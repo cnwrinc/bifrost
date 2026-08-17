@@ -15,6 +15,9 @@ name: bifrost
 #   POSTGRES_PASSWORD   - PostgreSQL password
 #   RABBITMQ_PASSWORD   - RabbitMQ password
 #
+# Optional public exposure via Cloudflare Tunnel (see cloudflared service below):
+#   docker compose --profile cloudflared up    # requires CLOUDFLARE_TUNNEL_TOKEN
+#
 # The BIFROST_SECRET_KEY is critical - it's used for:
 #   - JWT token signing (HS256)
 #   - Fernet encryption of secrets stored in PostgreSQL
@@ -228,6 +231,31 @@ services:
     depends_on:
       api:
         condition: service_healthy
+
+  # Cloudflare Tunnel - optional public HTTPS exposure of the app
+  #
+  # Opt-in via profile:
+  #   CLOUDFLARE_TUNNEL_TOKEN=<token> docker compose --profile cloudflared up -d
+  #
+  # Uses a remotely-managed tunnel: create one in the Cloudflare Zero Trust
+  # dashboard (Networks -> Tunnels), copy its token, and add a public hostname
+  # routed to http://client:80 (the client proxies /api and websockets to the
+  # API container, so one hostname covers the whole app).
+  #
+  # When exposing publicly, also set BIFROST_PUBLIC_URL, BIFROST_CORS_ORIGINS,
+  # and the BIFROST_WEBAUTHN_* variables to the tunnel hostname.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: bifrost-cloudflared
+    profiles: ["cloudflared"]
+    command: tunnel --no-autoupdate run
+    environment:
+      # Interpolated even when the profile is inactive, so no :? here;
+      # cloudflared exits with a clear error if started without a token.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      client:
+        condition: service_started
 
   # Scheduler Service + isolated platform-job host. Every replica runs a small
   # job pool; a PostgreSQL lease elects one trigger leader.
