@@ -9,15 +9,44 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import UUID
+
+
+def bifrost_adapter_return_schema() -> dict[str, Any]:
+    """Return the shared, truthful text contract for Bifrost-owned adapters.
+
+    The adapter serializes structured successes as JSON text, while other
+    successes can be plain text. Error representation differs by execution
+    surface: autonomous calls may use an ``Error:`` prefix and chat calls may
+    serialize a JSON envelope with ``error`` or ``is_error``. Individual tool
+    payload fields remain tool-specific.
+    """
+    return {
+        "type": "string",
+        "description": (
+            "Bifrost returns text. Structured successful results are JSON text; "
+            "parse with json.loads before field access. Other successful results "
+            "may be plain text. Failures are tool-specific: text can start with "
+            "`Error:`, or JSON can include `error` or `is_error`. Result fields "
+            "and metadata are specific to this tool; do not assume common object fields."
+        ),
+    }
 
 
 @dataclass
 class ToolDefinition:
-    """Tool definition for LLM function calling."""
+    """Tool definition for LLM function calling.
+
+    ``structured_output_schema`` is optional metadata for the successful
+    ``structuredContent`` payload advertised by an external MCP tool. It does
+    not describe the Bifrost transport envelope or change ``return_schema``.
+    """
 
     name: str
     description: str
     parameters: dict[str, Any]  # JSON Schema format
+    return_schema: dict[str, Any] | None = None
+    structured_output_schema: dict[str, Any] | None = None
 
 
 @dataclass
@@ -71,6 +100,7 @@ class LLMResponse:
     output_tokens: int | None = None
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
     provider_cost: Decimal | None = None
 
     # Model info
@@ -95,10 +125,30 @@ class LLMStreamChunk:
     output_tokens: int | None = None
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
     provider_cost: Decimal | None = None
 
     # For error chunks
     error: str | None = None
+
+
+ANTHROPIC_REQUIRED_MAX_TOKENS = 16_384
+
+# No generic harness defaults: when neither the agent nor its model profile
+# sets an explicit limit, the provider default applies (None) — except for
+# the two narrow cases below. Per agreement: explicit Agent.llm_max_tokens
+# wins, then Profile.default_max_tokens, then Anthropic's required 16384
+# (the API mandates a value), then the DeepSeek-family guard. Everything
+# else resolves in exactly one place (via request_max_tokens).
+
+DEEPSEEK_FAMILY_MAX_TOKENS = 8_000
+"""Heuristic safety-net cap for the DeepSeek model family.
+
+DeepSeek (via OpenRouter or direct) rejects unbounded/high output requests
+more aggressively than OpenAI/Anthropic, and its API only accepts the legacy
+``max_tokens`` wire field. This guard fires only when neither the agent nor
+the profile sets a value — explicit values always win.
+"""
 
 
 @dataclass
@@ -109,9 +159,70 @@ class LLMConfig:
     model: str
     api_key: str
     endpoint: str | None = None
-    max_tokens: int = 16384
+    openai_transport: Literal["responses", "chat_completions"] | None = None
+    provider_connection_id: UUID | None = None
+    anthropic_prompt_cache_supported: bool | None = None
+    # Profile-level default output cap (AIModelProfile.default_max_tokens).
+    # Populated by AIModelService.resolve_config; loses to an explicit
+    # per-request override (Agent.llm_max_tokens).
+    default_max_tokens: int | None = None
+    # models.dev provider id the connection was created from (None for a
+    # custom endpoint). Community providers bill under this id.
+    catalog_provider_id: str | None = None
+    # Profile reasoning choice: a catalog effort level, "on"/"off", or None
+    # for the model's default behavior.
+    reasoning_effort: str | None = None
     # Optional parameters
     extra_params: dict[str, Any] = field(default_factory=dict)
+
+
+def is_deepseek_family(config: LLMConfig) -> bool:
+    """Return True when the resolved model or endpoint belongs to DeepSeek.
+
+    Normalized match: model ``startswith`` ``deepseek/`` (OpenRouter namespaced
+    form, including the ``~`` latest-alias marker) or ``deepseek-`` (direct
+    form such as ``deepseek-chat``/``deepseek-reasoner``), or the endpoint URL
+    contains ``deepseek`` (direct/self-hosted DeepSeek-compatible servers).
+    """
+    model = (config.model or "").strip().lower().removeprefix("~")
+    endpoint = (config.endpoint or "").lower()
+    return (
+        model.startswith("deepseek/")
+        or model.startswith("deepseek-")
+        or "deepseek" in endpoint
+    )
+
+
+def request_max_tokens(
+    config: LLMConfig,
+    override: int | None,
+    *,
+    agent_kind: str | None = None,
+) -> int | None:
+    """Resolve the per-request output limit.
+
+    Precedence: explicit agent override wins > profile default >
+    Anthropic required / DeepSeek guard > provider default (None).
+
+    - ``override``: Agent.llm_max_tokens for the running agent.
+    - ``config.default_max_tokens``: the resolved model profile's
+      default_max_tokens (None when the profile sets none).
+    - ``agent_kind``: accepted for backward compatibility but ignored —
+      there are no generic per-kind fallbacks. Callers may stop passing it.
+    - DeepSeek family guard (heuristic safety net): caps at 8000, and fires
+      only when both the agent override and the profile default are null.
+    - Anthropic path (16384) unless agent/profile sets otherwise.
+    """
+    del agent_kind
+    if override is not None:
+        return override
+    if config.default_max_tokens is not None:
+        return config.default_max_tokens
+    if config.provider == "anthropic":
+        return ANTHROPIC_REQUIRED_MAX_TOKENS
+    if is_deepseek_family(config):
+        return DEEPSEEK_FAMILY_MAX_TOKENS
+    return None
 
 
 class BaseLLMClient(ABC):

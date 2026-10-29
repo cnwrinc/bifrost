@@ -25,6 +25,7 @@ from src.models.orm.config import Config
 from src.models.orm.integrations import Integration, IntegrationConfigSchema, IntegrationMapping
 from src.repositories.base import BaseRepository
 from src.repositories.org_scoped import OrgScopedRepository
+from src.services.authorization.reach import OrgReach
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,10 @@ class IntegrationMappingRepository(OrgScopedRepository[IntegrationMapping]):
         """
         # First get integration by name
         integration_result = await self.session.execute(
-            select(Integration).where(Integration.name == name)
+            select(Integration).where(
+                Integration.name == name,
+                Integration.is_deleted.is_(False),
+            )
         )
         integration = integration_result.scalar_one_or_none()
         if not integration:
@@ -104,6 +108,7 @@ class IntegrationsRepository(BaseRepository[Integration]):
         """
         integration = Integration(
             name=data.name,
+            description=data.description,
             entity_id=data.entity_id,
             entity_id_name=data.entity_id_name,
         )
@@ -156,7 +161,10 @@ class IntegrationsRepository(BaseRepository[Integration]):
         """
         result = await self.session.execute(
             select(Integration)
-            .where(Integration.name == name)
+            .where(
+                Integration.name == name,
+                Integration.is_deleted.is_(False),
+            )
             .options(
                 joinedload(Integration.oauth_provider),
                 selectinload(Integration.mappings),
@@ -215,6 +223,8 @@ class IntegrationsRepository(BaseRepository[Integration]):
         # Update only provided fields
         if data.name is not None:
             integration.name = data.name
+        if "description" in data.model_fields_set:
+            integration.description = data.description
         if data.list_entities_data_provider_id is not None:
             integration.list_entities_data_provider_id = (
                 data.list_entities_data_provider_id
@@ -377,18 +387,16 @@ class IntegrationsRepository(BaseRepository[Integration]):
         self,
         integration_id: UUID,
         *,
-        organization_id: UUID | None = None,
+        reach: OrgReach,
     ) -> list[IntegrationMapping]:
         """
-        List mappings for an integration.
+        List an integration's mappings whose organization is in ``reach``.
 
         Args:
             integration_id: Integration UUID
-            organization_id: Optional org filter. When provided, returns only
-                that org's mapping (used by non-bypass callers in the SDK
-                surface so they can't enumerate other orgs' mappings). When
-                ``None``, returns all mappings — reserved for callers that
-                have already gated on platform-admin / provider-org bypass.
+            reach: Organizations to include, filtered in SQL. Callers pass the
+                caller's permitted reach to enumerate, or a single-organization
+                reach for an exact scope.
 
         Returns:
             List of mappings for the integration (possibly empty).
@@ -396,8 +404,9 @@ class IntegrationsRepository(BaseRepository[Integration]):
         stmt = select(IntegrationMapping).where(
             IntegrationMapping.integration_id == integration_id
         )
-        if organization_id is not None:
-            stmt = stmt.where(IntegrationMapping.organization_id == organization_id)
+        predicate = reach.where(IntegrationMapping.organization_id)
+        if predicate is not None:
+            stmt = stmt.where(predicate)
         stmt = stmt.options(
             joinedload(IntegrationMapping.integration)
             .options(joinedload(Integration.oauth_provider)),
@@ -617,7 +626,7 @@ class IntegrationsRepository(BaseRepository[Integration]):
         return config
 
     async def get_config_for_mapping(
-        self, integration_id: UUID, org_id: UUID, *, external: bool
+        self, integration_id: UUID, org_id: UUID, *, external: bool, reveal_secrets: bool
     ) -> dict:
         """
         Get merged configuration for an integration mapping.
@@ -679,12 +688,16 @@ class IntegrationsRepository(BaseRepository[Integration]):
             else:
                 val = value
 
-            if entry.config_type == ConfigType.SECRET and isinstance(val, str):
+            if entry.config_type == ConfigType.SECRET and isinstance(val, str) and reveal_secrets:
                 try:
                     val = decrypt_secret(val)
                 except Exception:
                     logger.warning(f"Failed to decrypt config '{entry.key}'")
                     val = None
+            elif entry.config_type == ConfigType.SECRET:
+                from src.core.security import SECRET_PLACEHOLDER
+
+                val = SECRET_PLACEHOLDER
 
             if entry.organization_id is None:
                 defaults[entry.key] = val
@@ -697,7 +710,7 @@ class IntegrationsRepository(BaseRepository[Integration]):
         return config
 
     async def get_integration_defaults(
-        self, integration_id: UUID, *, external: bool
+        self, integration_id: UUID, *, external: bool, reveal_secrets: bool
     ) -> dict[str, Any]:
         """
         Get integration-level config defaults (org_id=NULL).
@@ -739,12 +752,16 @@ class IntegrationsRepository(BaseRepository[Integration]):
             else:
                 val = value
 
-            if entry.config_type == ConfigType.SECRET and isinstance(val, str):
+            if entry.config_type == ConfigType.SECRET and isinstance(val, str) and reveal_secrets:
                 try:
                     val = decrypt_secret(val)
                 except Exception:
                     logger.warning(f"Failed to decrypt config '{entry.key}'")
                     val = None
+            elif entry.config_type == ConfigType.SECRET:
+                from src.core.security import SECRET_PLACEHOLDER
+
+                val = SECRET_PLACEHOLDER
 
             config[entry.key] = val
 

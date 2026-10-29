@@ -1,0 +1,28 @@
+# The builds overlay's Job settings for local Kind (BIFROST_KIND_BUILD_JOBS=1):
+# Jobs run as the tokenless bifrost-build-runner account and otherwise copy
+# the API pod. Isolation itself is turned on in Settings -> Kubernetes.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bifrost-build-runner
+  namespace: bifrost-local
+  labels:
+    app.kubernetes.io/name: bifrost-build-runner
+    app.kubernetes.io/component: build-runner
+    app.kubernetes.io/part-of: bifrost-local-kind
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bifrost-build-jobs-config
+  namespace: bifrost-local
+  labels:
+    app.kubernetes.io/name: bifrost-build-jobs-config
+    app.kubernetes.io/component: build-controller
+    app.kubernetes.io/part-of: bifrost-local-kind
+data:
+  BIFROST_KUBERNETES_JOB_SERVICE_ACCOUNT: "bifrost-build-runner"
+  BIFROST_KUBERNETES_JOB_PENDING_TIMEOUT_SECONDS: "300"
+  BIFROST_KUBERNETES_JOB_CPU_REQUEST: "250m"
+  BIFROST_KUBERNETES_JOB_CPU_LIMIT: "1"

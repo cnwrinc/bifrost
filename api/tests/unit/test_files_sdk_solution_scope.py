@@ -51,6 +51,8 @@ def capture_file_sdk_urls(monkeypatch):
                 return {"files": []}
             if captured_urls[-1].startswith("/api/files/exists"):
                 return {"exists": True}
+            if captured_urls[-1].startswith("/api/files/stat"):
+                return {"path": "x.txt", "exists": True}
             if captured_urls[-1].startswith("/api/files/signed-url"):
                 return {"url": "https://example.invalid/signed", "path": "finance/abc/x.txt"}
             return {"content": ""}
@@ -59,7 +61,7 @@ def capture_file_sdk_urls(monkeypatch):
             return None
 
     class FakeClient:
-        async def post(self, url, json=None):
+        async def engine_request(self, method, url, json=None):
             captured_urls.append(url)
             return FakeResponse()
 
@@ -77,6 +79,7 @@ def capture_file_sdk_urls(monkeypatch):
         ("list", ("",), {"location": "finance"}),
         ("delete", ("x.txt",), {"location": "finance"}),
         ("exists", ("x.txt",), {"location": "finance"}),
+        ("stat", ("x.txt",), {"location": "finance"}),
         ("get_signed_url", ("x.txt",), {"location": "finance", "method": "GET"}),
     ],
 )
@@ -100,6 +103,7 @@ async def test_file_sdk_appends_solution_query(method_name, args, kwargs, captur
         ("list", ("",), {"location": "finance"}),
         ("delete", ("x.txt",), {"location": "finance"}),
         ("exists", ("x.txt",), {"location": "finance"}),
+        ("stat", ("x.txt",), {"location": "finance"}),
         ("get_signed_url", ("x.txt",), {"location": "finance", "method": "GET"}),
     ],
 )
@@ -116,3 +120,37 @@ async def test_file_sdk_omits_solution_query_without_solution_context(
 
     assert capture_file_sdk_urls
     assert all("solution=" not in url for url in capture_file_sdk_urls)
+
+
+@pytest.mark.asyncio
+async def test_file_sdk_forwards_signed_url_expiration(monkeypatch):
+    captured_json: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        is_success = True
+
+        def json(self):
+            return {
+                "url": "https://example.invalid/signed",
+                "path": "finance/abc/x.txt",
+                "expires_in": 604800,
+            }
+
+    class FakeClient:
+        async def engine_request(self, method, url, json=None):
+            captured_json.update(json or {})
+            return FakeResponse()
+
+    monkeypatch.setattr(files_sdk, "get_client", lambda: FakeClient())
+    set_execution_context(_make_context(solution_id=None))
+
+    result = await files_sdk.files.get_signed_url(
+        "x.txt",
+        location="finance",
+        method="GET",
+        expires_in=604800,
+    )
+
+    assert captured_json["expires_in"] == 604800
+    assert result["expires_in"] == 604800

@@ -76,6 +76,18 @@ class TestNormalizeToolName:
     def test_explicit_category_becomes_prefix(self):
         assert _normalize_tool_name("Add Comment", category="HaloPSA") == "halopsa_add_comment"
 
+    def test_already_prefixed_name_is_idempotent_for_its_normalized_category(self):
+        assert (
+            _normalize_tool_name("halopsa_submit_triage", category="HaloPSA")
+            == "halopsa_submit_triage"
+        )
+
+    def test_existing_different_category_prefix_does_not_bypass_category_namespace(self):
+        assert (
+            _normalize_tool_name("halopsa_submit_triage", category="AI Ticketing")
+            == "ai_ticketing_halopsa_submit_triage"
+        )
+
     def test_parentheses_stripped_from_name(self):
         assert _normalize_tool_name("Add Comment (Demo)", category="HaloPSA") == "halopsa_add_comment_demo"
 
@@ -283,7 +295,14 @@ class TestToToolDefinition:
 
         result = self.registry._to_tool_definition(tool)
 
-        assert result.parameters == {"type": "object", "properties": {}, "additionalProperties": False}
+        # Legacy Solution rows used [] for both zero-argument tools and tools
+        # whose signatures were never indexed. Keep them callable until the
+        # next Solution deploy backfills the real contract from source.
+        assert result.parameters == {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        }
 
     def test_array_type_includes_items(self):
         tool = _make_registered_tool(
@@ -321,6 +340,35 @@ class TestToToolDefinition:
         prop = result.parameters["properties"]["fields"]
         assert prop["type"] == "object"
         assert prop["additionalProperties"] is True
+
+    def test_json_schema_field_is_preserved_when_present(self):
+        tool = _make_registered_tool(
+            parameters_schema=[
+                {
+                    "name": "payload_items",
+                    "type": "list",
+                    "label": "Payload Items",
+                    "json_schema": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": {"type": "integer"},
+                        },
+                    },
+                },
+            ],
+        )
+
+        result = self.registry._to_tool_definition(tool)
+
+        assert result.parameters["properties"]["payload_items"] == {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": {"type": "integer"},
+            },
+            "description": "Payload Items",
+        }
 
     def test_non_array_type_has_no_items(self):
         tool = _make_registered_tool(
@@ -363,6 +411,22 @@ class TestToToolDefinition:
         result = self.registry._to_tool_definition(tool)
 
         assert "enum" not in result.parameters["properties"]["name"]
+
+    def test_options_list_supports_plain_values_for_backwards_compatibility(self):
+        tool = _make_registered_tool(
+            parameters_schema=[
+                {
+                    "name": "status",
+                    "type": "string",
+                    "label": "Status",
+                    "options": ["open", "closed"],
+                },
+            ],
+        )
+
+        result = self.registry._to_tool_definition(tool)
+
+        assert result.parameters["properties"]["status"]["enum"] == ["open", "closed"]
 
     def test_label_falls_back_to_name(self):
         tool = _make_registered_tool(

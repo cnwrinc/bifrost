@@ -1,11 +1,18 @@
 """Unit tests for the deny-by-default typed embed HTTP policy."""
 
 from datetime import timedelta
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
-from src.core.embed_middleware import EmbedScopeMiddleware, embed_request_allowed
+from src.core.embed_middleware import (
+    EmbedScopeMiddleware,
+    embed_request_allowed,
+    embed_session_owns_execution,
+)
 from src.core.security import create_embed_access_token
 
 
@@ -84,6 +91,21 @@ def test_app_embed_retains_legacy_app_and_execution_surfaces():
     )
 
 
+def test_app_embed_is_denied_every_form_runtime_surface():
+    claims = _app_claims()
+    denied = (
+        ("GET", f"/api/forms/{FORM_ID}/runtime"),
+        ("POST", f"/api/forms/{FORM_ID}/startup"),
+        ("POST", f"/api/forms/{FORM_ID}/upload"),
+        ("POST", f"/api/forms/{FORM_ID}/submissions"),
+        ("POST", f"/api/forms/{FORM_ID}/fields/customer/options"),
+    )
+    for method, path in denied:
+        assert not embed_request_allowed(method, path, claims), (method, path)
+    assert embed_request_allowed("GET", "/api/applications/app-slug/render", claims)
+    assert embed_request_allowed("POST", "/api/workflows/execute", claims)
+
+
 def _form_token() -> str:
     return create_embed_access_token(
         embed_kind="form",
@@ -143,3 +165,22 @@ def test_form_session_rejects_oversized_body_before_router_invocation():
 
     assert response.status_code == 413
     assert invoked is False
+
+
+@pytest.mark.asyncio
+async def test_embed_session_execution_ownership_reads_exact_jti_mapping():
+    redis = AsyncMock()
+    redis.exists.return_value = 1
+
+    @asynccontextmanager
+    async def fake_redis():
+        yield redis
+
+    with patch("src.core.cache.redis_client.get_redis", fake_redis):
+        assert await embed_session_owns_execution(
+            "session-jti", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        )
+
+    redis.exists.assert_awaited_once_with(
+        "bifrost:embed:exec:session-jti:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    )

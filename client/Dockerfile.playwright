@@ -4,14 +4,25 @@
 # Usage (via test.sh):
 #   ./test.sh client e2e      # Run Playwright E2E tests in the client container
 
-# mcr.microsoft.com/playwright:v1.56.0-jammy
-FROM mcr.microsoft.com/playwright:v1.62.1-jammy@sha256:b3251f7ff1a9fa559a28d1c67eaa15fc1a9800f7845e82756caea7842967f615
+# Keep the browser/system dependencies from Playwright's image, but use the
+# same Node runtime required by package.json and used by CI/client builds.
+FROM node:26-slim@sha256:14bf3eac4bf209d906d3c41256597d3ab1f926b2e93a79e9bdfe1efd32454239 AS node-runtime
+
+# mcr.microsoft.com/playwright:v1.64.1-jammy
+FROM mcr.microsoft.com/playwright:v1.64.1-jammy@sha256:7e9f074b4b69f7c746865936ac7840733cf5dfc957f265a547f331e7b83922d7
+
+COPY --from=node-runtime /usr/local/ /usr/local/
 
 WORKDIR /app
 
 # Copy package files and install dependencies
 COPY package*.json ./
 RUN npm ci
+
+# The web SDK supports React >=18; the platform client itself uses React 19.
+# Keep React 18 isolated for production SDK regressions.
+COPY e2e/fixtures/sdk-header/package*.json /opt/sdk-header-react18/
+RUN cd /opt/sdk-header-react18 && npm ci --ignore-scripts
 
 # Install only Chromium browser (faster than installing all browsers)
 RUN npx playwright install chromium

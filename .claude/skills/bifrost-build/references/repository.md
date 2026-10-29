@@ -20,6 +20,8 @@ bifrost files write workflows/example.py \
 
 For exact options, read `../generated/cli-reference.md`.
 
+`files search` covers workspace source and every Solution install's deployed source. Solution hits print as `slug:path  (read-only Solution source)`, so check them before you change a shared workflow they use. Results come 25 per page. When more exist, the output ends with a `More results:` command; run it unchanged. To find where something lives first, add `--files` for one line per matching file, then narrow with `--include` or `--solution`.
+
 `files write` replaces the complete text content. For an existing file:
 
 1. Run `files stat --json` and retain its opaque `version`.
@@ -108,7 +110,7 @@ Registration creates a stable UUID and applies organization/access/role boundari
 - Use `bifrost workflows remap` only when intentionally consolidating two existing workflow records.
 - Execute the registered ref after writing to verify worker behavior and permissions.
 
-A Solution with `global_repo_access: true` can fall back only to an eligible registered loose workflow. Merely placing a decorated function in `_repo` does not make it callable through workflow resolution.
+A Solution with `allow_outbound_access: true` can fall back only to an eligible registered loose workflow. Merely placing a decorated function in `_repo` does not make it callable through workflow resolution. To call another install's workflow directly, pass `solution=` (install UUID or slug) to `workflows.execute`; the target's `allow_inbound_access` gate decides, and the child run starts as that install. See `solution-resource-access.md`.
 
 Read `workflows.md` for decorators, testing, dependencies, and tool naming.
 

@@ -5,6 +5,9 @@ Tests SDK module structure and API method signatures.
 Integration tests for actual API calls are in tests/integration/platform/.
 """
 
+import importlib
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 
@@ -32,6 +35,7 @@ class TestTablesSDKImports:
 
         assert hasattr(tables, 'insert_batch')
         assert hasattr(tables, 'upsert_batch')
+        assert hasattr(tables, 'bulk_upsert')
         assert hasattr(tables, 'delete_batch')
 
     def test_import_table_models(self):
@@ -44,10 +48,11 @@ class TestTablesSDKImports:
 
     def test_import_batch_models(self):
         """Test importing batch result models."""
-        from bifrost import BatchResult, BatchDeleteResult
+        from bifrost import BatchResult, BatchDeleteResult, BulkUpsertResult
 
         assert BatchResult is not None
         assert BatchDeleteResult is not None
+        assert BulkUpsertResult is not None
 
     def test_table_info_model_fields(self):
         """Test TableInfo model has expected fields."""
@@ -135,6 +140,184 @@ class TestTablesSDKImports:
 
         assert result.deleted_ids == ["id-1", "id-2"]
         assert result.count == 2
+
+    def test_bulk_upsert_result_model_fields(self):
+        """Test BulkUpsertResult model has expected fields."""
+        from bifrost import BulkUpsertResult
+
+        result = BulkUpsertResult(count=3)
+
+        assert result.count == 3
+
+
+@pytest.mark.asyncio
+async def test_tables_bulk_upsert_posts_replace_upsert_batch_request(monkeypatch):
+    module = importlib.import_module("bifrost.tables")
+    from bifrost import tables
+
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"inserted": 2, "documents": []}
+    client = MagicMock()
+    client.engine_request = AsyncMock(return_value=response)
+    monkeypatch.setattr(module, "get_client", lambda: client)
+    monkeypatch.setattr(module, "raise_for_status_with_detail", MagicMock())
+
+    result = await tables.bulk_upsert(
+        "customers",
+        [
+            {"id": "a", "data": {"x": 1}},
+            {"id": "b", "data": {"y": None}},
+        ],
+        scope="global",
+        created_by="importer",
+        updated_by="importer",
+    )
+
+    assert result.count == 2
+    client.engine_request.assert_awaited_once_with(
+        "POST",
+        "/api/tables/customers/documents/batch?scope=global",
+        json={
+            "write_mode": "replace_upsert",
+            "return_documents": False,
+            "documents": [
+                {
+                    "id": "a",
+                    "data": {"x": 1},
+                    "created_by": "importer",
+                    "updated_by": "importer",
+                },
+                {
+                    "id": "b",
+                    "data": {"y": None},
+                    "created_by": "importer",
+                    "updated_by": "importer",
+                },
+            ]
+        },
+    )
+    assert "/documents/bulk-upsert" not in client.engine_request.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_tables_query_forwards_document_id_pagination_and_skip_count(monkeypatch):
+    module = importlib.import_module("bifrost.tables")
+    from bifrost import tables
+
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "documents": [],
+        "total": -1,
+        "limit": 500,
+        "offset": 0,
+    }
+    client = MagicMock()
+    client.engine_request = AsyncMock(return_value=response)
+    monkeypatch.setattr(module, "get_client", lambda: client)
+    monkeypatch.setattr(module, "raise_for_status_with_detail", MagicMock())
+
+    result = await tables.query(
+        "inventory",
+        scope="global",
+        after_document_id="tenant|drive|item-001",
+        document_id_prefix="tenant|",
+        document_ids=["tenant|drive|item-001", "tenant|drive|item-002"],
+        skip_count=True,
+        limit=500,
+    )
+
+    assert result.total == -1
+    client.engine_request.assert_awaited_once_with(
+        "POST",
+        "/api/tables/inventory/documents/query?scope=global",
+        json={
+            "where": None,
+            "order_by": None,
+            "order_dir": "asc",
+            "limit": 500,
+            "offset": 0,
+            "after_document_id": "tenant|drive|item-001",
+            "document_id_prefix": "tenant|",
+            "document_ids": ["tenant|drive|item-001", "tenant|drive|item-002"],
+            "skip_count": True,
+        },
+        retry_transient=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_tables_bulk_upsert_retries_bounded_conflict(monkeypatch):
+    module = importlib.import_module("bifrost.tables")
+    from bifrost import tables
+
+    conflict = MagicMock(status_code=409)
+    success = MagicMock(status_code=200)
+    success.json.return_value = {"inserted": 1, "documents": []}
+    client = MagicMock()
+    client.engine_request = AsyncMock(side_effect=[conflict, success])
+    monkeypatch.setattr(module, "get_client", lambda: client)
+    monkeypatch.setattr(module, "raise_for_status_with_detail", MagicMock())
+
+    result = await tables.bulk_upsert(
+        "customers",
+        [{"id": "a", "data": {"x": 1}}],
+        conflict_retries=1,
+    )
+
+    assert result.count == 1
+    assert client.engine_request.await_count == 2
+
+
+@pytest.mark.parametrize("method_name", ["insert_batch", "upsert_batch", "bulk_upsert"])
+@pytest.mark.asyncio
+async def test_tables_batch_writes_reject_more_than_1000_before_http(method_name, monkeypatch):
+    module = importlib.import_module("bifrost.tables")
+    from bifrost import tables
+
+    client = MagicMock()
+    client.engine_request = AsyncMock()
+    monkeypatch.setattr(module, "get_client", lambda: client)
+    documents = [{"id": f"doc-{index}", "data": {"index": index}} for index in range(1001)]
+
+    with pytest.raises(ValueError) as exc:
+        await getattr(tables, method_name)("customers", documents)
+
+    assert str(exc.value) == "table batch writes accept at most 1000 documents"
+    client.engine_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "documents", "expected_count"),
+    [
+        ("insert_batch", [], 0),
+        ("upsert_batch", [], 0),
+        ("bulk_upsert", [], 0),
+        ("insert_batch", [{"id": f"doc-{index}", "data": {"index": index}} for index in range(1000)], 1000),
+        ("upsert_batch", [{"id": f"doc-{index}", "data": {"index": index}} for index in range(1000)], 1000),
+        ("bulk_upsert", [{"id": f"doc-{index}", "data": {"index": index}} for index in range(1000)], 1000),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tables_batch_writes_allow_empty_and_1000_documents(
+    method_name,
+    documents,
+    expected_count,
+    monkeypatch,
+):
+    module = importlib.import_module("bifrost.tables")
+    from bifrost import tables
+
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"inserted": expected_count, "documents": []}
+    client = MagicMock()
+    client.engine_request = AsyncMock(return_value=response)
+    monkeypatch.setattr(module, "get_client", lambda: client)
+    monkeypatch.setattr(module, "raise_for_status_with_detail", MagicMock())
+
+    result = await getattr(tables, method_name)("customers", documents)
+
+    assert result.count == expected_count
+    client.engine_request.assert_awaited_once()
 
 
 class TestTablesSDKWithoutContext:

@@ -9,6 +9,8 @@ A git-connected install has exactly one writer: auto-pull from its repo.
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -98,6 +100,43 @@ class TestDeployFromWorkspace:
         assert survivors == ["keepme"]
 
 
+@pytest.mark.asyncio
+async def test_git_sync_propagates_incomplete_storage_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Git sync must remain failed until its committed bundle reaches storage."""
+    from src.services.solutions import git_sync
+    from src.services.solutions.deploy import SolutionFinalizeIncomplete
+
+    solution = Solution(
+        id=uuid.uuid4(),
+        slug="storage-finalize",
+        name="Storage Finalize",
+        git_connected=True,
+        git_repo_url="https://example.test/storage-finalize.git",
+    )
+    result = SimpleNamespace(
+        finalize_s3=AsyncMock(side_effect=SolutionFinalizeIncomplete(str(solution.id)))
+    )
+    db = SimpleNamespace(commit=AsyncMock())
+
+    async def fake_clone(_repo_url, destination, *, ref=None):  # noqa: ANN001
+        (destination / "bifrost.solution.yaml").write_text(
+            "slug: storage-finalize\nname: Storage Finalize\nscope: global\n"
+        )
+
+    monkeypatch.setattr(git_sync, "clone_repo_to_dir", fake_clone)
+    monkeypatch.setattr(
+        git_sync, "deploy_from_workspace", AsyncMock(return_value=result)
+    )
+
+    with pytest.raises(SolutionFinalizeIncomplete):
+        await git_sync._run_sync_once(db, solution)
+
+    db.commit.assert_awaited_once()
+    result.finalize_s3.assert_awaited_once()
+
+
 @pytest.mark.e2e
 class TestConnectedBundleCompleteness:
     """read_workspace_bundle must collect apps + forms + agents, not just
@@ -119,7 +158,8 @@ class TestConnectedBundleCompleteness:
         )
         form_id = str(uuid.uuid4())
         (tmp_path / ".bifrost" / "forms.yaml").write_text(
-            f"forms:\n  {form_id}:\n    id: {form_id}\n    name: intake\n    fields: []\n"
+            f"forms:\n  {form_id}:\n    id: {form_id}\n    name: intake\n"
+            "    form_schema:\n      fields: []\n"
         )
         agent_id = str(uuid.uuid4())
         (tmp_path / ".bifrost" / "agents.yaml").write_text(
@@ -237,6 +277,30 @@ class TestReadWorkspaceBundleFileLocations:
         assert bundle.file_locations == ["reports", "invoices"]
 
 
+class TestReadWorkspaceBundleFilePolicies:
+    def test_read_workspace_bundle_uses_canonical_file_policy_projection(self, tmp_path) -> None:
+        from bifrost.solution_definition import read_solution_definition
+        from src.models.orm.solutions import Solution
+        from src.services.solutions.git_sync import read_workspace_bundle
+
+        (tmp_path / "bifrost.solution.yaml").write_text("slug: fp\nname: FP\nscope: global\n")
+        (tmp_path / ".bifrost").mkdir()
+        (tmp_path / ".bifrost" / "file-policies.yaml").write_text(
+            "file_policies:\n"
+            "  reports-root:\n"
+            "    organization_id: source-org\n"
+            "    location: reports\n"
+            "    path: ''\n"
+            "    policies: [{$ref: admin_bypass}]\n"
+        )
+
+        definition = read_solution_definition(tmp_path)
+        sol = Solution(id=uuid.uuid4(), slug="fp", name="FP", organization_id=None)
+        bundle = read_workspace_bundle(sol, tmp_path)
+
+        assert bundle.file_policies == definition.install_entries("file_policies")
+
+
 @pytest.mark.e2e
 class TestGitSyncRerun:
     async def test_rerun_when_trigger_arrives_mid_sync(self, db_session, monkeypatch):
@@ -317,7 +381,7 @@ class TestDeletionSweepSparesSolutionManaged:
     lifecycle and are out of scope here.)
     """
 
-    async def test_sweep_spares_managed_entities(self, db_session) -> None:
+    async def test_sweep_spares_managed_entities(self, db_session, monkeypatch) -> None:
         from sqlalchemy import select
 
         from bifrost.manifest import Manifest
@@ -386,7 +450,30 @@ class TestDeletionSweepSparesSolutionManaged:
         db.add_all([*managed.values(), *repo.values()])
         await db.flush()
 
-        # Empty manifest => nothing is "present" => everything looks stale.
+        # Restrict the exporter query to this fixture. The shared unit DB
+        # includes unrelated workflows with dependent service rows; they are
+        # not part of this manifest-sweep contract.
+        from sqlalchemy import false
+        from src.services.manifest_generator import export_criteria as real_export_criteria
+
+        fixture_ids = {
+            Workflow: {row.id for row in (managed["wf"], repo["wf"])},
+            Form: {row.id for row in (managed["form"], repo["form"])},
+            Agent: {row.id for row in (managed["agent"], repo["agent"])},
+            Application: {row.id for row in (managed["app"], repo["app"])},
+            CustomClaim: {row.id for row in (managed["claim"], repo["claim"])},
+        }
+
+        def fixture_export_criteria(model):
+            criteria = real_export_criteria(model)
+            ids = fixture_ids.get(model)
+            # Other exported models are outside this fixture. Returning false
+            # prevents the empty manifest from sweeping shared seeded rows.
+            return [*criteria, model.id.in_(ids)] if ids is not None else [false()]
+
+        monkeypatch.setattr("src.services.manifest_generator.export_criteria", fixture_export_criteria)
+
+        # Empty manifest => fixture rows look stale.
         resolver = ManifestResolver(db)
         await resolver._resolve_deletions(manifest=Manifest(), dry_run=False)
         await db.flush()

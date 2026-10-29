@@ -343,6 +343,12 @@ def decrypt_with_key(encrypted: str, secret_key: str) -> str:
     return f.decrypt(encrypted_bytes).decode()
 
 
+# What human-facing reads return in place of a stored secret. Only the
+# engine-facing /api/sdk/* paths return decrypted values; every other surface
+# shows this, so field presence still signals "is set".
+SECRET_PLACEHOLDER = "[SECRET]"
+
+
 def encrypt_secret(plaintext: str) -> str:
     """
     Encrypt a secret value for storage in the database.
@@ -407,79 +413,81 @@ def validate_csrf_token(cookie_token: str, header_token: str) -> bool:
     return secrets.compare_digest(cookie_token, header_token)
 
 
-def mint_engine_token() -> tuple[str, str]:
-    """
-    Mint a long-lived engine token (30 days) parent-side.
+NO_TIMEOUT_TOKEN_SECONDS = 86_400
+"""Engine-token base lifetime for workflows configured with timeout_seconds=0 (no timeout)."""
 
-    Called by the consumer (which legitimately holds SECRET_KEY) before
-    dispatching an execution.  The returned token and expiry ISO string are
-    placed in context_data and handed to the child via Redis; the child writes
-    them to the credentials file with save_credentials() — no SECRET_KEY
-    required in the child process.
+SERVICE_TOKEN_LIFETIME_SECONDS = 900
+"""Service-token lifetime (15 min). Services outlive any single token: the
+owning worker parent mints a fresh token on every lease heartbeat and hands
+it to the child over Redis (see docs/plans/2026-09-20-services-credential-design.md).
+Short enough to bound a fenced child's residual API access; long enough that
+a missed heartbeat never strands a healthy child."""
+
+def mint_service_token(
+    *,
+    service_id: str,
+    attempt_id: str,
+    lifetime_seconds: int = SERVICE_TOKEN_LIFETIME_SECONDS,
+) -> tuple[str, str]:
+    """
+    Mint a short-lived, service-scoped credential parent-side.
+
+    Called by the owning worker (which legitimately holds SECRET_KEY) when
+    claiming an attempt and on every subsequent lease heartbeat. The child
+    installs the token as process-scoped SDK credentials — no SECRET_KEY or
+    persistent credential write is required there.
+
+    The token identifies only the durable attempt and its service definition.
+    Authentication re-loads all identity, organization, workflow, lineage,
+    and permission facts from the database on every request.
 
     Returns:
         (token, expires_at_iso): JWT string and ISO-8601 expiry timestamp.
     """
-    ENGINE_USER_ID = "00000000-0000-0000-0000-000000000001"
-
     token_data = {
-        "sub": ENGINE_USER_ID,
-        "email": "engine@bifrost.internal",
-        "name": "Bifrost Engine",
-        "is_superuser": True,
+        "sub": attempt_id,
+        "credential_kind": "service_attempt",
+        "service_id": service_id,
     }
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-    token = create_access_token(token_data, expires_delta=timedelta(days=30))
+    lifetime = timedelta(seconds=lifetime_seconds)
+    expires_at = datetime.now(timezone.utc) + lifetime
+    token = create_access_token(token_data, expires_delta=lifetime)
 
     return token, expires_at.isoformat()
-
-
-def authenticate_engine() -> None:
+def mint_engine_token(
+    *,
+    execution_id: str,
+    timeout_seconds: int,
+) -> tuple[str, str]:
     """
-    Create/refresh engine credentials for SDK calls in worker processes.
+    Mint a short-lived, execution-scoped engine token parent-side.
 
-    LEGACY PATH — called by worker.py only when no pre-minted token is
-    available in context_data (e.g. direct engine.execute() calls from tests
-    that bypass the consumer).  Production executions dispatched through the
-    consumer should always carry context_data["engine_token"] from
-    mint_engine_token() instead.
+    Called by the consumer (which legitimately holds SECRET_KEY) before
+    dispatching an execution.  The returned token and expiry ISO string are
+    placed in context_data and handed to the child over its private work pipe;
+    the child installs the token as process-scoped SDK credentials — no
+    SECRET_KEY or persistent credential write is required there.
 
-    The SDK's get_client() will find these credentials automatically, making
-    the worker behave identically to CLI mode but with superuser privileges.
+    The token identifies only the durable execution. Authentication derives
+    all other runtime facts from the execution row on every request.
+
+    Returns:
+        (token, expires_at_iso): JWT string and ISO-8601 expiry timestamp.
     """
-    import os
-
-    from bifrost.credentials import save_credentials
-
-    # Use a fixed UUID for the engine service account
-    # This is a well-known UUID that represents the execution engine
-    ENGINE_USER_ID = "00000000-0000-0000-0000-000000000001"
-
-    # Create a long-lived superuser token (30 days)
-    # is_superuser=True with no org_id = system account with global access
     token_data = {
-        "sub": ENGINE_USER_ID,
-        "email": "engine@bifrost.internal",
-        "name": "Bifrost Engine",
-        "is_superuser": True,
+        "sub": execution_id,
+        "credential_kind": "workflow_execution",
     }
 
-    token = create_access_token(
-        token_data,
-        expires_delta=timedelta(days=30)
-    )
+    # timeout_seconds == 0 means "no timeout" everywhere else in the engine
+    # (process_pool, execution_cleanup, and the 24h BLPOP cap in
+    # execution/service.py). Give those executions a 24h token; a 301-second
+    # token expires under the first long approval wait and every later SDK
+    # call fails with 401.
+    effective_timeout = timeout_seconds if timeout_seconds > 0 else NO_TIMEOUT_TOKEN_SECONDS
+    lifetime = timedelta(seconds=effective_timeout + 300)
+    expires_at = datetime.now(timezone.utc) + lifetime
+    token = create_access_token(token_data, expires_delta=lifetime)
 
-    # Get API URL for internal communication
-    api_url = os.getenv("BIFROST_API_URL", "http://api:8000")
-
-    # Calculate expiration timestamp
-    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
-
-    # Save to credentials file - SDK will find this automatically
-    save_credentials(
-        api_url=api_url,
-        access_token=token,
-        refresh_token=token,  # Not used but required by schema
-        expires_at=expires_at.isoformat(),
-    )
+    return token, expires_at.isoformat()

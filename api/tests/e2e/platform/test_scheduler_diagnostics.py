@@ -32,6 +32,7 @@ class TestSchedulerDiagnostics:
                         "webhook_renewal",
                         "solution_update_check",
                         "file_index_reconciliation",
+                        "model_catalog_refresh",
                     )
                 )
             ):
@@ -39,7 +40,7 @@ class TestSchedulerDiagnostics:
             time.sleep(0.25)
 
         assert body["leader"]["healthy"]
-        assert body["capacity"]["slots_total"] >= 1
+        assert body["capacity"]["replicas_online"] >= 1
         tasks = {task["task_id"]: task for task in body["tasks"]}
         expected = {
             "schedule_processor",
@@ -51,14 +52,20 @@ class TestSchedulerDiagnostics:
             "file_index_reconciliation",
             "webhook_renewal",
             "solution_update_check",
+            "model_catalog_refresh",
             "solution_export_job_cleanup",
-            "event_cleanup",
+            "run_retention",
             "stuck_event_cleanup",
             "worker_metrics_sampling",
             "worker_metrics_cleanup",
             "scheduler_diagnostics_cleanup",
             "summary_backfill_reconciliation",
             "artifact_retention_cleanup",
+            "audit_archive",
+            "workspace_bundle_preview_cleanup",
+            "workflow_operation_usage_flush",
+            "logo_thumbnail_backfill",
+            "execution_worker_cleanup",
         }
         assert set(tasks) == expected
         for task_id in (
@@ -66,10 +73,13 @@ class TestSchedulerDiagnostics:
             "webhook_renewal",
             "solution_update_check",
             "file_index_reconciliation",
+            "model_catalog_refresh",
         ):
             assert tasks[task_id]["execution_mode"] == "durable_job"
             assert tasks[task_id]["last_run"]["status"] == "enqueued"
         assert tasks["artifact_retention_cleanup"]["execution_mode"] == "durable_job"
+        assert tasks["audit_archive"]["execution_mode"] == "durable_job"
+        assert tasks["run_retention"]["execution_mode"] == "durable_job"
         deadline = time.monotonic() + 20
         history = {}
         while time.monotonic() < deadline:
@@ -118,3 +128,46 @@ class TestSchedulerDiagnostics:
             headers=platform_admin.headers,
         )
         assert response.status_code == 404
+
+
+@pytest.mark.e2e
+async def test_api_control_replicas_are_listed_but_not_counted_as_capacity(
+    e2e_client, platform_admin, db_session
+):
+    from datetime import datetime, timezone
+
+    from sqlalchemy import delete
+
+    from src.models.orm.scheduler_diagnostics import SchedulerReplica
+
+    replica_id = "api-control-diagnostics-test:1"
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        SchedulerReplica(
+            id=replica_id,
+            hostname="api-control-diagnostics-test",
+            pid=1,
+            job_slots=0,
+            started_at=now,
+            last_heartbeat_at=now,
+            memory_current_bytes=900,
+            memory_limit_bytes=1000,
+        )
+    )
+    await db_session.commit()
+    try:
+        body = e2e_client.get(
+            "/api/platform/scheduler", headers=platform_admin.headers
+        ).json()
+        replicas = {replica["id"]: replica for replica in body["replicas"]}
+        executors = [
+            replica for replica in replicas.values()
+            if replica["online"] and replica["runs_platform_jobs"]
+        ]
+        assert replicas[replica_id]["runs_platform_jobs"] is False
+        assert body["capacity"]["replicas_online"] == len(executors)
+        # The control replica's 90% memory never reads as scheduler pressure.
+        assert (body["capacity"]["max_memory_utilization_percent"] or 0) < 90
+    finally:
+        await db_session.execute(delete(SchedulerReplica).where(SchedulerReplica.id == replica_id))
+        await db_session.commit()

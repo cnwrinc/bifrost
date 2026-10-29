@@ -15,6 +15,8 @@ from src.models.orm.organizations import Organization
 from src.models.orm.users import Role, User, UserRole
 from src.services.agent_executor import AgentExecutor
 from src.services.agent_router import AgentRouter
+from src.services.authorization.context import AuthorizationContext
+from src.services.authorization.enforce import Caller
 from src.services.llm import LLMResponse
 
 
@@ -34,16 +36,9 @@ class SessionBoundAgentRouter(AgentRouter):
         self,
         session: AsyncSession,
         *,
-        user_id: UUID,
-        org_id: UUID | None,
-        is_superuser: bool = False,
+        caller: Caller,
     ):
-        super().__init__(
-            lambda: None,  # type: ignore[arg-type]
-            user_id=user_id,
-            org_id=org_id,
-            is_superuser=is_superuser,
-        )
+        super().__init__(lambda: None, caller=caller)  # type: ignore[arg-type]
         self._session = session
 
     @asynccontextmanager
@@ -170,6 +165,35 @@ def _principal(user: User) -> UserPrincipal:
         is_verified=user.is_verified,
     )
 
+def _caller(user: User) -> Caller:
+    return Caller(
+        _principal(user),
+        AuthorizationContext(
+            user_id=user.id,
+            home_organization_id=user.organization_id,
+            base_role_id=uuid4(),
+            is_external=False,
+            base_permissions=frozenset({"agents.readbasic", "agents.execute"}),
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def current_caller_refresh():
+    """Keep router access tests focused on the current caller contract."""
+    async def refresh(_db, caller):
+        return caller
+
+    with (
+        patch("src.services.agent_router.refresh_caller", new=AsyncMock(side_effect=refresh)),
+        patch(
+            "src.services.authorization.agent_runtime.refresh_caller",
+            new=AsyncMock(side_effect=refresh),
+        ),
+    ):
+        yield
+
+
 
 @pytest.mark.asyncio
 async def test_available_agents_are_limited_to_user_access(db_session: AsyncSession):
@@ -187,11 +211,34 @@ async def test_available_agents_are_limited_to_user_access(db_session: AsyncSess
     await _make_agent(db_session, "Unassigned Role Agent", org_id=None, access_level=AgentAccessLevel.ROLE_BASED, role=unassigned_role)
     await _make_agent(db_session, "Other Private Agent", org_id=org_b.id, access_level=AgentAccessLevel.PRIVATE, owner_user_id=other_user.id)
 
-    router = SessionBoundAgentRouter(db_session, user_id=user.id, org_id=org_b.id)
+    router = SessionBoundAgentRouter(db_session, caller=_caller(user))
 
     names = {agent.name for agent in await router.get_available_agents()}
 
     assert names == {"Global Role Agent", "Org B Auth Agent", "Own Private Agent"}
+
+
+@pytest.mark.asyncio
+async def test_admin_status_does_not_expand_automatic_agent_discovery(
+    db_session: AsyncSession,
+):
+    org_a = await _make_org(db_session, "Admin Discovery Org A")
+    org_b = await _make_org(db_session, "Admin Discovery Org B")
+    admin = await _make_user(
+        db_session,
+        org_id=org_b.id,
+        email_prefix="scoped-admin",
+        is_superuser=True,
+    )
+
+    await _make_agent(db_session, "Admin Own Org Agent", org_id=org_b.id)
+    await _make_agent(db_session, "Admin Cross Org Agent", org_id=org_a.id)
+
+    router = SessionBoundAgentRouter(db_session, caller=_caller(admin))
+    names = {agent.name for agent in await router.get_available_agents()}
+
+    assert "Admin Own Org Agent" in names
+    assert "Admin Cross Org Agent" not in names
 
 
 @pytest.mark.asyncio
@@ -203,7 +250,7 @@ async def test_auto_route_cannot_select_inaccessible_agent(db_session: AsyncSess
     await _make_agent(db_session, "Accessible Helpdesk", org_id=org_b.id)
     await _make_agent(db_session, "Cross Org Payroll", org_id=org_a.id)
 
-    router = SessionBoundAgentRouter(db_session, user_id=user.id, org_id=org_b.id)
+    router = SessionBoundAgentRouter(db_session, caller=_caller(user))
     llm_client = AsyncMock()
     llm_client.complete = AsyncMock(return_value=LLMResponse(content="Cross Org Payroll"))
 
@@ -225,7 +272,7 @@ async def test_mention_cannot_select_inaccessible_agent(db_session: AsyncSession
     await _make_agent(db_session, "Cross Org Payroll", org_id=org_a.id)
     accessible = await _make_agent(db_session, "Accessible Helpdesk", org_id=org_b.id)
 
-    router = SessionBoundAgentRouter(db_session, user_id=user.id, org_id=org_b.id)
+    router = SessionBoundAgentRouter(db_session, caller=_caller(user))
 
     assert await router.parse_mention("@[Cross Org Payroll] hello") is None
     assert await router.parse_mention("@[Accessible Helpdesk] hello") == accessible
@@ -245,7 +292,7 @@ async def test_executor_switch_agent_denies_inaccessible_agent(db_session: Async
         conversation,
         inaccessible,
         "routed",
-        user=_principal(user),
+        caller=_caller(user),
     )
 
     await db_session.refresh(conversation)
@@ -267,7 +314,7 @@ async def test_executor_switch_agent_persists_accessible_agent(db_session: Async
         conversation,
         accessible,
         "@mention",
-        user=_principal(user),
+        caller=_caller(user),
     )
 
     await db_session.refresh(conversation)

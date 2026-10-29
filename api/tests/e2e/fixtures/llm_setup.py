@@ -10,14 +10,82 @@ Environment variables:
 - GENERIC_AI_BASE_URL: Custom endpoint URL (e.g., DeepSeek)
 """
 
+import asyncio
 import logging
 import os
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import delete
+
+from src.models.orm.ai_models import AIModelAssignment, AIModelProfile, AIProviderConnection
 
 logger = logging.getLogger(__name__)
+
+
+async def _delete_model_profile(async_session_factory, profile_id: str, connection_id: str) -> None:
+    async with async_session_factory() as session:
+        await session.execute(
+            delete(AIModelAssignment).where(AIModelAssignment.profile_id == UUID(profile_id))
+        )
+        await session.execute(delete(AIModelProfile).where(AIModelProfile.id == UUID(profile_id)))
+        await session.execute(
+            delete(AIProviderConnection).where(AIProviderConnection.id == UUID(connection_id))
+        )
+        await session.commit()
+
+
+@contextmanager
+def _configured_model_profile(
+    e2e_client, platform_admin, async_session_factory, config: dict[str, Any]
+) -> Iterator[None]:
+    """Create a saved provider connection and reusable profile for live-LLM tests.
+
+    The profile becomes the global primary and chat default model, so it is
+    removed afterwards: a live provider left behind makes later agent runs in
+    the same suite call it.
+    """
+    suffix = uuid4().hex[:8]
+    connection_response = e2e_client.post(
+        "/api/admin/ai/connections",
+        json={
+            "name": f"E2E {config['provider']} {suffix}",
+            "provider": config["provider"],
+            "api_key": config["api_key"],
+            "endpoint": config.get("endpoint"),
+        },
+        headers=platform_admin.headers,
+    )
+    assert connection_response.status_code == 201, connection_response.text
+    connection_id = connection_response.json()["id"]
+    profile_response = e2e_client.post(
+        "/api/admin/ai/profiles",
+        json={
+            "name": f"E2E Chat {suffix}",
+            "connection_id": connection_id,
+            "model": config["model"],
+            "enabled_for_chat": True,
+        },
+        headers=platform_admin.headers,
+    )
+    assert profile_response.status_code == 201, profile_response.text
+    profile_id = profile_response.json()["id"]
+    for assignment in ("primary", "chat_default"):
+        response = e2e_client.put(
+            f"/api/admin/ai/assignments/{assignment}",
+            json={"profile_id": profile_id},
+            headers=platform_admin.headers,
+        )
+        assert response.status_code == 200, response.text
+    try:
+        yield
+    finally:
+        # The API keeps the required primary and chat assignments, so the
+        # rows this fixture created are removed directly.
+        asyncio.run(_delete_model_profile(async_session_factory, profile_id, connection_id))
 
 
 @pytest.fixture(scope="session")
@@ -51,32 +119,15 @@ def llm_config_cleanup(e2e_client, platform_admin) -> Generator[None, None, None
     This fixture ensures tests start with a clean state and
     cleans up any configuration created during the test.
     """
-    # Clean up any existing config before test
-    try:
-        e2e_client.delete(
-            "/api/admin/llm/config",
-            headers=platform_admin.headers,
-        )
-    except Exception:
-        pass  # Ignore if no config exists
-
+    del e2e_client, platform_admin
     yield
-
-    # Clean up after test
-    try:
-        e2e_client.delete(
-            "/api/admin/llm/config",
-            headers=platform_admin.headers,
-        )
-        logger.info("Cleaned up LLM config after test")
-    except Exception:
-        pass  # Ignore cleanup failures
 
 
 @pytest.fixture(scope="function")
 def llm_anthropic_configured(
     e2e_client,
     platform_admin,
+    async_session_factory,
     llm_test_anthropic_key,
 ) -> Generator[dict[str, Any], None, None]:
     """
@@ -94,36 +145,19 @@ def llm_anthropic_configured(
         "provider": "anthropic",
         "model": "claude-haiku-4-5-20251001",
         "api_key": llm_test_anthropic_key,
-        "max_tokens": 1024,
     }
 
-    response = e2e_client.post(
-        "/api/admin/llm/config",
-        json=config,
-        headers=platform_admin.headers,
-    )
-    assert response.status_code == 200, (
-        f"Failed to configure Anthropic: {response.text}"
-    )
+    with _configured_model_profile(e2e_client, platform_admin, async_session_factory, config):
+        logger.info("Configured Anthropic LLM provider")
+        yield config
 
-    logger.info("Configured Anthropic LLM provider")
-    yield config
-
-    # Cleanup
-    try:
-        e2e_client.delete(
-            "/api/admin/llm/config",
-            headers=platform_admin.headers,
-        )
-        logger.info("Cleaned up Anthropic config")
-    except Exception as e:
-        logger.warning(f"Failed to cleanup Anthropic config: {e}")
 
 
 @pytest.fixture(scope="function")
 def llm_openai_configured(
     e2e_client,
     platform_admin,
+    async_session_factory,
     llm_test_openai_key,
 ) -> Generator[dict[str, Any], None, None]:
     """
@@ -141,25 +175,8 @@ def llm_openai_configured(
         "provider": "openai",
         "model": "gpt-4o-mini",
         "api_key": llm_test_openai_key,
-        "max_tokens": 1024,
     }
 
-    response = e2e_client.post(
-        "/api/admin/llm/config",
-        json=config,
-        headers=platform_admin.headers,
-    )
-    assert response.status_code == 200, f"Failed to configure OpenAI: {response.text}"
-
-    logger.info("Configured OpenAI LLM provider")
-    yield config
-
-    # Cleanup
-    try:
-        e2e_client.delete(
-            "/api/admin/llm/config",
-            headers=platform_admin.headers,
-        )
-        logger.info("Cleaned up OpenAI config")
-    except Exception as e:
-        logger.warning(f"Failed to cleanup OpenAI config: {e}")
+    with _configured_model_profile(e2e_client, platform_admin, async_session_factory, config):
+        logger.info("Configured OpenAI LLM provider")
+        yield config

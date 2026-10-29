@@ -8,22 +8,26 @@ const storeState = {
 };
 
 vi.mock("react-router-dom", async () => {
-	const actual = await vi.importActual<typeof import("react-router-dom")>(
-		"react-router-dom",
-	);
+	const actual =
+		await vi.importActual<typeof import("react-router-dom")>(
+			"react-router-dom",
+		);
 	return {
 		...actual,
 		useParams: () => paramsRef,
-		Link: ({ children }: { children: React.ReactNode }) => <a>{children}</a>,
+		Link: ({ children }: { children: React.ReactNode }) => (
+			<a>{children}</a>
+		),
 	};
 });
 
 vi.mock("@/stores/chatStore", () => ({
-	useChatStore: () => storeState,
+	useChatStore: <T,>(selector: (state: typeof storeState) => T) =>
+		selector(storeState),
 }));
 
-vi.mock("@/hooks/useLLMConfig", () => ({
-	useLLMConfig: () => ({
+vi.mock("@/hooks/useChatAvailability", () => ({
+	useChatAvailability: () => ({
 		isConfigured: true,
 		isPlatformAdmin: true,
 		isLoading: false,
@@ -31,9 +35,11 @@ vi.mock("@/hooks/useLLMConfig", () => ({
 }));
 
 vi.mock("@/components/chat", () => ({
-	ChatLayout: ({ initialConversationId }: { initialConversationId?: string }) => (
-		<div>{initialConversationId ?? "blank-chat"}</div>
-	),
+	ChatLayout: ({
+		initialConversationId,
+	}: {
+		initialConversationId?: string;
+	}) => <div>{initialConversationId ?? "blank-chat"}</div>,
 }));
 
 import { Chat } from "./Chat";

@@ -15,13 +15,18 @@ Key Features:
 """
 
 import logging
+from dataclasses import replace
 from datetime import datetime, timezone
+from typing import Annotated, NoReturn
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from shared.device_auth import decide_device_login
+from shared.models import BrowserImpersonationTokenResponse, DeviceAuthorizeRequest
 from src.core.cache import get_shared_redis
 from src.core.cache.keys import (
     device_code_key,
@@ -33,7 +38,6 @@ from src.core.cache.keys import (
 )
 from src.models import (
     AuthStatusResponse,
-    DeviceAuthorizeRequest,
     DeviceCodeResponse,
     DeviceTokenErrorResponse,
     DeviceTokenRequest,
@@ -49,12 +53,24 @@ from src.models.contracts.passkeys import (
     SetupPasskeyVerifyResponse,
 )
 from src.config import get_settings
-from src.core.auth import CurrentActiveUser, CurrentSuperuser
+from src.core.auth import CurrentActiveUser, get_original_human_user
 from src.core.db_deps import DbSession
 from src.core.log_safety import log_safe
-from src.core.rate_limit import auth_limiter, mfa_limiter, get_client_ip
+from src.core.principal import UserPrincipal
+from src.core.rate_limit import auth_limiter, device_token_limiter, mfa_limiter, get_client_ip
 from src.services.audit import emit_audit
 from src.services.audit_context import ActorContext, current_actor
+from shared.browser_impersonation import (
+    BrowserImpersonationError,
+    IMPERSONATION_COOKIE_NAME,
+    IMPERSONATION_MARKER_MAX_AGE_SECONDS,
+    create_browser_impersonation,
+    decode_browser_impersonation_marker,
+    is_browser_impersonation,
+    revoke_browser_impersonation_marker,
+    revoke_browser_impersonation,
+)
+from src.services.authorization.impersonation import RunAsError
 from src.core.security import (
     create_access_token,
     create_mfa_token,
@@ -68,9 +84,9 @@ from src.core.security import (
 from src.repositories.users import UserRepository
 from src.services.user_provisioning import ensure_user_provisioned, get_user_roles
 from shared.external_access import (
-    resolve_external_claim,
     resolve_provider_org_claim,
 )
+from shared.identities import is_identity, refuse_identity_sign_in
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +108,9 @@ def set_auth_cookies(response: Response, access_token: str, refresh_token: str):
     Also sets a CSRF token cookie that JavaScript can read and send as a header.
     """
     settings = get_settings()
+    # A new login or refresh starts an ordinary session. Never leave an old
+    # browser-wide impersonation marker able to override it.
+    clear_browser_impersonation_cookie(response)
 
     # Determine if we're in production (HTTPS)
     # Only use secure cookies in production - dev and testing use HTTP
@@ -137,6 +156,27 @@ def clear_auth_cookies(response: Response):
     response.delete_cookie(key="access_token", path="/")
     response.delete_cookie(key="refresh_token", path="/")
     response.delete_cookie(key="csrf_token", path="/")
+    clear_browser_impersonation_cookie(response)
+
+
+def set_browser_impersonation_cookie(response: Response, token: str) -> None:
+    """Set the opaque browser-wide impersonation marker."""
+    response.set_cookie(
+        key=IMPERSONATION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=get_settings().is_production,
+        samesite="lax",
+        # Deliberately longer than the signed token: expiry must fail closed
+        # instead of revealing the ordinary administrator session.
+        max_age=IMPERSONATION_MARKER_MAX_AGE_SECONDS,
+        path="/",
+    )
+
+
+def clear_browser_impersonation_cookie(response: Response) -> None:
+    """Clear an active, expired, or revoked impersonation marker."""
+    response.delete_cookie(key=IMPERSONATION_COOKIE_NAME, path="/")
 
 
 # =============================================================================
@@ -174,6 +214,12 @@ async def validate_and_revoke_refresh_token_jti(user_id: str, jti: str) -> bool:
     # Atomically check and delete
     result = await r.delete(key)
     return result > 0
+
+
+async def has_live_refresh_token_jti(user_id: str, jti: str) -> bool:
+    """Check a refresh session without rotating or revoking it."""
+    r = await get_shared_redis()
+    return bool(await r.exists(refresh_token_jti_key(user_id, jti)))
 
 
 async def revoke_all_user_refresh_tokens(user_id: str) -> int:
@@ -271,6 +317,36 @@ class UserCreate(BaseModel):
     name: str | None = None
 
 
+async def _refuse_login(
+    db: AsyncSession,
+    *,
+    email: str,
+    reason: str,
+    user=None,
+    status_code: int = status.HTTP_401_UNAUTHORIZED,
+    detail: str = "Incorrect email or password",
+) -> NoReturn:
+    """Record a refused sign-in, then refuse it.
+
+    The record is committed before raising: the request's session rolls back
+    when the refusal propagates, which would otherwise take the record with it.
+    """
+    await emit_audit(
+        db,
+        "auth.login.failed",
+        resource_type="user" if user is not None else None,
+        resource_id=user.id if user is not None else None,
+        outcome="failure",
+        details={"email": email, "reason": reason},
+    )
+    await db.commit()
+    raise HTTPException(
+        status_code=status_code,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"} if status_code == status.HTTP_401_UNAUTHORIZED else None,
+    )
+
+
 # =============================================================================
 # Endpoints
 # =============================================================================
@@ -317,58 +393,25 @@ async def login(
     user = await user_repo.get_by_email(form_data.username)
 
     if not user:
-        await emit_audit(
-            db,
-            "auth.login.failed",
-            outcome="failure",
-            details={"email": form_data.username, "reason": "user_not_found"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
+        await _refuse_login(db, email=form_data.username, reason="user_not_found")
+    if is_identity(user):
+        await _refuse_login(db, email=user.email, reason="identity", user=user, detail="Invalid credentials")
     if not user.hashed_password:
-        await emit_audit(
+        await _refuse_login(
             db,
-            "auth.login.failed",
-            resource_type="user",
-            resource_id=user.id,
-            outcome="failure",
-            details={"email": user.email, "reason": "no_password"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            email=user.email,
+            reason="no_password",
+            user=user,
             detail="Account does not have password authentication enabled",
-            headers={"WWW-Authenticate": "Bearer"},
         )
-
     if not verify_password(form_data.password, user.hashed_password):
-        await emit_audit(
-            db,
-            "auth.login.failed",
-            resource_type="user",
-            resource_id=user.id,
-            outcome="failure",
-            details={"email": user.email, "reason": "wrong_password"},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
+        await _refuse_login(db, email=user.email, reason="wrong_password", user=user)
     if not user.is_active:
-        await emit_audit(
+        await _refuse_login(
             db,
-            "auth.login.failed",
-            resource_type="user",
-            resource_id=user.id,
-            outcome="failure",
-            details={"email": user.email, "reason": "inactive"},
-        )
-        raise HTTPException(
+            email=user.email,
+            reason="inactive",
+            user=user,
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is inactive",
         )
@@ -517,6 +560,7 @@ async def mfa_initial_setup(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
         )
+    refuse_identity_sign_in(user)
 
     force_new = setup_request.force_new if setup_request else False
 
@@ -604,6 +648,7 @@ async def mfa_initial_verify(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
         )
+    refuse_identity_sign_in(user)
 
     mfa_service = MFAService(db)
 
@@ -630,7 +675,7 @@ async def mfa_initial_verify(
         "email": user.email,
         "name": user.name or user.email.split("@")[0],
         "is_superuser": user.is_superuser,
-        "is_external": await resolve_external_claim(db, user),
+        "is_external": bool(user.is_external),
         "is_provider_org": await resolve_provider_org_claim(db, user),
         "org_id": str(user.organization_id) if user.organization_id else None,
         "roles": roles,
@@ -704,6 +749,7 @@ async def verify_mfa_login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
         )
+    refuse_identity_sign_in(user)
 
     mfa_service = MFAService(db)
 
@@ -765,6 +811,7 @@ async def _generate_login_tokens(user, db, response: Response | None = None) -> 
     Returns:
         LoginResponse with tokens
     """
+    refuse_identity_sign_in(user)
     # Update last login (use naive datetime for DB compatibility)
     user.last_login = datetime.now(timezone.utc)
     await db.commit()
@@ -779,7 +826,7 @@ async def _generate_login_tokens(user, db, response: Response | None = None) -> 
         "email": user.email,
         "name": user.name or user.email.split("@")[0],
         "is_superuser": user.is_superuser,
-        "is_external": await resolve_external_claim(db, user),
+        "is_external": bool(user.is_external),
         "is_provider_org": await resolve_provider_org_claim(db, user),
         "org_id": str(user.organization_id) if user.organization_id else None,
         "roles": roles,
@@ -816,6 +863,10 @@ async def _generate_login_tokens(user, db, response: Response | None = None) -> 
         ip_address=base_actor.ip_address if base_actor else None,
         user_agent=base_actor.user_agent if base_actor else None,
         source="http",
+        # Same request as the middleware's pre-auth actor — carry over its
+        # already-resolved surface rather than defaulting. operation_id is
+        # resolved separately, at emit time, from the request scope.
+        surface=base_actor.surface if base_actor else "web",
     )
     await emit_audit(
         db,
@@ -830,6 +881,118 @@ async def _generate_login_tokens(user, db, response: Response | None = None) -> 
         access_token=access_token,
         refresh_token=refresh_token_str,
     )
+
+
+@router.post("/impersonate/{user_id}", response_model=BrowserImpersonationTokenResponse)
+async def start_browser_impersonation(
+    user_id: UUID,
+    request: Request,
+    response: Response,
+    current_user: CurrentActiveUser,
+    db: DbSession,
+) -> BrowserImpersonationTokenResponse:
+    """Mint a browser-wide, original-session-bound impersonation marker."""
+    if (
+        current_user.embed
+        or current_user.runtime_authority is not None
+        or is_browser_impersonation(current_user)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Browser impersonation requires an original human session",
+        )
+
+    refresh_token = request.cookies.get("refresh_token")
+    refresh_payload = decode_token(refresh_token, expected_type="refresh") if refresh_token else None
+    refresh_jti = refresh_payload.get("jti") if refresh_payload else None
+    if (
+        not isinstance(refresh_jti, str)
+        or refresh_payload.get("sub") != str(current_user.user_id)
+        or not await has_live_refresh_token_jti(str(current_user.user_id), refresh_jti)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Browser impersonation requires the original browser refresh session",
+        )
+    try:
+        credential = await create_browser_impersonation(
+            db,
+            current_user,
+            user_id,
+            initiator_refresh_jti=refresh_jti,
+        )
+    except RunAsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except BrowserImpersonationError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+    start_actor = current_actor()
+    await emit_audit(
+        db,
+        "auth.impersonation.started",
+        resource_type="user",
+        resource_id=user_id,
+        details={
+            "impersonated_by_user_id": str(current_user.user_id),
+            "impersonation_session_id": str(credential.session_id),
+        },
+        actor_override=(
+            replace(
+                start_actor,
+                impersonated_by_user_id=current_user.user_id,
+                impersonation_session_id=credential.session_id,
+            )
+            if start_actor is not None
+            else None
+        ),
+    )
+    set_browser_impersonation_cookie(response, credential.access_token)
+    return BrowserImpersonationTokenResponse(access_token=credential.access_token)
+
+
+@router.post("/impersonation/end", status_code=status.HTTP_204_NO_CONTENT)
+async def end_browser_impersonation(
+    request: Request,
+    response: Response,
+    original_operator: Annotated[UserPrincipal, Depends(get_original_human_user)],
+    db: DbSession,
+) -> None:
+    """Exit using the original operator, even after marker expiry or revocation."""
+    marker = request.cookies.get(IMPERSONATION_COOKIE_NAME)
+    marker_payload = decode_browser_impersonation_marker(marker) if marker is not None else None
+    target_user_id = (
+        await revoke_browser_impersonation_marker(marker, original_operator.user_id)
+        if marker is not None
+        else None
+    )
+    clear_browser_impersonation_cookie(response)
+    if target_user_id is not None:
+        end_actor = current_actor()
+        session_id = None
+        if marker_payload is not None:
+            # Revocation above only accepts a marker with a valid session UUID.
+            session_id = UUID(str(marker_payload["impersonation_session_id"]))
+        await emit_audit(
+            db,
+            "auth.impersonation.ended",
+            resource_type="user",
+            resource_id=target_user_id,
+            details={"impersonated_by_user_id": str(original_operator.user_id)},
+            actor_override=(
+                replace(
+                    end_actor,
+                    user_id=original_operator.user_id,
+                    organization_id=original_operator.organization_id,
+                    email=original_operator.email,
+                    name=original_operator.name,
+                    impersonated_by_user_id=original_operator.user_id,
+                    impersonation_session_id=session_id,
+                )
+                if end_actor is not None
+                else None
+            ),
+        )
+    return None
 
 
 @router.post("/refresh", response_model=Token)
@@ -868,6 +1031,15 @@ async def refresh_token(
     # Rate limiting
     client_ip = get_client_ip(request)
     await auth_limiter.check("refresh", client_ip)
+
+    # Do not rotate the original browser session out from under an active or
+    # expired marker. The operator must explicitly Exit before refreshing.
+    if IMPERSONATION_COOKIE_NAME in request.cookies:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Exit browser impersonation before refreshing",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     # Get refresh token from body (API clients) or cookie (browser clients)
     refresh_token_value = None
@@ -932,6 +1104,7 @@ async def refresh_token(
             detail="User not found or inactive",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    refuse_identity_sign_in(user)
 
     # Get fresh user roles from database
     db_roles = await get_user_roles(db, user.id)
@@ -943,7 +1116,7 @@ async def refresh_token(
         "email": user.email,
         "name": user.name or user.email.split("@")[0],
         "is_superuser": user.is_superuser,
-        "is_external": await resolve_external_claim(db, user),
+        "is_external": bool(user.is_external),
         "is_provider_org": await resolve_provider_org_claim(db, user),
         "org_id": str(user.organization_id) if user.organization_id else None,
         "roles": roles,
@@ -1051,6 +1224,8 @@ async def logout(
             )
 
     # Clear cookies
+    if is_browser_impersonation(current_user):
+        await revoke_browser_impersonation(current_user)
     clear_auth_cookies(response)
 
     logger.info(f"User logged out: {current_user.email}")
@@ -1112,28 +1287,39 @@ class AdminRevokeRequest(BaseModel):
 @router.post("/admin/revoke-user", response_model=RevokeAllResponse)
 async def admin_revoke_user_sessions(
     revoke_data: AdminRevokeRequest,
-    current_user: CurrentSuperuser,
+    current_user: CurrentActiveUser,
     db: DbSession,
 ) -> RevokeAllResponse:
     """
-    Revoke all refresh tokens for a specific user (admin only).
+    Revoke all refresh tokens for a specific user.
 
-    Allows platform administrators to forcibly log out a user from all
-    devices. Useful for security incidents or account compromises.
-
-    Requires platform admin (superuser) privileges.
+    Signs a user out of every device: users.readwrite at the user's
+    organization, and only a Platform Admin for a privileged user. Useful
+    for security incidents or account compromises.
 
     Args:
         revoke_data: Target user ID to revoke
-        current_user: Current authenticated user (must be admin)
+        current_user: Current authenticated user
         db: Database session
 
     Returns:
         Number of sessions revoked
 
     Raises:
-        HTTPException: If not admin or user not found
+        HTTPException: If not permitted or user not found
     """
+    from src.services.authorization.enforce import (
+        load_caller,
+        operation_reach,
+        org_target,
+        privileged_user_ids,
+        require_operation,
+        require_unprotected,
+    )
+
+    operation = "POST /auth/admin/revoke-user"
+    caller = await load_caller(db, current_user)
+    operation_reach(caller, operation)
     # Verify target user exists
     user_repo = UserRepository(db)
     target_user = await user_repo.get_by_id(revoke_data.user_id)
@@ -1142,6 +1328,8 @@ async def admin_revoke_user_sessions(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found",
         )
+    require_operation(caller, operation, org_target(target_user.organization_id))
+    require_unprotected(caller, target_user.id in await privileged_user_ids(db, [target_user.id]), target_user.organization_id)
 
     # Revoke all sessions for target user
     count = await revoke_all_user_refresh_tokens(revoke_data.user_id)
@@ -1215,6 +1403,7 @@ async def register_user(
     existing_user = await user_repo.get_by_email(user_data.email)
 
     if existing_user:
+        refuse_identity_sign_in(existing_user)
         # Check if this is a pre-created user completing registration
         if not existing_user.is_registered:
             # Pre-created user - complete their registration
@@ -1476,7 +1665,7 @@ async def exchange_device_token(
 
     # Rate limiting (more lenient for polling)
     client_ip = get_client_ip(request)
-    await auth_limiter.check("device_token", client_ip)
+    await device_token_limiter.check("device_token", client_ip)
 
     r = await get_shared_redis()
 
@@ -1694,7 +1883,7 @@ async def setup_passkey_verify(
         "email": user.email,
         "name": user.name or user.email.split("@")[0],
         "is_superuser": user.is_superuser,
-        "is_external": await resolve_external_claim(db, user),
+        "is_external": bool(user.is_external),
         "is_provider_org": await resolve_provider_org_claim(db, user),
         "org_id": str(user.organization_id) if user.organization_id else None,
         "roles": roles,
@@ -1722,85 +1911,49 @@ async def authorize_device(
     authorize_request: DeviceAuthorizeRequest,
     current_user: CurrentActiveUser,
 ) -> DeviceAuthorizeResponse:
-    """
-    Authorize a device code (user approves CLI access).
+    """Approve a CLI login after explicit confirmation. The first decision is final."""
+    return await _record_device_decision(authorize_request.user_code, True, current_user)
 
-    This endpoint is called by the web UI when a logged-in user enters the
-    user_code and approves CLI access. The CLI will then receive tokens on
-    its next poll to /device/token.
 
-    Requires authentication - user must be logged in to authorize a device.
+@router.post("/device/deny", response_model=DeviceAuthorizeResponse)
+async def deny_device(
+    deny_request: DeviceAuthorizeRequest,
+    current_user: CurrentActiveUser,
+) -> DeviceAuthorizeResponse:
+    """Deny a CLI login without ever calling the approval endpoint."""
+    return await _record_device_decision(deny_request.user_code, False, current_user)
 
-    Args:
-        authorize_request: Device authorization request with user_code
-        current_user: Current authenticated user (from JWT)
 
-    Returns:
-        Success response
-
-    Raises:
-        HTTPException: If user_code is invalid or expired
-    """
-    import json
-
-    r = await get_shared_redis()
-
-    # Look up device_code from user_code (reverse index)
-    device_code = await r.get(device_user_code_index_key(authorize_request.user_code))
-
-    if not device_code:
-        logger.warning(
-            f"Device authorization attempt with invalid user_code: {log_safe(authorize_request.user_code)}",
-            extra={"user_id": str(current_user.user_id)}
+async def _record_device_decision(
+    user_code: str, approved: bool, current_user: UserPrincipal,
+) -> DeviceAuthorizeResponse:
+    if is_browser_impersonation(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Exit impersonation before authorizing a CLI login",
         )
+
+    decision = await decide_device_login(
+        user_code,
+        str(current_user.user_id),
+        approved,
+    )
+    if decision == "expired":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Invalid or expired user code",
         )
-
-    device_code_str = device_code.decode() if isinstance(device_code, bytes) else device_code
-
-    # Get device data
-    device_data_json = await r.get(device_code_key(device_code_str))
-
-    if not device_data_json:
-        logger.warning(
-            f"Device code missing for user_code: {log_safe(authorize_request.user_code)}",
-            extra={"user_id": str(current_user.user_id)}
-        )
+    if decision == "decided":
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Invalid or expired user code",
-        )
-
-    # Update device code status to authorized
-    device_data = json.loads(device_data_json)
-    device_data["status"] = "authorized"
-    device_data["user_id"] = str(current_user.user_id)
-
-    # Get remaining TTL and preserve it
-    ttl = await r.ttl(device_code_key(device_code_str))
-    if ttl > 0:
-        await r.setex(
-            device_code_key(device_code_str),
-            ttl,
-            json.dumps(device_data)
-        )
-    else:
-        # Fallback if TTL query fails
-        await r.setex(
-            device_code_key(device_code_str),
-            TTL_DEVICE_CODE,
-            json.dumps(device_data)
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This CLI login has already been approved or denied. Start a new login from your CLI.",
         )
 
     logger.info(
-        f"Device authorized by user: {current_user.email}",
-        extra={
-            "user_id": str(current_user.user_id),
-            "user_code": log_safe(authorize_request.user_code),
-            "device_code": log_safe(device_code_str[:8]) + "...",
-        }
+        "CLI device login %s by user: %s",
+        "approved" if approved else "denied",
+        log_safe(current_user.email),
+        extra={"user_id": str(current_user.user_id)},
     )
 
     return DeviceAuthorizeResponse(success=True)

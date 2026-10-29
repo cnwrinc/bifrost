@@ -10,16 +10,19 @@ from uuid import UUID
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from shared.app_build_errors import APP_BUILD_JOB_TYPES, app_build_memory_message
 from src.core.database import close_db, get_db_context, init_db
 from src.jobs.platform.base import (
     PlatformJobCancelled,
     PlatformJobContext,
     PlatformJobDeferred,
     PlatformJobFailure,
+    PlatformJobRequiresAction,
 )
 from src.jobs.platform.registry import get_platform_job_definition
 from src.models.orm.platform_jobs import PlatformJob
-from src.services.platform_jobs import defer_platform_job, finish_platform_job
+from src.services.audit_context import ActorContext, clear_actor, set_actor
+from src.services.platform_jobs import defer_platform_job, finish_platform_job, retry_platform_job_failure
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +76,28 @@ async def run_claimed_platform_job(job_id: UUID, lease_token: UUID) -> bool:
             requested_by_user_id=job.requested_by_user_id,
             requested_by_email=job.requested_by_email,
             requested_by_name=job.requested_by_name,
+            impersonated_by_user_id=job.impersonated_by_user_id,
+            impersonation_session_id=job.impersonation_session_id,
+            checkpoint=job.result,
         )
+
+    try:
+        requested_by_user_id = UUID(context.requested_by_user_id)
+    except ValueError:
+        requested_by_user_id = None
+    actor_token = set_actor(
+        ActorContext(
+            user_id=requested_by_user_id,
+            organization_id=context.organization_id,
+            email=context.requested_by_email,
+            name=context.requested_by_name,
+            source="platform_job",
+            # Background system work, not a browser/CLI/MCP call.
+            surface="service",
+            impersonated_by_user_id=context.impersonated_by_user_id,
+            impersonation_session_id=context.impersonation_session_id,
+        )
+    )
 
     try:
         payload = definition.payload_model.model_validate(payload_data)
@@ -98,13 +122,14 @@ async def run_claimed_platform_job(job_id: UUID, lease_token: UUID) -> bool:
             result=exc.result,
         )
     except PlatformJobFailure as exc:
+        return await retry_platform_job_failure(job_id, lease_token, exc, enabled=definition.policy.retry_on_failure)
+    except PlatformJobRequiresAction as exc:
         return await finish_platform_job(
             job_id,
             lease_token,
-            status="failed",
-            error_code=exc.code,
-            error_message=exc.message,
-            error_retryable=exc.retryable,
+            status="requires_action",
+            phase=exc.phase,
+            result=exc.result,
         )
     except ValidationError as exc:
         return await finish_platform_job(
@@ -114,16 +139,25 @@ async def run_claimed_platform_job(job_id: UUID, lease_token: UUID) -> bool:
             error_code="invalid_payload",
             error_message=str(exc),
         )
-    except Exception:
-        logger.exception("Unhandled platform-job handler failure", extra={"job_id": str(job_id)})
+    except Exception as exc:
+        logger.exception(
+            "Unhandled platform-job handler failure", extra={"job_id": str(job_id)}
+        )
+        build_oom = isinstance(exc, MemoryError) and job.job_type in APP_BUILD_JOB_TYPES
         return await finish_platform_job(
             job_id,
             lease_token,
             status="failed",
-            error_code="handler_error",
-            error_message="Platform job failed unexpectedly; see server logs.",
+            error_code="memory_pressure" if build_oom else "handler_error",
+            error_message=(
+                app_build_memory_message()
+                if build_oom
+                else "Platform job failed unexpectedly; see server logs."
+            ),
             error_retryable=False,
         )
+    finally:
+        clear_actor(actor_token)
 
 
 async def _main(job_id: str, lease_token: str) -> int:
@@ -141,4 +175,7 @@ async def _main(job_id: str, lease_token: str) -> int:
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         raise SystemExit("usage: platform.runner JOB_ID LEASE_TOKEN")
+    from src.services.execution.oom_priority import volunteer_for_oom_kill
+
+    volunteer_for_oom_kill()
     raise SystemExit(asyncio.run(_main(sys.argv[1], sys.argv[2])))

@@ -1,5 +1,6 @@
 """E2E tests for form embed HMAC flow."""
 
+import base64
 import hashlib
 import hmac as hmac_module
 import uuid
@@ -15,7 +16,15 @@ def _compute_hmac(params: dict, secret: str) -> str:
     return hmac_module.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 
+def _compute_halopsa_hmac(agent_id: str, secret: str) -> str:
+    digest = hmac_module.new(
+        secret.encode(), agent_id.encode(), hashlib.sha256
+    ).digest()
+    return base64.b64encode(digest).decode()
+
+
 @pytest.mark.e2e
+@pytest.mark.usefixtures("secrets_reader_platform_admin")
 class TestFormEmbed:
     @pytest.fixture
     def form_with_secret(self, e2e_client, platform_admin):
@@ -72,6 +81,38 @@ class TestFormEmbed:
             params={"agent_id": "42"},
         )
         assert r.status_code == 403
+
+    def test_halopsa_bootstrap_promotes_only_agent_id(
+        self, e2e_client, platform_admin, form_with_secret
+    ):
+        form_id = form_with_secret["form"]["id"]
+        secret = "contoso-form-halopsa-secret"
+        created = e2e_client.post(
+            f"/api/forms/{form_id}/embed-secrets",
+            headers=platform_admin.headers,
+            json={
+                "name": "Contoso HaloPSA",
+                "secret": secret,
+                "hmac_scheme": "halopsa",
+            },
+        )
+        assert created.status_code == 201, created.text
+
+        agent_id = "42"
+        r = e2e_client.get(
+            f"/embed/forms/{form_id}",
+            params={
+                "agent_id": agent_id,
+                "customer": "Fabrikam",
+                "hmac": _compute_halopsa_hmac(agent_id, secret),
+            },
+            follow_redirects=False,
+        )
+        assert r.status_code == 302, r.text
+        token = r.headers["location"].split("#embed_token=", 1)[1]
+        payload = decode_token(token, expected_type="access")
+        assert payload is not None
+        assert payload["verified_context"] == {"agent_id": agent_id}
 
     def test_embed_form_nonexistent(self, e2e_client):
         """Non-existent form should return 404."""
@@ -343,18 +384,22 @@ def _mint_app_embed_token(e2e_client, platform_admin, *, organization_id=None):
 
 
 @pytest.mark.e2e
+@pytest.mark.usefixtures("secrets_reader_platform_admin")
 class TestEmbedFormCrossTenantBinding:
     """EXT-1 NEW-I (HIGH, cross-tenant code execution): the embed short-circuits
     in get_form / execute_form / execute_startup_workflow / generate_upload_url
     skipped access control for ANY embed token with no binding between the
-    token's form_id/app_id and the path form. An embed token minted for one
-    resource in org H could READ and EXECUTE any form in any other org — a
-    workflow run as sentinel in the victim's org, output returned to the
-    attacker. The fix binds every embed short-circuit to the path form
-    (form_id match, or app-embed → same-org only).
+    token's form_id and the path form. A form-embed token minted for one form
+    could READ and EXECUTE any other form in any other org — a workflow run
+    as sentinel in the victim's org, output returned to the attacker. The fix
+    binds every embed short-circuit to a form-embed token's own form_id.
+    App-embed tokens have no form_id claim at all, so they are never
+    form-bound and are denied every form path outright (no runtime app uses
+    forms).
 
-    These tests exercise all four sites with both attack vectors (form-embed
-    token and app-embed token) and confirm the legitimate paths still work.
+    These tests exercise all four sites for the form-embed attack vector and
+    confirm app-embed tokens are denied outright, while the legitimate
+    form-embed path still works.
     """
 
     @pytest.fixture
@@ -524,10 +569,11 @@ class TestEmbedFormCrossTenantBinding:
                 f"/api/forms/{form['id']}", headers=platform_admin.headers
             )
 
-    def test_app_embed_can_read_same_org_form(
+    def test_app_embed_cannot_read_same_org_form(
         self, e2e_client, platform_admin, org1
     ):
-        # An app-embed token in org1 CAN read a form in org1 (same-org binding).
+        # An app-embed token has no form binding at all: it must be denied a
+        # form in its OWN org too, not just a cross-org one.
         _app, token = _mint_app_embed_token(
             e2e_client, platform_admin, organization_id=org1["id"]
         )
@@ -545,8 +591,8 @@ class TestEmbedFormCrossTenantBinding:
         try:
             headers = {"Authorization": f"Bearer {token}"}
             r = e2e_client.get(f"/api/forms/{form['id']}/runtime", headers=headers)
-            assert r.status_code == 200, (
-                f"app-embed token (org1) must read an org1 form: "
+            assert r.status_code in (403, 404), (
+                f"app-embed token (org1) must not read an org1 form: "
                 f"{r.status_code} {r.text}"
             )
         finally:

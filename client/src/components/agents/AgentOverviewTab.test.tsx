@@ -1,3 +1,4 @@
+import { AgentOverviewTab } from "./AgentOverviewTab";
 /**
  * Tests for AgentOverviewTab.
  *
@@ -18,6 +19,14 @@ function NavigationStateProbe() {
 	);
 }
 
+const mockAuth = vi.fn();
+vi.mock("@/contexts/AuthContext", () => ({ useAuth: () => mockAuth() }));
+
+const mockAuthorization = vi.fn();
+vi.mock("@/services/authorization", () => ({
+	useAuthorization: () => mockAuthorization(),
+}));
+
 const mockUseAgentStats = vi.fn();
 vi.mock("@/services/agents", () => ({
 	useAgentStats: (id: string | undefined) => mockUseAgentStats(id),
@@ -31,6 +40,11 @@ vi.mock("@/services/agentRuns", () => ({
 const mockUseAgent = vi.fn();
 vi.mock("@/hooks/useAgents", () => ({
 	useAgent: (id: string | undefined) => mockUseAgent(id),
+}));
+
+const mockListModelProfiles = vi.fn();
+vi.mock("@/services/aiModels", () => ({
+	listModelProfiles: () => mockListModelProfiles(),
 }));
 
 const baseStats = {
@@ -69,6 +83,12 @@ function makeRun(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+	mockListModelProfiles.mockClear();
+	mockAuth.mockReturnValue({ isPlatformAdmin: true });
+	mockAuthorization.mockReturnValue({
+		canAt: () => true,
+		canAnywhere: () => true,
+	});
 	mockUseAgentStats.mockReturnValue({ data: baseStats, isLoading: false });
 	mockUseAgentRuns.mockReturnValue({
 		data: { items: [makeRun()], total: 1, next_cursor: null },
@@ -82,17 +102,35 @@ beforeEach(() => {
 			channels: ["chat"],
 			access_level: "authenticated",
 			created_by: "admin",
-			llm_model: null,
+			llm_profile_id: null,
 			max_iterations: 15,
 			max_token_budget: 50000,
 			is_active: true,
 		},
 		isLoading: false,
 	});
+	mockListModelProfiles.mockResolvedValue([
+		{
+			id: "profile-support",
+			name: "Support profile",
+			connection_id: "connection-1",
+			model: "gpt-5-mini",
+			capabilities: null,
+			enabled_for_chat: true,
+			connection: {
+				id: "connection-1",
+				name: "Default",
+				provider: "openai",
+				endpoint: null,
+			},
+			assignment_keys: [],
+			created_at: "2026-08-22T00:00:00Z",
+			updated_at: "2026-08-22T00:00:00Z",
+		},
+	]);
 });
 
 async function renderTab(agentId = "agent-1") {
-	const { AgentOverviewTab } = await import("./AgentOverviewTab");
 	return renderWithProviders(<AgentOverviewTab agentId={agentId} />);
 }
 
@@ -101,6 +139,37 @@ describe("AgentOverviewTab", () => {
 		await renderTab();
 		expect(screen.getByText("42")).toBeInTheDocument(); // runs
 		expect(screen.getByText("95%")).toBeInTheDocument(); // success rate
+	});
+
+	it("shows the governed model profile setting", async () => {
+		mockUseAgent.mockReturnValue({
+			data: {
+				id: "agent-1",
+				name: "Triage",
+				description: "Test",
+				channels: ["chat"],
+				access_level: "authenticated",
+				created_by: "admin",
+				llm_profile_id: "profile-support",
+				max_iterations: 15,
+				max_token_budget: 50000,
+				is_active: true,
+			},
+			isLoading: false,
+		});
+		await renderTab();
+		expect(await screen.findByText("Support profile")).toBeInTheDocument();
+		expect(screen.getByText("Model profile")).toBeInTheDocument();
+	});
+
+	it("does not request model profiles without global settings read", async () => {
+		mockAuthorization.mockReturnValue({
+			canAt: () => false,
+			canAnywhere: () => false,
+		});
+		await renderTab();
+		expect(screen.getByText("Primary profile assignment")).toBeVisible();
+		expect(mockListModelProfiles).not.toHaveBeenCalled();
 	});
 
 	it("renders the recent runs list", async () => {
@@ -112,7 +181,6 @@ describe("AgentOverviewTab", () => {
 	});
 
 	it("keeps the overview as the origin when a recent run is opened", async () => {
-		const { AgentOverviewTab } = await import("./AgentOverviewTab");
 		const { user } = renderWithProviders(
 			<Routes>
 				<Route
@@ -222,4 +290,49 @@ describe("AgentOverviewTab", () => {
 			screen.getByText(/no runs yet for this agent/i),
 		).toBeInTheDocument();
 	});
+});
+
+it("shows retryable read errors instead of empty activity", async () => {
+	const retryStats = vi.fn();
+	const retryRuns = vi.fn();
+	mockUseAgentStats.mockReturnValue({
+		data: undefined,
+		isLoading: false,
+		isError: true,
+		refetch: retryStats,
+	});
+	mockUseAgentRuns.mockReturnValue({
+		data: undefined,
+		isLoading: false,
+		isError: true,
+		refetch: retryRuns,
+	});
+	const { user } = await renderTab();
+	expect(screen.getByText("Could not load statistics.")).toBeVisible();
+	expect(screen.getByText("Could not load recent runs.")).toBeVisible();
+	expect(screen.queryByText("No activity yet")).not.toBeInTheDocument();
+	expect(
+		screen.queryByText("No runs yet for this agent."),
+	).not.toBeInTheDocument();
+	await user.click(screen.getByRole("button", { name: "Retry statistics" }));
+	await user.click(screen.getByRole("button", { name: "Retry recent runs" }));
+	expect(retryStats).toHaveBeenCalledOnce();
+	expect(retryRuns).toHaveBeenCalledOnce();
+});
+
+it("retains cached activity when refresh fails", async () => {
+	mockUseAgentStats.mockReturnValue({
+		data: baseStats,
+		isError: true,
+		isLoading: false,
+	});
+	mockUseAgentRuns.mockReturnValue({
+		data: { items: [makeRun()] },
+		isError: true,
+		isLoading: false,
+	});
+	await renderTab();
+	expect(screen.getByText("Help me")).toBeVisible();
+	expect(screen.getByText("95%")).toBeVisible();
+	expect(screen.getByText("Could not load recent runs.")).toBeVisible();
 });

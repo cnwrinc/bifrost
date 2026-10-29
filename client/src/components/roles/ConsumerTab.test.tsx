@@ -9,7 +9,7 @@
 import { describe, it, expect, vi } from "vitest";
 import userEvent from "@testing-library/user-event";
 
-import { renderWithProviders, screen, waitFor } from "@/test-utils";
+import { renderWithProviders, screen, waitFor, within } from "@/test-utils";
 import { ConsumerTab, type ConsumerTabItem } from "./ConsumerTab";
 
 const defaults = {
@@ -46,13 +46,39 @@ describe("ConsumerTab", () => {
 		expect(screen.getByText("bob@example.com")).toBeInTheDocument();
 	});
 
+	it("opens an assigned item without treating checkbox selection as navigation", async () => {
+		const user = userEvent.setup();
+		const onItemClick = vi.fn();
+		renderWithProviders(
+			<ConsumerTab
+				{...defaults}
+				items={[{ id: "a", primary: "Alice" }]}
+				onItemClick={onItemClick}
+				getItemHref={(item) => `/users/${item.id}`}
+			/>,
+		);
+
+		await user.click(screen.getByText("Alice"));
+		expect(onItemClick).toHaveBeenCalledWith(
+			expect.objectContaining({ id: "a" }),
+		);
+
+		onItemClick.mockClear();
+		await user.click(screen.getByLabelText("Select Alice"));
+		expect(onItemClick).not.toHaveBeenCalled();
+	});
+
 	it("filters items by search across primary and secondary", async () => {
 		const user = userEvent.setup();
 		renderWithProviders(
 			<ConsumerTab
 				{...defaults}
 				items={[
-					{ id: "a", primary: "Alice", secondary: "alice@example.com" },
+					{
+						id: "a",
+						primary: "Alice",
+						secondary: "alice@example.com",
+					},
 					{ id: "b", primary: "Bob", secondary: "bob@example.com" },
 				]}
 			/>,
@@ -98,16 +124,16 @@ describe("ConsumerTab", () => {
 
 	it("opens the AssignDrawer when the Assign button is clicked", async () => {
 		const user = userEvent.setup();
+		const onRequestCandidates = vi.fn();
 		renderWithProviders(
 			<ConsumerTab
 				{...defaults}
 				candidates={[{ id: "c", primary: "Carol" }]}
+				onRequestCandidates={onRequestCandidates}
 			/>,
 		);
 
-		await user.click(
-			screen.getByRole("button", { name: /assign users/i }),
-		);
+		await user.click(screen.getByRole("button", { name: /assign users/i }));
 
 		// Candidate is rendered inside the drawer once it opens
 		await waitFor(() => {
@@ -117,5 +143,109 @@ describe("ConsumerTab", () => {
 		expect(
 			screen.getByText(/pick the users you want to add/i),
 		).toBeInTheDocument();
+		expect(onRequestCandidates).toHaveBeenCalledOnce();
 	});
+
+	it("keeps the pagination summary when assigned users fit on one page", () => {
+		renderWithProviders(
+			<ConsumerTab
+				{...defaults}
+				items={[{ id: "a", primary: "Alice" }]}
+				pagination={{
+					offset: 0,
+					limit: 25,
+					total: 1,
+					onPageChange: vi.fn(),
+				}}
+			/>,
+		);
+		expect(screen.getByText("Alice")).toBeInTheDocument();
+		expect(screen.getByText("1–1 of 1 · Page 1 of 1")).toBeInTheDocument();
+		expect(
+			screen.queryByRole("button", { name: /^Next$/i }),
+		).not.toBeInTheDocument();
+	});
+
+	it("keeps pagination in the pinned table footer", async () => {
+		const user = userEvent.setup();
+		const onPageChange = vi.fn();
+		renderWithProviders(
+			<ConsumerTab
+				{...defaults}
+				items={[{ id: "a", primary: "Alice" }]}
+				pagination={{
+					offset: 0,
+					limit: 25,
+					total: 30,
+					onPageChange,
+				}}
+			/>,
+		);
+
+		const pagination = screen.getByRole("navigation", {
+			name: /pagination/i,
+		});
+		expect(pagination.closest("tfoot")).not.toBeNull();
+		expect(
+			screen.getAllByRole("table")[0].parentElement?.parentElement,
+		).toHaveClass("max-h-full");
+
+		await user.click(screen.getByRole("button", { name: /^Next$/i }));
+		expect(onPageChange).toHaveBeenCalledWith(25);
+	});
+
+	it("keeps previous pagination available when the current page has no assigned users", async () => {
+		const user = userEvent.setup();
+		const onPageChange = vi.fn();
+		renderWithProviders(
+			<ConsumerTab
+				{...defaults}
+				pagination={{
+					offset: 25,
+					limit: 25,
+					total: 30,
+					onPageChange,
+				}}
+			/>,
+		);
+
+		expect(
+			screen.getByText("No users assigned to this role yet."),
+		).toBeInTheDocument();
+		const pagination = screen.getByRole("navigation", {
+			name: /pagination/i,
+		});
+		expect(pagination.closest("tfoot")).toBeNull();
+		expect(screen.getByText(/26–30 of 30/)).toBeInTheDocument();
+
+		await user.click(screen.getByRole("button", { name: /^Previous$/i }));
+		expect(onPageChange).toHaveBeenCalledWith(0);
+	});
+});
+
+it("keeps removal failure feedback with the selected-item action and retries the selection", async () => {
+	const onUnassign = vi
+		.fn()
+		.mockRejectedValueOnce(new Error("Removal failed"))
+		.mockResolvedValueOnce(undefined);
+	const { user } = renderWithProviders(
+		<ConsumerTab
+			{...defaults}
+			items={[{ id: "a", primary: "Alice" }]}
+			onUnassign={onUnassign}
+		/>,
+	);
+	await user.click(screen.getByRole("checkbox", { name: "Select Alice" }));
+	await user.click(
+		screen.getByRole("button", { name: "Unassign from role" }),
+	);
+	const actions = screen.getByRole("region", { name: "Selected users" });
+	expect(await within(actions).findByRole("alert")).toHaveTextContent(
+		"Removal failed. Your selection is preserved.",
+	);
+	await user.click(
+		within(actions).getByRole("button", { name: "Unassign from role" }),
+	);
+	await waitFor(() => expect(onUnassign).toHaveBeenCalledTimes(2));
+	expect(onUnassign).toHaveBeenLastCalledWith(["a"]);
 });

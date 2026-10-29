@@ -217,6 +217,7 @@ class TestSubgroupRegistration:
         assert set(ENTITY_GROUPS) == {
             "orgs",
             "roles",
+            "permissions",
             "workflows",
             "forms",
             "agents",
@@ -229,6 +230,10 @@ class TestSubgroupRegistration:
             "files",
             "requirements",
             "policy-rule",
+            "services",
+            "audit",
+            "users",
+            "retention",
         }
 
     def test_dispatch_unknown_subgroup_exits_1(self) -> None:

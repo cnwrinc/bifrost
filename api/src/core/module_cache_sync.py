@@ -1,36 +1,36 @@
-"""
-Synchronous Redis client for import hook.
+"""Synchronous source loading for the virtual import hook.
 
-Python's import system runs synchronously - we need sync Redis access
-for the MetaPathFinder to fetch modules during import.
-
-This module provides synchronous versions of the cache functions
-specifically for use in virtual_import.py's MetaPathFinder.
-
-When a cache miss occurs, we fall back via two paths (tried in order):
-1. API module-fetch endpoint (GET /api/sdk/modules/<path>) — preferred when
-   BIFROST_API_URL is set and a credentials file is present.  This path does
-   not require BIFROST_S3_* in the child env (Phase 2 hardening).
-2. Direct S3 access via botocore — legacy fallback, only active when
-   BIFROST_S3_ACCESS_KEY/SECRET_KEY are set in the environment.
-
-Self-healing: on any successful fetch, the result is re-cached to Redis so
-subsequent calls on the same worker hit the fast path.
+Python imports run synchronously. Parent processes may use the supported
+Redis/S3 cache and network API paths. A forked execution child is explicitly
+marked after fork; every one of its module resolution and source requests goes
+through the scoped SDK transport before any cache or storage access. The SDK
+uses the worker-local Unix socket when installed and ordinary network HTTP
+otherwise. Children never read or write Redis or S3.
 """
 
 import hashlib
 import json
 import logging
 import os
+import sys
 import threading
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import redis
 
-from src.core.module_cache import MODULE_INDEX_KEY, MODULE_KEY_PREFIX, CachedModule
+from src.core.module_cache_contract import (
+    CachedModule,
+    MODULE_INDEX_KEY,
+    MODULE_KEY_PREFIX,
+    MODULE_RESOLUTION_KEY_PREFIX,
+    MODULE_RESOLUTION_READ_SCRIPT,
+    module_resolution_generation_key,
+    module_resolution_cache_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,21 +62,66 @@ class SolutionContext:
     global_repo_access: bool
 
 
+@dataclass(frozen=True)
+class ModuleResolution:
+    """Targeted resolver result for a logical import name."""
+
+    kind: str
+    path: str
+    content: str | None = None
+    hash: str = ""
+    storage_path: str | None = None
+
+
+class ModuleResolutionError(RuntimeError):
+    """Raised when targeted module resolution cannot reach the API."""
+
+
 def set_solution_context(solution_id: UUID | str, global_repo_access: bool) -> None:
     """Activate the solution import root for the current thread/execution."""
     _solution_ctx.value = SolutionContext(
         solution_id=str(solution_id), global_repo_access=bool(global_repo_access)
     )
+    _solution_ctx.resolution_cache = {}
 
 
 def clear_solution_context() -> None:
     """Deactivate the solution import root (restore plain _repo/ behavior)."""
     _solution_ctx.value = None
+    _solution_ctx.resolution_cache = {}
 
 
 def get_solution_context() -> SolutionContext | None:
     """Return the active solution context for this thread, or None."""
     return getattr(_solution_ctx, "value", None)
+
+
+def _get_resolution_cache() -> dict[tuple[str, str | None, bool], ModuleResolution]:
+    cache = getattr(_solution_ctx, "resolution_cache", None)
+    if cache is None:
+        cache = {}
+        _solution_ctx.resolution_cache = cache
+    return cache
+
+
+def _get_http_client() -> Any:
+    client = getattr(_solution_ctx, "http_client", None)
+    if client is None:
+        import httpx
+
+        client = httpx.Client(timeout=10.0)
+        _solution_ctx.http_client = client
+    return client
+
+
+def _close_http_client() -> None:
+    client = getattr(_solution_ctx, "http_client", None)
+    if client is not None:
+        # Teardown must not replace the workflow result with a transport-close
+        # failure; the process is exiting and owns no reusable client state.
+        with suppress(Exception):
+            client.close()
+        _solution_ctx.http_client = None
 
 
 def _candidate_storage_paths(path: str) -> list[str]:
@@ -99,31 +144,19 @@ def _candidate_storage_paths(path: str) -> list[str]:
     return [rooted]
 
 
-def candidate_module_paths(path: str) -> list[str]:
-    """Storage paths that may contain a concrete module file."""
-    return _candidate_storage_paths(path)
-
-
-def candidate_index_prefixes(base_path: str) -> list[str]:
-    """Storage-path prefixes to scan the module index with, for namespace-package
-    (PEP 420) detection of ``base_path`` (e.g. "modules").
-
-    Mirrors :func:`_candidate_storage_paths`: solution-rooted prefix first, with
-    the bare prefix only when global_repo_access is on; bare prefix only when no
-    solution is active. The finder tests ``index_entry.startswith(prefix)``.
-    """
-    base = base_path.rstrip("/")
-    ctx = get_solution_context()
-    if ctx is None:
-        return [f"{base}/"]
-    rooted = f"{SOLUTIONS_ROOT}/{ctx.solution_id}/{base}/"
-    if ctx.global_repo_access:
-        return [rooted, f"{base}/"]
-    return [rooted]
-
 # Cached S3 client — reused across calls to avoid repeated setup
 _s3_client: Any = None
 _s3_available: bool | None = None
+_sync_redis_client: Any = None
+# Set only by TemplateProcess after fork. It is process-local by virtue of
+# fork's copy-on-write memory and never comes from workflow-controlled input.
+_execution_child = False
+
+
+def mark_execution_child() -> None:
+    """Mark this post-fork process as an execution child."""
+    global _execution_child
+    _execution_child = True
 
 
 @lru_cache(maxsize=1)
@@ -133,22 +166,21 @@ def _get_sync_redis() -> Any:
 
     Uses lru_cache to reuse connection across imports.
     """
-    return redis.Redis.from_url(
+    global _sync_redis_client
+    _sync_redis_client = redis.Redis.from_url(
         os.environ.get("BIFROST_REDIS_URL", "redis://localhost:6379/0"),
         decode_responses=True,
     )
+    return _sync_redis_client
 
 
 def _get_engine_credentials() -> tuple[str, str] | None:
     """
     Read the engine bearer token and API URL from the credentials file.
 
-    The file is written by save_credentials() (either from the handed-down
-    context_data["engine_token"] path or the legacy authenticate_engine()
-    path) and carries both the access token and the API URL.  Returning the
-    URL from here means the API module-fetch fallback works even when
-    BIFROST_API_URL is not set in the child env (it is not, in either the
-    test stack or the k8s worker manifests).
+    The file is written by the handed-down ``context_data["engine_token"]``
+    path and carries both the access token and the API URL. Parent synchronous
+    callers use it only when no trusted execution-child socket is installed.
 
     Returns (api_url, access_token) or None if unavailable.
     """
@@ -164,6 +196,30 @@ def _get_engine_credentials() -> tuple[str, str] | None:
     return None
 
 
+def _get_engine_client() -> Any | None:
+    """Return the scoped SDK client for a trusted execution child.
+
+    A worker-installed private Unix socket remains an execution-child marker
+    for existing callers. TemplateProcess also marks every post-fork execution
+    child, including a thin runner that uses the SDK's network transport.
+    Everywhere else (API processes, plain workers, tests without injection)
+    this is None and parent cache behavior applies.
+
+    The import is lazy so this module stays importable before the SDK package
+    loads. A SDK package that is present but broken raises instead of
+    silently switching an execution child to Redis or S3.
+    """
+    try:
+        from bifrost.client import get_client, get_engine_socket_path
+    except ModuleNotFoundError as e:
+        if not _execution_child and e.name in {"bifrost", "bifrost.client"}:
+            return None
+        raise
+    if not _execution_child and get_engine_socket_path() is None:
+        return None
+    return get_client()
+
+
 def _fetch_module_from_api(path: str) -> CachedModule | None:
     """
     Fetch a module via GET /api/sdk/modules/<path> (synchronous, httpx).
@@ -173,8 +229,8 @@ def _fetch_module_from_api(path: str) -> CachedModule | None:
     no URL.  Returns a CachedModule dict on success, None on any error
     (404, auth failure, etc.).
 
-    This is the primary cold-cache fallback when BIFROST_S3_* are absent
-    from the child environment (Phase 2 hardening).
+    This is the primary parent cold-cache fallback when direct S3 settings are
+    unavailable.
     """
     creds = _get_engine_credentials()
     if not creds:
@@ -187,13 +243,10 @@ def _fetch_module_from_api(path: str) -> CachedModule | None:
         return None
 
     try:
-        import httpx
-
         url = f"{api_url}/api/sdk/modules/{path}"
-        resp = httpx.get(
+        resp = _get_http_client().get(
             url,
             headers={"Authorization": f"Bearer {token}"},
-            timeout=10.0,
         )
         if resp.status_code == 404:
             return None
@@ -210,45 +263,14 @@ def _fetch_module_from_api(path: str) -> CachedModule | None:
         return None
 
 
-def _fetch_module_index_from_api(solution_id: str | None = None) -> set[str]:
+def _fetch_module_resolution_from_api(name: str) -> ModuleResolution | None:
     """
-    Fetch the module index via GET /api/sdk/modules-index (synchronous).
+    Resolve one import name via GET /api/sdk/modules-resolve.
 
-    Returns the set of known workspace module paths from the API server,
-    used when the Redis index is cold.  Returns empty set on any error.
-    """
-    creds = _get_engine_credentials()
-    if not creds:
-        return set()
-    creds_url, token = creds
-    api_url = creds_url or os.environ.get("BIFROST_API_URL", "").rstrip("/")
-    if not api_url:
-        return set()
-
-    try:
-        import httpx
-
-        resp = httpx.get(
-            f"{api_url}/api/sdk/modules-index",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"solution_id": solution_id} if solution_id else None,
-            timeout=10.0,
-        )
-        if resp.status_code != 200:
-            return set()
-        return set(resp.json().get("paths", []))
-    except Exception as e:
-        logger.warning(f"API module-index fetch error: {e}")
-        return set()
-
-
-def _fetch_requirements_from_api() -> str | None:
-    """
-    Fetch requirements.txt via GET /api/sdk/requirements (synchronous).
-
-    Returns the requirements content string, or None on any error / 404.
-    Used as the primary cold-cache fallback in get_requirements_sync() when
-    BIFROST_S3_* are absent from the child environment (Phase 2 hardening).
+    This is the targeted replacement for fetching the whole module index during
+    child import resolution. The API owns Redis→S3 module lookup and bounded
+    namespace prefix probing; the child memoizes each result for the active
+    execution.
     """
     creds = _get_engine_credentials()
     if not creds:
@@ -258,31 +280,279 @@ def _fetch_requirements_from_api() -> str | None:
     if not api_url:
         return None
 
-    try:
-        import httpx
+    ctx = get_solution_context()
+    params: dict[str, object] = {"name": name}
+    if ctx is not None:
+        params["solution_id"] = ctx.solution_id
+        params["global_repo_access"] = ctx.global_repo_access
 
-        resp = httpx.get(
-            f"{api_url}/api/sdk/requirements",
+    try:
+        resp = _get_http_client().get(
+            f"{api_url}/api/sdk/modules-resolve",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=10.0,
+            params=params,
         )
-        if resp.status_code == 404:
-            return None
         if resp.status_code != 200:
-            logger.warning(f"API requirements-fetch returned {resp.status_code}")
+            logger.warning(
+                f"API module-resolve returned {resp.status_code} for {name}"
+            )
             return None
 
         data = resp.json()
-        return data.get("content")
+        kind = data.get("kind")
+        if kind not in {"module", "package", "namespace", "not_found"}:
+            logger.warning(f"API module-resolve returned invalid kind for {name}")
+            return None
+        return ModuleResolution(
+            kind=kind,
+            path=data.get("path") or name.replace(".", "/"),
+            content=data.get("content"),
+            hash=data.get("hash") or "",
+            storage_path=data.get("storage_path"),
+        )
     except Exception as e:
-        logger.warning(f"API requirements-fetch error: {e}")
+        logger.warning(f"API module-resolve error for {name}: {e}")
         return None
 
 
+def _resolve_via_engine_transport(client: Any, name: str) -> ModuleResolution:
+    """Resolve one import name through the scoped SDK transport.
+
+    Calls the original ``GET /api/sdk/modules-resolve`` route through the
+    synchronous ``engine_request_sync`` entry point. That client selects the
+    worker socket when one is installed, otherwise its ordinary network HTTP
+    transport. The active Solution scope rides the query and the route's
+    signed per-execution claims remain authoritative for engine callers.
+
+    Raises :class:`ModuleResolutionError` on transport failure, a non-200
+    status, or an invalid payload. An execution-child attempt never falls back
+    to Redis or S3.
+    """
+    ctx = get_solution_context()
+    params: dict[str, object] = {"name": name}
+    if ctx is not None:
+        params["solution_id"] = ctx.solution_id
+        params["global_repo_access"] = ctx.global_repo_access
+
+    try:
+        response = client.engine_request_sync(
+            "GET", "/api/sdk/modules-resolve", params=params
+        )
+    except Exception as e:
+        raise ModuleResolutionError(
+            f"Engine-local module resolver failed for {name}: {e}"
+        ) from e
+    if response.status_code != 200:
+        raise ModuleResolutionError(
+            f"Engine-local module resolver returned {response.status_code} "
+            f"for {name}"
+        )
+
+    data = response.json()
+    kind = data.get("kind")
+    if kind not in {"module", "package", "namespace", "not_found"}:
+        raise ModuleResolutionError(
+            f"Engine-local module resolver returned invalid kind for {name}"
+        )
+    content = data.get("content")
+    if content is not None and not isinstance(content, str):
+        raise ModuleResolutionError(
+            f"Engine-local module resolver returned invalid content for {name}"
+        )
+    module_hash = data.get("hash") or ""
+    if not isinstance(module_hash, str):
+        raise ModuleResolutionError(
+            f"Engine-local module resolver returned invalid hash for {name}"
+        )
+    storage_path = data.get("storage_path")
+    if storage_path is not None and not isinstance(storage_path, str):
+        raise ModuleResolutionError(
+            f"Engine-local module resolver returned invalid storage path for {name}"
+        )
+    return ModuleResolution(
+        kind=kind,
+        path=data.get("path") or name.replace(".", "/"),
+        content=content,
+        hash=module_hash,
+        storage_path=storage_path,
+    )
+
+
+def _fetch_via_engine_transport(client: Any, storage_path: str) -> CachedModule | None:
+    """Fetch one candidate's source through the scoped SDK transport.
+
+    Calls the original ``GET /api/sdk/modules/{path}`` route through the
+    synchronous ``engine_request_sync`` entry point. Returns None on a route
+    404 so the caller advances to the next candidate. Any other failure raises
+    :class:`ModuleResolutionError`; an execution child never falls back to
+    Redis or S3.
+    """
+    try:
+        response = client.engine_request_sync(
+            "GET", f"/api/sdk/modules/{storage_path}"
+        )
+    except Exception as e:
+        raise ModuleResolutionError(
+            f"Engine-local module fetch failed for {storage_path}: {e}"
+        ) from e
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise ModuleResolutionError(
+            f"Engine-local module fetch returned {response.status_code} "
+            f"for {storage_path}"
+        )
+
+    module = response.json()
+    content = module.get("content")
+    if not isinstance(content, str):
+        raise ModuleResolutionError(
+            f"Engine-local module fetch returned invalid content for {storage_path}"
+        )
+    return cast(CachedModule, dict(module))
+
+
+def _resolution_redis_key(name: str) -> str:
+    ctx = get_solution_context()
+    cache_key = module_resolution_cache_key(
+        name,
+        solution_id=ctx.solution_id if ctx is not None else None,
+        global_repo_access=ctx.global_repo_access if ctx is not None else False,
+    )
+    return f"{MODULE_RESOLUTION_KEY_PREFIX}{cache_key}"
+
+
+def _module_resolution_from_cached_source(
+    *,
+    kind: str,
+    path: str,
+    storage_path: str,
+    raw_module: str,
+) -> ModuleResolution | None:
+    try:
+        module = json.loads(raw_module)
+        content = module["content"]
+        content_hash = module.get("hash") or ""
+        if not isinstance(content, str) or not isinstance(content_hash, str):
+            return None
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    return ModuleResolution(
+        kind=kind,
+        path=path,
+        content=content,
+        hash=content_hash,
+        storage_path=storage_path,
+    )
+
+
+def _get_cached_module_resolution(name: str) -> ModuleResolution | None:
+    """Hydrate resolver metadata and source directly from worker-visible Redis."""
+    try:
+        client = _get_sync_redis()
+        resolution_key = _resolution_redis_key(name)
+        raw_resolution = client.eval(
+            MODULE_RESOLUTION_READ_SCRIPT, 2,
+            module_resolution_generation_key(resolution_key), resolution_key,
+        )
+        if not raw_resolution:
+            return None
+        data = json.loads(raw_resolution)
+        kind = data.get("kind")
+        path = data.get("path") or name.replace(".", "/")
+        if kind in {"namespace", "not_found"}:
+            return ModuleResolution(kind=kind, path=path)
+        if kind not in {"module", "package"}:
+            return None
+        storage_path = data.get("storage_path")
+        if not isinstance(storage_path, str):
+            return None
+        raw_module = client.get(f"{MODULE_KEY_PREFIX}{storage_path}")
+        if not raw_module:
+            return None
+        return _module_resolution_from_cached_source(
+            kind=kind,
+            path=path,
+            storage_path=storage_path,
+            raw_module=raw_module,
+        )
+    except (redis.RedisError, json.JSONDecodeError, TypeError) as exc:
+        logger.debug("Cached module resolution unavailable for %s: %s", name, exc)
+        return None
+
+
+def _get_exact_scoped_module(name: str) -> ModuleResolution | None:
+    """Resolve a concrete module in the primary scope without an HTTP hop.
+
+    This intentionally does not probe namespaces or a Solution's optional
+    workspace fallback. Those cases require the API resolver to preserve the
+    rule that a Solution namespace shadows a concrete workspace module.
+    """
+    base_path = name.replace(".", "/")
+    ctx = get_solution_context()
+    scope_prefix = f"{SOLUTIONS_ROOT}/{ctx.solution_id}/" if ctx else ""
+    try:
+        client = _get_sync_redis()
+        for relative_path, kind in (
+            (f"{base_path}.py", "module"),
+            (f"{base_path}/__init__.py", "package"),
+        ):
+            storage_path = f"{scope_prefix}{relative_path}"
+            raw_module = client.get(f"{MODULE_KEY_PREFIX}{storage_path}")
+            if not raw_module:
+                continue
+            return _module_resolution_from_cached_source(
+                kind=kind,
+                path=relative_path,
+                storage_path=storage_path,
+                raw_module=raw_module,
+            )
+    except redis.RedisError as exc:
+        logger.debug("Direct module cache unavailable for %s: %s", name, exc)
+    return None
+
+
+def resolve_module_sync(name: str) -> ModuleResolution:
+    """Resolve one logical import name, cached for the active execution."""
+    top_level = name.split(".", 1)[0]
+    if (
+        top_level in sys.builtin_module_names
+        or top_level in getattr(sys, "stdlib_module_names", set())
+    ):
+        return ModuleResolution(kind="not_found", path=name.replace(".", "/"))
+
+    ctx = get_solution_context()
+    cache_key = (
+        name,
+        ctx.solution_id if ctx is not None else None,
+        ctx.global_repo_access if ctx is not None else False,
+    )
+    cache = _get_resolution_cache()
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # A worker socket or post-fork marker selects the scoped SDK transport
+    # before any Redis helper so an inherited or ambient cache cannot become
+    # an authority or credential path for customer code.
+    engine_client = _get_engine_client()
+    if engine_client is not None:
+        resolution = _resolve_via_engine_transport(engine_client, name)
+    else:
+        resolution = _get_cached_module_resolution(name)
+        if resolution is None:
+            resolution = _get_exact_scoped_module(name)
+        if resolution is None:
+            resolution = _fetch_module_resolution_from_api(name)
+    if resolution is None:
+        raise ModuleResolutionError(f"Module resolver unavailable for {name}")
+
+    cache[cache_key] = resolution
+    return resolution
+
+
 def _get_s3_client() -> Any:
-    """
-    Get or create a sync S3 client using botocore (always available via aiobotocore).
-    """
+    """Get or create the parent-only synchronous CRT S3 client."""
     global _s3_client, _s3_available
 
     if _s3_available is False:
@@ -296,28 +566,21 @@ def _get_s3_client() -> Any:
     secret_key = os.environ.get("BIFROST_S3_SECRET_KEY")
     region = os.environ.get("BIFROST_S3_REGION", "us-east-1")
 
-    if not all([access_key, secret_key]):
-        logger.debug("S3 not configured, skipping S3 fallback")
-        _s3_available = False
-        return None
-
     try:
-        import botocore.session  # type: ignore[import-untyped]
+        from src.core.s3_transport import SyncS3Transport
 
-        session = botocore.session.get_session()
-        client = session.create_client(
-            "s3",
+        client = SyncS3Transport(
             endpoint_url=endpoint_url,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            region_name=region,
+            access_key_id=access_key,
+            secret_access_key=secret_key,
+            region=region,
         )
         _s3_client = client
         _s3_available = True
         return client
     except Exception:
         _s3_available = False
-        logger.debug("botocore not available, S3 fallback disabled")
+        logger.debug("S3 transport unavailable; S3 fallback disabled")
         return None
 
 
@@ -337,8 +600,8 @@ def _get_s3_module(storage_path: str) -> bytes | None:
     Fetch a module from S3 by storage path (synchronous).
 
     Bare paths resolve under _repo/; ``_solutions/{id}/...`` paths are used
-    verbatim. Uses botocore sync client since this runs in worker subprocesses.
-    Returns raw bytes or None if not found.
+    verbatim. This is available only to parent synchronous callers. Returns
+    raw bytes or None if not found.
     """
     bucket = os.environ.get("BIFROST_S3_BUCKET")
     if not bucket:
@@ -377,27 +640,38 @@ def get_module_sync(path: str) -> CachedModule | None:
     global_repo_access is on. With no context, behavior is unchanged: the bare
     path resolves under _repo/.
 
-    Per candidate, the lookup order is:
-    1. Redis cache (fast path)
-    2. API endpoint GET /api/sdk/modules/<storage_path>  — preferred cold-cache
-       fallback (no S3 env vars required; uses engine token from credentials
-       file; the server performs the Redis→S3 lookup)
-    3. Direct S3 via botocore — legacy fallback when BIFROST_S3_* are present
-    Then the next candidate; None if no candidate resolves.
+    A forked execution child is identified by its injected worker socket or
+    post-fork marker. It uses ``GET /api/sdk/modules/<storage_path>`` through
+    the scoped SDK transport for every candidate, including entries that would
+    be warm in Redis. It never uses Redis or S3, and a 404 advances to the
+    next candidate.
 
-    On any successful fallback hit the module is re-cached to Redis (under the
-    storage-path key) so the next call on the same worker takes the fast path.
-    The returned CachedModule keeps the logical (bare) ``path`` so __file__ and
-    spec origin stay stable regardless of where the bytes were stored.
+    Parent callers retain the existing Redis → network API → S3 lookup and
+    re-cache successful fallback reads. The returned CachedModule keeps the
+    logical (bare) ``path`` so __file__ and spec origin stay stable regardless
+    of where the bytes were stored.
     """
+    # The worker socket or post-fork marker selects the scoped SDK transport
+    # before touching any Redis cache or parent-only fallback.
+    engine_client = _get_engine_client()
+    if engine_client is not None:
+        for storage_path in _candidate_storage_paths(path):
+            engine_module = _fetch_via_engine_transport(engine_client, storage_path)
+            if engine_module is None:
+                continue
+            engine_module["storage_path"] = storage_path
+            return engine_module
+        return None
+
     try:
         client = _get_sync_redis()
-
         for storage_path in _candidate_storage_paths(path):
             key = f"{MODULE_KEY_PREFIX}{storage_path}"
             data = client.get(key)
             if data:
-                return json.loads(data)
+                cached = cast(CachedModule, json.loads(data))
+                cached["storage_path"] = storage_path
+                return cached
 
             # --- Cold-cache fallback 1: API endpoint ---
             api_module = _fetch_module_from_api(storage_path)
@@ -407,6 +681,7 @@ def get_module_sync(path: str) -> CachedModule | None:
                     client.sadd(MODULE_INDEX_KEY, storage_path)
                 except redis.RedisError as e:
                     logger.warning(f"Failed to re-cache API module to Redis: {e}")
+                api_module["storage_path"] = storage_path
                 return api_module
 
             # --- Cold-cache fallback 2: direct S3 (legacy; not needed post-scrub) ---
@@ -424,6 +699,7 @@ def get_module_sync(path: str) -> CachedModule | None:
                 "content": content_str,
                 "path": path,
                 "hash": content_hash,
+                "storage_path": storage_path,
             }
 
             # Cache back to Redis under the storage-path key + index.
@@ -443,129 +719,21 @@ def get_module_sync(path: str) -> CachedModule | None:
         return None
 
 
-def _list_s3_modules() -> set[str]:
-    """
-    List all Python module paths in S3 _repo/ (synchronous).
-
-    Used as a fallback when the Redis module index is empty, which can happen
-    after Redis restarts or cache eviction. Returns paths relative to _repo/
-    (e.g. "features/spotify_journal/services/spotify_api.py").
-    """
-    bucket = os.environ.get("BIFROST_S3_BUCKET")
-    if not bucket:
-        return set()
-
-    client = _get_s3_client()
-    if client is None:
-        return set()
-
-    paths: set[str] = set()
-    try:
-        paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=bucket, Prefix=REPO_PREFIX):
-            for obj in page.get("Contents", []):
-                key: str = obj["Key"]
-                if key.endswith(".py"):
-                    # Strip the _repo/ prefix to get the relative path
-                    paths.add(key[len(REPO_PREFIX):])
-    except Exception as e:
-        logger.warning(f"S3 list error when rebuilding module index: {e}")
-
-    return paths
-
-
-def get_module_index_sync() -> set[str]:
-    """
-    Get all cached module paths (synchronous).
-
-    When the Redis index is empty (cold cache after restart or eviction),
-    falls back via two paths (tried in order):
-    1. API endpoint GET /api/sdk/modules-index — preferred (no S3 env needed)
-    2. Direct S3 listing — legacy fallback when BIFROST_S3_* are present
-
-    On any successful fallback hit, Redis is repopulated so subsequent calls
-    take the fast path.
-    """
-    try:
-        client = _get_sync_redis()
-        paths = client.smembers(MODULE_INDEX_KEY)
-        if paths:
-            return {p if isinstance(p, str) else p.decode() for p in paths}
-
-        # Redis index is empty — try API first
-        logger.debug("Module index empty in Redis, falling back to API listing")
-        ctx = get_solution_context()
-        api_paths = _fetch_module_index_from_api(
-            solution_id=ctx.solution_id if ctx is not None else None
-        )
-        if api_paths:
-            try:
-                client.sadd(MODULE_INDEX_KEY, *api_paths)
-                client.expire(MODULE_INDEX_KEY, MODULE_CACHE_TTL)
-            except redis.RedisError as e:
-                logger.warning(f"Failed to repopulate module index from API: {e}")
-            return api_paths
-
-        # API not available — try direct S3 (legacy path)
-        logger.debug("API index unavailable, falling back to S3 listing")
-        s3_paths = _list_s3_modules()
-        if s3_paths:
-            try:
-                client.sadd(MODULE_INDEX_KEY, *s3_paths)
-                client.expire(MODULE_INDEX_KEY, MODULE_CACHE_TTL)
-            except redis.RedisError as e:
-                logger.warning(f"Failed to repopulate module index in Redis: {e}")
-            return s3_paths
-
-        return set()
-    except redis.RedisError as e:
-        logger.warning(f"Redis error fetching module index: {e}")
-        return set()
-
-
-def solution_has_submodules(base_path: str) -> bool:
-    """True if the active solution has any module under ``{base_path}/``.
-
-    Namespace-package (PEP 420) detection for solution code can't rely on the
-    Redis module index alone: a freshly-deployed module is only indexed once
-    it's first loaded, but it can't load until its parent package resolves as a
-    namespace — a chicken-and-egg. So when a solution is active we check the
-    API-backed module index under ``_solutions/{id}/{base_path}/`` first, then
-    direct S3 as the legacy fallback when the child still has S3 credentials.
-
-    Returns False when no solution is active (the _repo/ index path already handles
-    that case) or neither fallback can prove a submodule exists.
-    """
-    ctx = get_solution_context()
-    if ctx is None:
-        return False
-    prefix = f"{SOLUTIONS_ROOT}/{ctx.solution_id}/{base_path.rstrip('/')}/"
-
-    api_paths = _fetch_module_index_from_api(solution_id=ctx.solution_id)
-    if any(path.startswith(prefix) for path in api_paths):
-        return True
-
-    bucket = os.environ.get("BIFROST_S3_BUCKET")
-    if not bucket:
-        return False
-    client = _get_s3_client()
-    if client is None:
-        return False
-    try:
-        resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
-        return resp.get("KeyCount", 0) > 0 or bool(resp.get("Contents"))
-    except Exception as e:
-        logger.debug(f"S3 submodule check failed for {prefix}: {e}")
-        return False
-
-
 def reset_sync_redis() -> None:
-    """Reset the sync Redis client."""
+    """Close and reset the synchronous parent Redis cache client."""
+    global _sync_redis_client
+    if _sync_redis_client is not None:
+        with suppress(Exception):
+            _sync_redis_client.close()
+        _sync_redis_client = None
     _get_sync_redis.cache_clear()
 
 
 def reset_s3_client() -> None:
     """Reset the cached S3 client. Used for testing."""
     global _s3_client, _s3_available
+    if _s3_client is not None:
+        with suppress(Exception):
+            _s3_client.close()
     _s3_client = None
     _s3_available = None

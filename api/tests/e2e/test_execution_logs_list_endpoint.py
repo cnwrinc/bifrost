@@ -8,11 +8,14 @@ These tests make real HTTP requests to the running API.
 """
 
 import os
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+from sqlalchemy import delete
+from src.models.orm.executions import Execution, ExecutionLog
 
 import httpx
 import pytest
-
-from tests.fixtures.auth import create_test_jwt, auth_headers
 
 
 # API URL (from docker-compose.test.yml)
@@ -26,55 +29,35 @@ def http_client():
         yield client
 
 
-@pytest.fixture
-def admin_token():
-    """JWT token for a platform admin (superuser)."""
-    return create_test_jwt(
-        email="admin@test.com",
-        name="Test Admin",
-        is_superuser=True,
-    )
-
-
-@pytest.fixture
-def regular_user_token():
-    """JWT token for a regular org user (non-superuser)."""
-    return create_test_jwt(
-        email="user@test.com",
-        name="Test User",
-        is_superuser=False,
-    )
-
-
 @pytest.mark.e2e
 class TestLogsListEndpoint:
     """Integration tests for GET /api/executions/logs endpoint."""
 
+    @pytest.fixture(autouse=True)
+    def _persisted_callers(self, platform_admin, org1_user):
+        """Use users whose persisted roles and reach the API can resolve."""
+        self.admin_headers = platform_admin.headers
+        self.org_user_headers = org1_user.headers
+
     def test_list_logs_requires_admin(
         self,
         http_client: httpx.Client,
-        regular_user_token: str,
     ):
-        """Non-admin users should get 403 Forbidden."""
+        """Users without execution-log reach should get 403 Forbidden."""
         response = http_client.get(
             "/api/executions/logs",
-            headers=auth_headers(regular_user_token),
+            headers=self.org_user_headers,
         )
         assert response.status_code == 403
-        # Gated by the declarative RequirePlatformAdmin dependency, which
-        # returns the canonical "Superuser privileges required" detail.
-        detail = response.json().get("detail", "").lower()
-        assert "superuser" in detail or "admin" in detail
 
     def test_list_logs_returns_paginated_results(
         self,
         http_client: httpx.Client,
-        admin_token: str,
     ):
         """Admin can list logs with pagination."""
         response = http_client.get(
             "/api/executions/logs",
-            headers=auth_headers(admin_token),
+            headers=self.admin_headers,
             params={"limit": 10},
         )
         assert response.status_code == 200
@@ -89,12 +72,11 @@ class TestLogsListEndpoint:
     def test_list_logs_filters_by_level(
         self,
         http_client: httpx.Client,
-        admin_token: str,
     ):
         """Admin can filter logs by level."""
         response = http_client.get(
             "/api/executions/logs",
-            headers=auth_headers(admin_token),
+            headers=self.admin_headers,
             params={"levels": "ERROR,WARNING", "limit": 50},
         )
         assert response.status_code == 200
@@ -109,12 +91,11 @@ class TestLogsListEndpoint:
     def test_list_logs_filters_by_workflow_name(
         self,
         http_client: httpx.Client,
-        admin_token: str,
     ):
         """Admin can filter logs by workflow name (partial match)."""
         response = http_client.get(
             "/api/executions/logs",
-            headers=auth_headers(admin_token),
+            headers=self.admin_headers,
             params={"workflow_name": "test", "limit": 50},
         )
         assert response.status_code == 200
@@ -129,12 +110,11 @@ class TestLogsListEndpoint:
     def test_list_logs_message_search(
         self,
         http_client: httpx.Client,
-        admin_token: str,
     ):
         """Admin can search in log message content."""
         response = http_client.get(
             "/api/executions/logs",
-            headers=auth_headers(admin_token),
+            headers=self.admin_headers,
             params={"message_search": "error", "limit": 50},
         )
         assert response.status_code == 200
@@ -146,52 +126,83 @@ class TestLogsListEndpoint:
         for log in data["logs"]:
             assert "error" in log["message"].lower()
 
-    def test_list_logs_pagination_with_token(
+    @pytest.mark.asyncio
+    async def test_list_logs_pagination_with_token(
         self,
         http_client: httpx.Client,
-        admin_token: str,
+        db_session,
     ):
-        """Pagination with continuation token works correctly."""
-        # First request with small limit
-        response1 = http_client.get(
-            "/api/executions/logs",
-            headers=auth_headers(admin_token),
-            params={"limit": 2},
-        )
-        assert response1.status_code == 200
-        data1 = response1.json()
-        assert "logs" in data1
+        """Equal timestamps and arriving logs cannot duplicate or omit older rows."""
+        execution_id = uuid4()
+        workflow_name = f"log-cursor-{uuid4().hex}"
+        timestamp = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+        db_session.add(Execution(
+            id=execution_id,
+            workflow_name=workflow_name,
+            executed_by_name="Log pagination fixture",
+        ))
+        await db_session.flush()
+        seeded = [ExecutionLog(
+            execution_id=execution_id, level="INFO",
+            message=f"seed-{index}", timestamp=timestamp, sequence=index,
+        ) for index in range(5)]
+        db_session.add_all(seeded)
+        await db_session.commit()
+        expected_ids = sorted((log.id for log in seeded), reverse=True)
+        headers = self.admin_headers
+        params = {"limit": 2, "workflow_name": workflow_name}
 
-        # If there's a continuation token, fetch next page
-        if data1.get("continuation_token"):
-            response2 = http_client.get(
-                "/api/executions/logs",
-                headers=auth_headers(admin_token),
-                params={
-                    "limit": 2,
-                    "continuation_token": data1["continuation_token"],
-                },
+        try:
+            first_response = http_client.get(
+                "/api/executions/logs", headers=headers, params=params,
             )
-            assert response2.status_code == 200
-            data2 = response2.json()
-            assert "logs" in data2
+            assert first_response.status_code == 200
+            first = first_response.json()
+            assert [log["id"] for log in first["logs"]] == expected_ids[:2]
+            assert first["continuation_token"]
 
-            # The pages should be different (if there are enough logs)
-            if data1["logs"] and data2["logs"]:
-                # Log IDs should be different between pages
-                ids1 = {log["id"] for log in data1["logs"]}
-                ids2 = {log["id"] for log in data2["logs"]}
-                assert ids1.isdisjoint(ids2), "Pages should not contain duplicate logs"
+            # Arrivals before the cursor must not shift the remaining pages.
+            # Include a same-timestamp arrival to exercise the ID tie-breaker.
+            db_session.add_all([
+                ExecutionLog(execution_id=execution_id, level="INFO",
+                             message="newer", timestamp=timestamp + timedelta(seconds=1)),
+                ExecutionLog(execution_id=execution_id, level="INFO",
+                             message="same-time arrival", timestamp=timestamp),
+            ])
+            await db_session.commit()
+
+            second_response = http_client.get(
+                "/api/executions/logs", headers=headers,
+                params={**params, "continuation_token": first["continuation_token"]},
+            )
+            assert second_response.status_code == 200
+            second = second_response.json()
+            assert [log["id"] for log in second["logs"]] == expected_ids[2:4]
+            assert second["continuation_token"]
+
+            third_response = http_client.get(
+                "/api/executions/logs", headers=headers,
+                params={**params, "continuation_token": second["continuation_token"]},
+            )
+            assert third_response.status_code == 200
+            third = third_response.json()
+            assert [log["id"] for log in third["logs"]] == expected_ids[4:]
+            assert third["continuation_token"] is None
+        finally:
+            await db_session.execute(delete(ExecutionLog).where(
+                ExecutionLog.execution_id == execution_id,
+            ))
+            await db_session.execute(delete(Execution).where(Execution.id == execution_id))
+            await db_session.commit()
 
     def test_list_logs_date_range_filter(
         self,
         http_client: httpx.Client,
-        admin_token: str,
     ):
         """Admin can filter logs by date range."""
         response = http_client.get(
             "/api/executions/logs",
-            headers=auth_headers(admin_token),
+            headers=self.admin_headers,
             params={
                 "start_date": "2020-01-01T00:00:00Z",
                 "end_date": "2030-12-31T23:59:59Z",
@@ -206,12 +217,11 @@ class TestLogsListEndpoint:
     def test_list_logs_response_structure(
         self,
         http_client: httpx.Client,
-        admin_token: str,
     ):
         """Verify log entries have the expected structure."""
         response = http_client.get(
             "/api/executions/logs",
-            headers=auth_headers(admin_token),
+            headers=self.admin_headers,
             params={"limit": 10},
         )
         assert response.status_code == 200

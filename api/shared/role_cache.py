@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from src.core.cache.redis_client import get_shared_redis
+from src.core.log_safety import log_safe
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -83,9 +84,9 @@ async def get_user_roles(
                 role_names = list(payload["role_names"])
                 return role_ids, role_names
             # Wrong shape / stale schema: treat as miss, fall through to DB.
-            logger.debug(f"Role cache entry for {user_id} has unexpected shape; refetching")
+            logger.debug("Role cache entry for %s has unexpected shape; refetching", log_safe(user_id))
         except (ValueError, TypeError) as e:
-            logger.warning(f"Role cache entry for {user_id} unparseable; refetching: {e}")
+            logger.warning("Role cache entry for %s unparseable; refetching: %s", log_safe(user_id), log_safe(e))
 
     # Miss -> DB
     from sqlalchemy import select
@@ -111,7 +112,7 @@ async def get_user_roles(
         r = await get_shared_redis()
         await r.set(key, json.dumps(payload), ex=_ROLE_CACHE_TTL)
     except Exception as e:
-        logger.warning(f"Role cache populate failed for user {user_id}: {e}")
+        logger.warning("Role cache populate failed for user %s: %s", log_safe(user_id), log_safe(e))
 
     return role_ids, role_names
 
@@ -125,9 +126,13 @@ async def invalidate_user(user_id: UUID) -> None:
     try:
         r = await get_shared_redis()
         await r.delete(_key(user_id))
-        logger.debug(f"Invalidated role cache for user {user_id}")
+        logger.debug("Invalidated role cache for user %s", log_safe(user_id))
     except Exception as e:
-        logger.warning(f"Failed to invalidate role cache for user {user_id}: {e}")
+        logger.warning(
+            "Failed to invalidate role cache for user %s: %s",
+            log_safe(user_id),
+            log_safe(e),
+        )
 
 
 async def invalidate_role(role_id: UUID) -> None:

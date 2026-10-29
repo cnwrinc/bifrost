@@ -1,4 +1,11 @@
-import { useState } from "react";
+import { getErrorMessage } from "@/lib/api-error";
+import { GitHubTokenField } from "./GitHubTokenField";
+import { GitHubResourceSelect } from "./GitHubResourceSelect";
+import { GitHubCreateRepositoryDialog } from "./GitHubCreateRepositoryDialog";
+import { GitHubDisconnectDialog } from "./GitHubDisconnectDialog";
+import { SettingsReadError } from "./SettingsReadError";
+import { GitHubConnectionSummary } from "./GitHubConnectionSummary";
+import { useRef, useState } from "react";
 import {
 	Card,
 	CardContent,
@@ -7,53 +14,52 @@ import {
 	CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
-import {
-	Select,
-	SelectContent,
-	SelectItem,
-	SelectTrigger,
-	SelectValue,
-} from "@/components/ui/select";
-import {
-	Dialog,
-	DialogContent,
-	DialogDescription,
-	DialogFooter,
-	DialogHeader,
-	DialogTitle,
-} from "@/components/ui/dialog";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { toast } from "sonner";
-import {
-	Loader2,
-	CheckCircle2,
-	AlertCircle,
-	Plus,
-} from "lucide-react";
+import { Loader2, Plus } from "lucide-react";
 import { Github } from "@/components/icons/GithubIcon";
 import {
 	useGitHubConfig,
 	useGitHubRepositories,
-	useConfigureGitHub,
 	useCreateGitHubRepository,
 	useDisconnectGitHub,
+	enqueueGitHubConnect,
+	previewGitHubConnect,
 	validateGitHubToken,
 	listGitHubBranches,
+	type GitConnectPreview,
+	type GitConnectRequest,
 	type GitHubRepoInfo,
 	type GitHubBranchInfo,
 	type GitHubConfigResponse,
 } from "@/hooks/useGitHub";
 
 export function GitHub() {
+	const headingRef = useRef<HTMLDivElement>(null);
+	const branchRequest = useRef(0);
+	const [branchError, setBranchError] = useState(false);
+	const [disconnected, setDisconnected] = useState(false);
 	const [config, setConfig] = useState<GitHubConfigResponse | null>(null);
 	const [saving, setSaving] = useState(false);
 	const [testingToken, setTestingToken] = useState(false);
 	const [loadingBranches, setLoadingBranches] = useState(false);
+	const [connectionPreview, setConnectionPreview] =
+		useState<GitConnectPreview | null>(null);
+	const [connectionStrategy, setConnectionStrategy] = useState<
+		GitConnectRequest["strategy"] | ""
+	>("");
+	const [conflictDecisions, setConflictDecisions] = useState<
+		Record<string, "local" | "remote">
+	>({});
+	const [confirmDestructive, setConfirmDestructive] = useState(false);
+	const [connectionJobId, setConnectionJobId] = useState<string | null>(null);
 
 	// Form state
 	const [token, setToken] = useState("");
 	const [tokenValid, setTokenValid] = useState<boolean | null>(null);
+	const [tokenError, setTokenError] = useState<string | null>(null);
 	const [repositories, setRepositories] = useState<GitHubRepoInfo[]>([]);
 	const [branches, setBranches] = useState<GitHubBranchInfo[]>([]);
 	const [selectedRepo, setSelectedRepo] = useState<string>("");
@@ -70,24 +76,50 @@ export function GitHub() {
 	const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
 
 	// Load current GitHub configuration
-	const { data: configData, isLoading: configLoading } = useGitHubConfig();
+	const {
+		data: configData,
+		isLoading: configLoading,
+		isError: configError,
+		isFetching: configFetching,
+		refetch: refetchConfig,
+	} = useGitHubConfig();
 
 	// Load repositories when token is saved but not configured
 	const shouldLoadRepos = configData?.token_saved && !configData?.configured;
-	const { data: reposData } = useGitHubRepositories(shouldLoadRepos ?? false);
+	const {
+		data: reposData,
+		isError: reposError,
+		isFetching: reposFetching,
+		refetch: refetchRepos,
+	} = useGitHubRepositories(shouldLoadRepos ?? false);
 
 	// Mutations
-	const configureMutation = useConfigureGitHub();
 	const createRepoMutation = useCreateGitHubRepository();
 	const disconnectMutation = useDisconnectGitHub();
 	// Track the saved token for use in configuration
 	const [savedToken, setSavedToken] = useState<string | null>(null);
+	const previewItems = connectionPreview?.items ?? [];
+	const conflicts = previewItems.filter(
+		(item) => item.classification === "conflict",
+	);
+	const summaryCounts = {
+		local: previewItems.filter(
+			(item) => item.classification === "local_only",
+		).length,
+		remote: previewItems.filter(
+			(item) => item.classification === "remote_only",
+		).length,
+		same: previewItems.filter((item) => item.classification === "identical")
+			.length,
+		conflict: conflicts.length,
+	};
 
 	// Mirror server-loaded configData into local state so handlers can patch
 	// it without going back through the query cache. Adjust during render
 	// with a previous-value sentinel to avoid setState-in-effect.
-	const [prevConfigDataRef, setPrevConfigDataRef] =
-		useState<GitHubConfigResponse | undefined>(undefined);
+	const [prevConfigDataRef, setPrevConfigDataRef] = useState<
+		GitHubConfigResponse | undefined
+	>(undefined);
 	if (configData && prevConfigDataRef !== configData) {
 		setPrevConfigDataRef(configData);
 		setConfig(configData);
@@ -97,8 +129,9 @@ export function GitHub() {
 	}
 
 	// Load repositories when they become available for an unconfigured token.
-	const [prevReposDataRef, setPrevReposDataRef] =
-		useState<typeof reposData | undefined>(undefined);
+	const [prevReposDataRef, setPrevReposDataRef] = useState<
+		typeof reposData | undefined
+	>(undefined);
 	if (
 		reposData?.repositories &&
 		config?.token_saved &&
@@ -111,6 +144,7 @@ export function GitHub() {
 
 	// Validate token and load repositories
 	const handleTokenValidation = async () => {
+		if (testingToken || saving) return;
 		if (!token.trim()) {
 			toast.error("Please enter a GitHub Personal Access Token");
 			return;
@@ -118,6 +152,7 @@ export function GitHub() {
 
 		setTestingToken(true);
 		setTokenValid(null);
+		setTokenError(null);
 		setRepositories([]);
 		setBranches([]);
 
@@ -129,21 +164,10 @@ export function GitHub() {
 
 			// Auto-select detected repo if available
 			if (response.detected_repo) {
-				setSelectedRepo(response.detected_repo.full_name);
-				setSelectedBranch(response.detected_repo.branch);
-
-				// Load branches for detected repo
-				try {
-					const branchList = await listGitHubBranches(
-						response.detected_repo.full_name,
-					);
-					setBranches(branchList);
-				} catch (error) {
-					console.error(
-						"Failed to load branches for detected repo:",
-						error,
-					);
-				}
+				await handleRepoSelection(
+					response.detected_repo.full_name,
+					response.detected_repo.branch,
+				);
 
 				toast.success("Token validated successfully", {
 					description: `Detected existing repository: ${response.detected_repo.full_name}`,
@@ -153,46 +177,56 @@ export function GitHub() {
 					description: `Found ${response.repositories.length} accessible repositories`,
 				});
 			}
-		} catch {
+		} catch (error) {
+			const message = getErrorMessage(error, "Failed to validate token");
 			setTokenValid(false);
-			toast.error("Invalid token", {
-				description:
-					"Please check your GitHub Personal Access Token and try again",
-			});
+			setTokenError(message);
+			toast.error("Token Validation Failed", { description: message });
 		} finally {
 			setTestingToken(false);
 		}
 	};
 
 	// Load branches when repository is selected
-	const handleRepoSelection = async (repoFullName: string) => {
+	const handleRepoSelection = async (
+		repoFullName: string,
+		preferredBranch?: string,
+	) => {
+		const request = ++branchRequest.current;
+		setBranchError(false);
 		setSelectedRepo(repoFullName);
 		setBranches([]);
-		setSelectedBranch("main");
+		setSelectedBranch(preferredBranch || "main");
+		setConnectionPreview(null);
+		setConnectionJobId(null);
 
 		if (!repoFullName) return;
 
 		setLoadingBranches(true);
 		try {
 			const branchList = await listGitHubBranches(repoFullName);
+			if (request !== branchRequest.current) return;
 			setBranches(branchList);
 
 			// Auto-select main/master if available
 			const defaultBranch =
+				branchList.find((b) => b.name === preferredBranch) ||
 				branchList.find((b) => b.name === "main") ||
 				branchList.find((b) => b.name === "master");
 			if (defaultBranch) {
 				setSelectedBranch(defaultBranch.name);
 			}
 		} catch {
-			toast.error("Failed to load branches");
+			if (request !== branchRequest.current) return;
+			setBranchError(true);
 		} finally {
-			setLoadingBranches(false);
+			if (request === branchRequest.current) setLoadingBranches(false);
 		}
 	};
 
 	// Create new repository
 	const handleCreateRepository = async () => {
+		if (creatingRepo) return;
 		if (!newRepoName.trim()) {
 			toast.error("Please enter a repository name");
 			return;
@@ -229,18 +263,16 @@ export function GitHub() {
 			setNewRepoName("");
 			setNewRepoDescription("");
 			setNewRepoPrivate(true);
-		} catch (error) {
-			toast.error("Failed to create repository", {
-				description:
-					error instanceof Error ? error.message : "Unknown error",
-			});
+		} catch {
+			// The dialog retains the draft and displays the mutation failure inline.
 		} finally {
 			setCreatingRepo(false);
 		}
 	};
 
-	// Configure GitHub integration
+	// Compare before any first connection can modify the workspace.
 	const handleConfigure = async () => {
+		if (saving || testingToken || loadingBranches || branchError) return;
 		// Token must be saved to configure
 		if (!config?.token_saved && !savedToken) {
 			toast.error("Please validate your token first");
@@ -252,28 +284,78 @@ export function GitHub() {
 			return;
 		}
 
-		// Proceed directly to configuration
-		await handleSaveConfig();
-	};
-
-	// Save configuration (always replaces workspace with remote)
-	const handleSaveConfig = async () => {
 		setSaving(true);
-
+		setConnectionJobId(null);
 		try {
-			const setupResponse = await configureMutation.mutateAsync({
-				body: {
-					repo_url: selectedRepo,
-					branch: selectedBranch,
-				},
+			const preview = await previewGitHubConnect({
+				repository_url: selectedRepo,
+				branch: selectedBranch,
 			});
-
-			// Configuration is now async - show job queued message
-			toast.success("GitHub configuration started", {
-				description: `Job ${setupResponse.job_id} queued. Watch for notifications for progress.`,
+			setConnectionPreview(preview);
+			setConnectionStrategy("");
+			setConflictDecisions({});
+			setConfirmDestructive(false);
+			toast.success("Workspace connection reviewed", {
+				description:
+					"Choose how to reconcile the reviewed files before connecting.",
 			});
 		} catch (error) {
-			toast.error("Failed to save configuration", {
+			toast.error("Failed to review workspace connection", {
+				description:
+					error instanceof Error ? error.message : "Unknown error",
+			});
+		} finally {
+			setSaving(false);
+		}
+	};
+
+	const handleConnect = async () => {
+		if (!connectionPreview || !connectionStrategy || saving) return;
+		if (
+			connectionStrategy === "reconcile" &&
+			conflicts.some((item) => !conflictDecisions[item.path])
+		) {
+			toast.error("Choose local or remote for every conflict", {
+				description:
+					"Reconcile requires one decision for each conflicting path.",
+			});
+			return;
+		}
+		const discardsLocal = previewItems.some(
+			(item) =>
+				item.classification === "local_only" ||
+				item.classification === "conflict",
+		);
+		if (
+			connectionStrategy === "start_from_remote" &&
+			discardsLocal &&
+			!confirmDestructive
+		) {
+			toast.error("Confirm replacing local workspace content", {
+				description:
+					"Starting from the remote would discard reviewed local files.",
+			});
+			return;
+		}
+		setSaving(true);
+		try {
+			const operation = await enqueueGitHubConnect({
+				preview_token: connectionPreview.token,
+				strategy: connectionStrategy,
+				decisions:
+					connectionStrategy === "reconcile" ? conflictDecisions : {},
+				confirm_destructive:
+					connectionStrategy === "start_from_remote" &&
+					confirmDestructive,
+			});
+			setConnectionJobId(operation.job_id);
+			toast.success("GitHub connection queued", {
+				description: operation.notification_id
+					? "Progress will appear in notifications."
+					: `Track durable job ${operation.job_id}.`,
+			});
+		} catch (error) {
+			toast.error("Failed to queue GitHub connection", {
 				description:
 					error instanceof Error ? error.message : "Unknown error",
 			});
@@ -284,11 +366,14 @@ export function GitHub() {
 
 	// Disconnect GitHub integration
 	const handleDisconnect = async () => {
+		if (saving) return;
 		setSaving(true);
-		setShowDisconnectConfirm(false);
 
 		try {
 			await disconnectMutation.mutateAsync({});
+			setDisconnected(true);
+			setShowDisconnectConfirm(false);
+			setSavedToken(null);
 
 			// Reset all state
 			setConfig({
@@ -320,19 +405,42 @@ export function GitHub() {
 
 	if (configLoading) {
 		return (
-			<div className="flex items-center justify-center py-12">
-				<Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+			<div
+				role="status"
+				aria-label="Loading GitHub configuration"
+				className="flex items-center justify-center py-12"
+			>
+				<Loader2 className="h-8 w-8 animate-spin motion-reduce:animate-none text-muted-foreground" />
 			</div>
 		);
 	}
 
+	const readError = configError ? (
+		<SettingsReadError
+			resource="GitHub configuration"
+			cached={!!configData}
+			pending={configFetching}
+			onRetry={() => {
+				void refetchConfig();
+			}}
+		/>
+	) : null;
+	if (!configData) return readError;
+
 	return (
 		<div className="space-y-6">
+			{readError}
 			<Card>
 				<CardHeader>
 					<div className="flex items-center gap-2">
 						<Github className="h-5 w-5" />
-						<CardTitle>GitHub Integration</CardTitle>
+						<CardTitle
+							ref={headingRef}
+							tabIndex={-1}
+							className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						>
+							GitHub Integration
+						</CardTitle>
 					</div>
 					<CardDescription>
 						Connect your workspace to a GitHub repository for
@@ -342,119 +450,33 @@ export function GitHub() {
 				<CardContent className="space-y-6">
 					{/* Current Status */}
 					{config?.configured ? (
-						<div className="space-y-4">
-							<div className="rounded-lg bg-muted/50 p-4 ring-1 ring-foreground/5">
-								<div className="flex items-center justify-between mb-2">
-									<div className="flex items-center gap-2">
-										<CheckCircle2 className="h-4 w-4 text-green-500" />
-										<span className="text-sm font-medium">
-											Currently Connected
-										</span>
-									</div>
-									<Button
-										variant="destructive"
-										size="sm"
-										onClick={() =>
-											setShowDisconnectConfirm(true)
-										}
-										disabled={saving}
-									>
-										{saving ? (
-											<Loader2 className="h-4 w-4 animate-spin" />
-										) : (
-											"Disconnect"
-										)}
-									</Button>
-								</div>
-								<div className="space-y-1 text-sm text-muted-foreground">
-									<div>
-										<strong>Repository:</strong>{" "}
-										{config.repo_url}
-									</div>
-									<div>
-										<strong>Branch:</strong> {config.branch}
-									</div>
-								</div>
-							</div>
-							<p className="text-sm text-muted-foreground">
-								Use the <strong>Source Control</strong> panel in
-								the Code Editor to commit, push, and pull
-								changes.
-							</p>
-						</div>
+						<GitHubConnectionSummary
+							config={config}
+							pending={saving}
+							onDisconnect={() => {
+								disconnectMutation.reset();
+								setDisconnected(false);
+								setShowDisconnectConfirm(true);
+							}}
+						/>
 					) : (
 						<>
-							{/* GitHub Token */}
-							<div className="space-y-2">
-								<Label htmlFor="github-token">
-									GitHub Personal Access Token
-								</Label>
-								<div className="flex flex-col gap-2 sm:flex-row">
-									<Input
-										id="github-token"
-										type="password"
-										autoComplete="off"
-										placeholder={
-											config?.token_saved
-												? "Token saved - enter new token to change"
-												: "ghp_xxxxxxxxxxxxxxxxxxxx"
-										}
-										value={token}
-										onChange={(e) => {
-											setToken(e.target.value);
-											// Only invalidate if we actually had a validated token from manual validation
-											// Don't clear if token was just saved (not manually validated)
-											if (tokenValid === true) {
-												setTokenValid(null);
-											}
-										}}
-									/>
-									<Button
-										onClick={handleTokenValidation}
-										disabled={testingToken || !token.trim()}
-										variant={
-											tokenValid === true
-												? "default"
-												: tokenValid === false
-													? "destructive"
-													: "secondary"
-										}
-										className="gap-2"
-									>
-										{testingToken ? (
-											<>
-												<Loader2 className="h-4 w-4 animate-spin" />
-												Validating...
-											</>
-										) : tokenValid === true ? (
-											<>
-												<CheckCircle2 className="h-4 w-4" />
-												Validated
-											</>
-										) : tokenValid === false ? (
-											<>
-												<AlertCircle className="h-4 w-4" />
-												Invalid
-											</>
-										) : (
-											"Validate"
-										)}
-									</Button>
-								</div>
-								<p className="text-xs text-muted-foreground">
-									Create a token at{" "}
-									<a
-										href="https://github.com/settings/tokens/new"
-										target="_blank"
-										rel="noopener noreferrer"
-										className="underline hover:text-foreground"
-									>
-										github.com/settings/tokens
-									</a>{" "}
-									with <code className="text-xs">repo</code>{" "}
-									scope
-								</p>
-							</div>
+							<GitHubTokenField
+								value={token}
+								saved={!!config?.token_saved}
+								valid={tokenValid}
+								error={tokenError}
+								pending={testingToken}
+								disabled={saving}
+								onChange={(value) => {
+									setToken(value);
+									setTokenValid(null);
+									setTokenError(null);
+								}}
+								onValidate={() => {
+									void handleTokenValidation();
+								}}
+							/>
 
 							{/* Repository Selection - always show if token is valid or saved */}
 							{(tokenValid || config?.token_saved) && (
@@ -466,41 +488,60 @@ export function GitHub() {
 										<Button
 											variant="ghost"
 											size="sm"
-											onClick={() =>
-												setShowCreateRepo(true)
-											}
+											className="min-h-11"
+											disabled={saving}
+											onClick={() => {
+												createRepoMutation.reset();
+												setShowCreateRepo(true);
+											}}
 										>
 											<Plus className="h-4 w-4 mr-1" />
 											Create New
 										</Button>
 									</div>
-									<Select
+									<GitHubResourceSelect
+										id="repository"
 										value={selectedRepo}
-										onValueChange={handleRepoSelection}
-									>
-										<SelectTrigger id="repository">
-											<SelectValue placeholder="Select a repository" />
-										</SelectTrigger>
-										<SelectContent>
-											{repositories.map((repo) => (
-												<SelectItem
-													key={repo.full_name}
-													value={repo.full_name}
-												>
-													<div className="flex items-center gap-2">
-														<span>
-															{repo.full_name}
-														</span>
-														{repo.private && (
-															<span className="text-xs text-muted-foreground">
-																(private)
-															</span>
-														)}
-													</div>
-												</SelectItem>
-											))}
-										</SelectContent>
-									</Select>
+										onChange={(value) => {
+											void handleRepoSelection(value);
+										}}
+										placeholder={
+											reposFetching &&
+											repositories.length === 0
+												? "Loading repositories…"
+												: "Select a repository"
+										}
+										disabled={
+											saving ||
+											(repositories.length === 0 &&
+												(reposFetching || reposError))
+										}
+										options={repositories.map((repo) => ({
+											value: repo.full_name,
+											detail: repo.private
+												? "Private"
+												: undefined,
+										}))}
+									/>
+									{reposError && (
+										<SettingsReadError
+											resource="GitHub repositories"
+											cached={repositories.length > 0}
+											pending={reposFetching}
+											onRetry={() => {
+												void refetchRepos();
+											}}
+										/>
+									)}
+									{!reposError &&
+										!reposFetching &&
+										repositories.length === 0 && (
+											<p className="text-sm text-muted-foreground">
+												No repositories available.
+												Create one or check the saved
+												token’s repository access.
+											</p>
+										)}
 								</div>
 							)}
 
@@ -508,45 +549,41 @@ export function GitHub() {
 							{(tokenValid || config?.token_saved) && (
 								<div className="space-y-2">
 									<Label htmlFor="branch">Branch</Label>
-									<Select
+									<GitHubResourceSelect
+										id="branch"
 										value={selectedBranch}
-										onValueChange={setSelectedBranch}
+										onChange={(branch) => {
+											setSelectedBranch(branch);
+											setConnectionPreview(null);
+											setConnectionJobId(null);
+										}}
+										placeholder="Select a branch"
+										loading={loadingBranches}
 										disabled={
-											!selectedRepo || loadingBranches
+											!selectedRepo ||
+											branchError ||
+											saving
 										}
-									>
-										<SelectTrigger id="branch">
-											{loadingBranches ? (
-												<div className="flex items-center gap-2">
-													<Loader2 className="h-4 w-4 animate-spin" />
-													<span>
-														Loading branches...
-													</span>
-												</div>
-											) : (
-												<SelectValue placeholder="Select a branch" />
-											)}
-										</SelectTrigger>
-										<SelectContent>
-											{branches.map((branch) => (
-												<SelectItem
-													key={branch.name}
-													value={branch.name}
-												>
-													<div className="flex items-center gap-2">
-														<span>
-															{branch.name}
-														</span>
-														{branch.protected && (
-															<span className="text-xs text-muted-foreground">
-																(protected)
-															</span>
-														)}
-													</div>
-												</SelectItem>
-											))}
-										</SelectContent>
-									</Select>
+										options={branches.map((branch) => ({
+											value: branch.name,
+											detail: branch.protected
+												? "Protected"
+												: undefined,
+										}))}
+									/>
+									{branchError && (
+										<SettingsReadError
+											resource="repository branches"
+											cached={false}
+											pending={loadingBranches}
+											onRetry={() => {
+												void handleRepoSelection(
+													selectedRepo,
+													selectedBranch,
+												);
+											}}
+										/>
+									)}
 									{!selectedRepo && (
 										<p className="text-xs text-muted-foreground">
 											Select a repository first
@@ -555,12 +592,294 @@ export function GitHub() {
 								</div>
 							)}
 
-							{/* Save Button */}
+							{connectionJobId && (
+								<p
+									role="status"
+									className="text-sm text-muted-foreground"
+								>
+									Connection queued. Follow its progress in
+									notifications.
+								</p>
+							)}
+
+							{connectionPreview && (
+								<section
+									aria-label="Review workspace connection"
+									className="space-y-4 rounded-[var(--bf-radius-control)] border border-border/70 bg-muted/20 p-4"
+								>
+									<div className="space-y-1">
+										<h3 className="font-medium">
+											Review workspace connection
+										</h3>
+										<p className="text-sm text-muted-foreground">
+											The comparison is bound to this
+											repository and branch. If either
+											changes, review it again.
+										</p>
+									</div>
+									<div
+										aria-label="Connection summary"
+										className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-4"
+									>
+										<span>
+											<strong>
+												{summaryCounts.local}
+											</strong>{" "}
+											local-only
+										</span>
+										<span>
+											<strong>
+												{summaryCounts.remote}
+											</strong>{" "}
+											remote-only
+										</span>
+										<span>
+											<strong>
+												{summaryCounts.same}
+											</strong>{" "}
+											same
+										</span>
+										<span>
+											<strong>
+												{summaryCounts.conflict}
+											</strong>{" "}
+											conflict
+											{summaryCounts.conflict === 1
+												? ""
+												: "s"}
+										</span>
+									</div>
+
+									<RadioGroup
+										value={connectionStrategy}
+										onValueChange={(value) =>
+											setConnectionStrategy(
+												value as GitConnectRequest["strategy"],
+											)
+										}
+										aria-label="Connection strategy"
+										className="space-y-2"
+									>
+										<div className="flex gap-3 rounded-[var(--bf-radius-control)] border border-border/70 p-3">
+											<RadioGroupItem
+												value="publish_local"
+												id="publish-local"
+											/>
+											<Label
+												htmlFor="publish-local"
+												className="space-y-1"
+											>
+												<span>
+													Publish local workspace
+												</span>
+												<span className="block text-xs font-normal text-muted-foreground">
+													Creates the remote branch
+													from local files. This is
+													unavailable when the remote
+													branch already has content.
+												</span>
+											</Label>
+										</div>
+										<div className="flex gap-3 rounded-[var(--bf-radius-control)] border border-border/70 p-3">
+											<RadioGroupItem
+												value="start_from_remote"
+												id="start-from-remote"
+											/>
+											<Label
+												htmlFor="start-from-remote"
+												className="space-y-1"
+											>
+												<span>Start from remote</span>
+												<span className="block text-xs font-normal text-muted-foreground">
+													Replaces reviewed local-only
+													files with the remote
+													branch.
+												</span>
+											</Label>
+										</div>
+										<div className="flex gap-3 rounded-[var(--bf-radius-control)] border border-border/70 p-3">
+											<RadioGroupItem
+												value="reconcile"
+												id="reconcile"
+											/>
+											<Label
+												htmlFor="reconcile"
+												className="space-y-1"
+											>
+												<span>Reconcile both</span>
+												<span className="block text-xs font-normal text-muted-foreground">
+													Keeps both sides where
+													possible and asks you to
+													choose every conflict.
+												</span>
+											</Label>
+										</div>
+									</RadioGroup>
+
+									{connectionStrategy ===
+										"start_from_remote" &&
+										previewItems.some(
+											(item) =>
+												item.classification ===
+													"local_only" ||
+												item.classification ===
+													"conflict",
+										) && (
+											<div className="flex items-start gap-3 rounded-[var(--bf-radius-control)] border border-destructive/40 bg-destructive/5 p-3">
+												<Checkbox
+													id="confirm-destructive-connect"
+													checked={confirmDestructive}
+													onCheckedChange={(
+														checked,
+													) =>
+														setConfirmDestructive(
+															checked === true,
+														)
+													}
+												/>
+												<Label
+													htmlFor="confirm-destructive-connect"
+													className="font-normal"
+												>
+													I understand this replaces
+													the reviewed local-only and
+													conflicting files with the
+													remote branch.
+												</Label>
+											</div>
+										)}
+
+									{connectionStrategy === "reconcile" &&
+										conflicts.length > 0 && (
+											<div className="space-y-2">
+												<Label>Resolve conflicts</Label>
+												<div className="max-h-56 space-y-2 overflow-y-auto pr-1">
+													{conflicts.map((item) => (
+														<div
+															key={item.path}
+															className="rounded-[var(--bf-radius-control)] border border-border/70 p-3"
+														>
+															<p className="mb-2 break-all font-mono text-xs">
+																{item.path}
+															</p>
+															<RadioGroup
+																value={
+																	conflictDecisions[
+																		item
+																			.path
+																	] ?? ""
+																}
+																onValueChange={(
+																	value,
+																) =>
+																	setConflictDecisions(
+																		(
+																			current,
+																		) => ({
+																			...current,
+																			[item.path]:
+																				value as
+																					| "local"
+																					| "remote",
+																		}),
+																	)
+																}
+																aria-label={`Decision for ${item.path}`}
+																className="grid grid-cols-1 gap-2 sm:grid-cols-2"
+															>
+																<div className="flex items-center gap-2">
+																	<RadioGroupItem
+																		value="local"
+																		id={`local-${item.path}`}
+																	/>
+																	<Label
+																		htmlFor={`local-${item.path}`}
+																		className="font-normal"
+																	>
+																		Keep
+																		local:{" "}
+																		{
+																			item.path
+																		}
+																	</Label>
+																</div>
+																<div className="flex items-center gap-2">
+																	<RadioGroupItem
+																		value="remote"
+																		id={`remote-${item.path}`}
+																	/>
+																	<Label
+																		htmlFor={`remote-${item.path}`}
+																		className="font-normal"
+																	>
+																		Keep
+																		remote:{" "}
+																		{
+																			item.path
+																		}
+																	</Label>
+																</div>
+															</RadioGroup>
+														</div>
+													))}
+												</div>
+											</div>
+										)}
+
+									<Button
+										onClick={() => {
+											void handleConnect();
+										}}
+										className="min-h-11 w-full sm:w-auto"
+										disabled={
+											saving ||
+											!connectionStrategy ||
+											(connectionStrategy ===
+												"reconcile" &&
+												conflicts.some(
+													(item) =>
+														!conflictDecisions[
+															item.path
+														],
+												)) ||
+											(connectionStrategy ===
+												"start_from_remote" &&
+												previewItems.some(
+													(item) =>
+														item.classification ===
+															"local_only" ||
+														item.classification ===
+															"conflict",
+												) &&
+												!confirmDestructive)
+										}
+									>
+										{saving ? (
+											<>
+												<Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />
+												Connecting...
+											</>
+										) : (
+											<>
+												{" "}
+												<Github className="mr-2 h-4 w-4" />
+												Connect GitHub
+											</>
+										)}
+									</Button>
+								</section>
+							)}
+
+							{/* Review Button */}
 							<div className="flex justify-end">
 								<Button
 									onClick={handleConfigure}
+									className="min-h-11 w-full sm:w-auto"
 									disabled={
 										saving ||
+										testingToken ||
+										loadingBranches ||
+										branchError ||
 										!selectedRepo ||
 										(!config?.token_saved &&
 											!token.trim()) ||
@@ -570,13 +889,13 @@ export function GitHub() {
 								>
 									{saving ? (
 										<>
-											<Loader2 className="h-4 w-4 mr-2 animate-spin" />
-											Configuring...
+											<Loader2 className="h-4 w-4 mr-2 animate-spin motion-reduce:animate-none" />
+											Reviewing...
 										</>
 									) : (
 										<>
 											<Github className="h-4 w-4 mr-2" />
-											Configure GitHub
+											Review connection
 										</>
 									)}
 								</Button>
@@ -613,125 +932,33 @@ export function GitHub() {
 				</CardContent>
 			</Card>
 
-			{/* Create Repository Modal */}
-			<Dialog open={showCreateRepo} onOpenChange={setShowCreateRepo}>
-				<DialogContent>
-					<DialogHeader>
-						<DialogTitle>Create New Repository</DialogTitle>
-						<DialogDescription>
-							Create a new GitHub repository in your account
-						</DialogDescription>
-					</DialogHeader>
+			<GitHubCreateRepositoryDialog
+				open={showCreateRepo}
+				name={newRepoName}
+				description={newRepoDescription}
+				isPrivate={newRepoPrivate}
+				pending={creatingRepo}
+				failed={createRepoMutation.isError}
+				onClose={() => setShowCreateRepo(false)}
+				onConfirm={() => {
+					void handleCreateRepository();
+				}}
+				onNameChange={setNewRepoName}
+				onDescriptionChange={setNewRepoDescription}
+				onPrivateChange={setNewRepoPrivate}
+			/>
 
-					<div className="space-y-4">
-						<div className="space-y-2">
-							<Label htmlFor="new-repo-name">
-								Repository Name
-							</Label>
-							<Input
-								id="new-repo-name"
-								placeholder="my-repository"
-								value={newRepoName}
-								onChange={(e) => setNewRepoName(e.target.value)}
-							/>
-						</div>
-
-						<div className="space-y-2">
-							<Label htmlFor="new-repo-desc">
-								Description (Optional)
-							</Label>
-							<Input
-								id="new-repo-desc"
-								placeholder="A brief description"
-								value={newRepoDescription}
-								onChange={(e) =>
-									setNewRepoDescription(e.target.value)
-								}
-							/>
-						</div>
-
-						<div className="flex items-center space-x-2">
-							<input
-								type="checkbox"
-								id="new-repo-private"
-								checked={newRepoPrivate}
-								onChange={(e) =>
-									setNewRepoPrivate(e.target.checked)
-								}
-								className="h-4 w-4"
-							/>
-							<Label
-								htmlFor="new-repo-private"
-								className="text-sm font-normal"
-							>
-								Private repository
-							</Label>
-						</div>
-					</div>
-
-					<DialogFooter>
-						<Button
-							variant="outline"
-							onClick={() => setShowCreateRepo(false)}
-						>
-							Cancel
-						</Button>
-						<Button
-							onClick={handleCreateRepository}
-							disabled={!newRepoName.trim() || creatingRepo}
-						>
-							{creatingRepo ? (
-								<>
-									<Loader2 className="h-4 w-4 mr-2 animate-spin" />
-									Creating...
-								</>
-							) : (
-								"Create Repository"
-							)}
-						</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
-
-			{/* Disconnect Confirmation Dialog */}
-			<Dialog
+			<GitHubDisconnectDialog
 				open={showDisconnectConfirm}
-				onOpenChange={setShowDisconnectConfirm}
-			>
-				<DialogContent>
-					<DialogHeader>
-						<DialogTitle>Disconnect GitHub Integration</DialogTitle>
-						<DialogDescription>
-							Are you sure you want to disconnect GitHub
-							integration? This will remove all stored credentials
-							and you'll need to reconfigure to reconnect.
-						</DialogDescription>
-					</DialogHeader>
-					<DialogFooter>
-						<Button
-							variant="outline"
-							onClick={() => setShowDisconnectConfirm(false)}
-							disabled={saving}
-						>
-							Cancel
-						</Button>
-						<Button
-							variant="destructive"
-							onClick={handleDisconnect}
-							disabled={saving}
-						>
-							{saving ? (
-								<>
-									<Loader2 className="h-4 w-4 mr-2 animate-spin" />
-									Disconnecting...
-								</>
-							) : (
-								"Disconnect"
-							)}
-						</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
+				pending={saving}
+				failed={disconnectMutation.isError}
+				completed={disconnected}
+				returnFocusRef={headingRef}
+				onClose={() => setShowDisconnectConfirm(false)}
+				onConfirm={() => {
+					void handleDisconnect();
+				}}
+			/>
 		</div>
 	);
 }

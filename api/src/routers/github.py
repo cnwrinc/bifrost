@@ -7,13 +7,14 @@ Provides endpoints for connecting to repos, syncing, and configuration managemen
 
 import logging
 import uuid
+from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Request, HTTPException, Query, Response, status
 
-from src.core.auth import Context, CurrentSuperuser
+from src.core.auth import Context, CurrentActiveUser
+from src.services.authorization.enforce import authorize_operation
+from src.services.authorization.evaluator import GLOBAL
 from src.core.db_deps import DbSession
-from src.core.log_safety import log_safe
-from src.core.pubsub import publish_git_operation
 from src.models import (
     CommitHistoryResponse,
     CommitInfo,
@@ -24,29 +25,60 @@ from src.models import (
     DiscardRequest,
     GitHubBranchesResponse,
     GitHubBranchInfo,
-    GitHubConfigRequest,
     GitHubConfigResponse,
     GitHubRepoInfo,
     GitHubReposResponse,
-    GitHubSetupResponse,
-    GitJobResponse,
     GitOpRequest,
     SyncRequest,
+    SyncResult,
     GitRefreshStatusResponse,
     RepoStatusResponse,
     ResolveRequest,
     ValidateTokenRequest,
 )
+from src.jobs.platform.git_operation import (
+    GIT_OPERATION_DEFINITION,
+    GitOperationPayload,
+    WORKSPACE_MUTATION_RESOURCE_LOCK_KEY,
+    _github_remote_url,
+)
+from src.models.contracts.github import (
+    GitConnectPreview,
+    GitConnectPreviewRequest,
+    GitConnectRequest,
+)
+from src.models.contracts.platform_jobs import PlatformJobAccepted, PlatformJobStatus
+from src.models.orm.platform_jobs import PlatformJob
+from src.services.git_repo_manager import GitRepoManager
 from src.services.github_api import GitHubAPIClient, GitHubAPIError
 from src.services.github_config import (
     delete_github_config,
     get_github_config,
     save_github_config,
 )
+from src.services.github_sync import (
+    GitConnectDecisionError,
+    GitConnectPreviewError,
+    GitHubSyncService,
+    redact_token,
+    resolve_connect_items,
+)
+from src.services.platform_jobs import (
+    enqueue_platform_job,
+    ensure_platform_job_notification,
+    publish_platform_job_update,
+)
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/github", tags=["GitHub"])
+async def _authorize_global_route(
+    request: Request, user: CurrentActiveUser, db: DbSession
+) -> None:
+    await authorize_operation(
+        db, user, f"{request.method} {request.scope['route'].path}", GLOBAL
+    )
+
+router = APIRouter(prefix="/api/github", tags=["GitHub"], dependencies=[Depends(_authorize_global_route)])
 
 
 # =============================================================================
@@ -59,6 +91,74 @@ def _extract_repo_from_url(repo_url: str) -> str:
     if repo_url.startswith("https://github.com/"):
         return repo_url.replace("https://github.com/", "").rstrip(".git")
     return repo_url
+
+
+def _normalize_connect_repository_url(repository_url: str) -> str:
+    """Accept GitHub owner/repo shorthand without permitting arbitrary remotes."""
+    candidate = repository_url.strip().removesuffix(".git")
+    if not candidate.startswith("http"):
+        candidate = f"https://github.com/{candidate}"
+    prefix = "https://github.com/"
+    repository = candidate.removeprefix(prefix).strip("/")
+    if (
+        not candidate.startswith(prefix)
+        or len(repository.split("/")) != 2
+        or not all(repository.split("/"))
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="repository_url must be a GitHub HTTPS repository URL",
+        )
+    return f"{prefix}{repository}"
+
+
+async def _enqueue_git_operation(
+    db: DbSession,
+    *,
+    operation: Literal[
+        "fetch", "status", "commit", "sync", "resolve", "discard", "abort_merge", "diff", "connect"
+    ],
+    organization_id,
+    user: CurrentActiveUser,
+    job_id: uuid.UUID | None,
+    options: dict | None = None,
+    response: Response | None = None,
+    ensure_notification: bool = False,
+) -> PlatformJobAccepted:
+    """Enqueue one Git operation through the shared durable job transport."""
+    job, reused = await enqueue_platform_job(
+        db,
+        GIT_OPERATION_DEFINITION,
+        GitOperationPayload(
+            operation=operation,
+            organization_id=organization_id,
+            options=options or {},
+        ),
+        dedupe_key=str(job_id) if job_id else None,
+        resource_lock_key=WORKSPACE_MUTATION_RESOURCE_LOCK_KEY,
+        priority=500,
+        organization_id=organization_id,
+        requested_by_user_id=user.user_id,
+        requested_by_email=user.email,
+        requested_by_name=user.email,
+        resource_type="workspace",
+        resource_id="git",
+        title=operation.replace("_", " ").title(),
+        action_url="/git",
+        job_id=job_id,
+    )
+    if ensure_notification and job.notification_id is None:
+        await ensure_platform_job_notification(db, job)
+    await db.commit()
+    await publish_platform_job_update(job)
+    if response is not None:
+        response.headers["Location"] = f"/api/platform-jobs/{job.id}"
+    return PlatformJobAccepted(
+        job_id=job.id,
+        status=PlatformJobStatus(job.status),
+        reused=reused,
+        notification_id=job.notification_id,
+    )
 
 
 # =============================================================================
@@ -74,7 +174,7 @@ def _extract_repo_from_url(repo_url: str) -> str:
 )
 async def get_config_endpoint(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
 ) -> GitHubConfigResponse:
     """Get current GitHub configuration."""
@@ -114,7 +214,7 @@ async def get_config_endpoint(
 )
 async def get_github_status(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
 ) -> GitRefreshStatusResponse:
     """
@@ -202,7 +302,7 @@ async def get_github_status(
 )
 async def get_repo_status(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
 ) -> RepoStatusResponse:
     """Fast repo status check used by CLI push to gate on dirty state."""
@@ -226,7 +326,7 @@ async def get_repo_status(
 async def validate_github_token(
     request: ValidateTokenRequest,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
 ) -> GitHubReposResponse:
     """Validate GitHub token, save to database, and list repositories."""
@@ -276,7 +376,11 @@ async def validate_github_token(
         logger.error(f"GitHub API error validating token: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid GitHub token: {e.message}",
+            detail=(
+                f"GitHub token validation failed (HTTP {e.status_code}): {e.message}"
+                if e.status_code is not None
+                else f"GitHub token validation failed: {e.message}"
+            ),
         )
     except HTTPException:
         raise
@@ -288,69 +392,6 @@ async def validate_github_token(
         )
 
 
-@router.post(
-    "/configure",
-    response_model=GitHubSetupResponse,
-    summary="Configure GitHub integration",
-    description="Save GitHub repository configuration. Syncing happens via /sync endpoints.",
-)
-async def configure_github(
-    request: GitHubConfigRequest,
-    ctx: Context,
-    user: CurrentSuperuser,
-    db: DbSession,
-) -> GitHubSetupResponse:
-    """
-    Configure GitHub integration.
-
-    Saves the GitHub repository configuration (repo URL, branch) to the database.
-    Use the /sync endpoints to pull/push changes.
-    """
-    try:
-        # Normalize repo_url - accept both full URL and owner/repo format
-        repo_url = request.repo_url.strip()
-        if not repo_url.startswith("http"):
-            repo_url = f"https://github.com/{repo_url}"
-
-        logger.info(f"Configuring GitHub for repo: {log_safe(repo_url)}")
-
-        # Get existing config to retrieve token
-        existing_config = await get_github_config(db, ctx.org_id)
-
-        if not existing_config or not existing_config.token:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="GitHub token not found. Please validate your token first.",
-            )
-
-        # Save the updated configuration
-        await save_github_config(
-            db=db,
-            org_id=ctx.org_id,
-            token=existing_config.token,
-            repo_url=repo_url,
-            branch=request.branch or "main",
-            updated_by=user.email,
-        )
-
-        logger.info(f"GitHub configuration saved for repo: {log_safe(repo_url)}")
-
-        return GitHubSetupResponse(
-            job_id=None,
-            notification_id=None,
-            status="configured",
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to configure GitHub: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to configure GitHub: {str(e)}",
-        )
-
-
 @router.get(
     "/repositories",
     response_model=GitHubReposResponse,
@@ -359,7 +400,7 @@ async def configure_github(
 )
 async def list_github_repos(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
 ) -> GitHubReposResponse:
     """List user's GitHub repositories using saved token."""
@@ -412,7 +453,7 @@ async def list_github_repos(
 )
 async def list_github_branches(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
     repo: str = Query(..., description="Repository full name (owner/repo)"),
 ) -> GitHubBranchesResponse:
@@ -471,7 +512,7 @@ async def list_github_branches(
 async def create_github_repository(
     request: CreateRepoRequest,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
 ) -> CreateRepoResponse:
     """Create new GitHub repository."""
@@ -517,11 +558,12 @@ async def create_github_repository(
 )
 async def disconnect_github(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
 ) -> dict:
     """Disconnect GitHub integration."""
     try:
+        await GitRepoManager().remove_stored_credentials()
         await delete_github_config(db, ctx.org_id)
 
         logger.info("GitHub integration disconnected")
@@ -549,7 +591,7 @@ async def disconnect_github(
 )
 async def get_commits(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
     limit: int = Query(20, description="Number of commits to return"),
     offset: int = Query(0, description="Offset for pagination"),
@@ -630,232 +672,355 @@ async def get_commits(
 
 
 @router.post(
+    "/connect/preview",
+    response_model=GitConnectPreview,
+    summary="Preview first workspace Git connection",
+)
+async def preview_git_connect(
+    body: GitConnectPreviewRequest,
+    ctx: Context,
+    user: CurrentActiveUser,
+    db: DbSession,
+) -> GitConnectPreview:
+    """Compare the detached workspace with a remote branch without changing either."""
+    config = await get_github_config(db, ctx.org_id)
+    if config is None or not config.token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GitHub token not found. Please validate your token first.",
+        )
+    if config.repo_url:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="GitHub is already connected; disconnect it before connecting another repository.",
+        )
+    repository_url = _normalize_connect_repository_url(body.repository_url)
+    service = GitHubSyncService(
+        db,
+        repo_url=_github_remote_url(config, repository_url),
+        branch=body.branch,
+        token=config.token,
+    )
+    try:
+        return await service.preview_connect(
+            repository_url,
+            body.branch,
+            requested_by_user_id=str(user.user_id),
+            organization_id=str(ctx.org_id) if ctx.org_id else None,
+        )
+    except GitConnectPreviewError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=redact_token(str(exc), config.token),
+        ) from exc
+
+
+@router.post(
+    "/connect",
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue reviewed first workspace Git connection",
+)
+async def enqueue_git_connect(
+    body: GitConnectRequest,
+    response: Response,
+    ctx: Context,
+    user: CurrentActiveUser,
+    db: DbSession,
+) -> PlatformJobAccepted:
+    """Validate a requester-bound preview, then run it through ``workspace.git``."""
+    config = await get_github_config(db, ctx.org_id)
+    if config is None or not config.token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GitHub token not found. Please validate your token first.",
+        )
+    if config.repo_url:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="GitHub is already connected; disconnect it before connecting another repository.",
+        )
+    try:
+        preview = await GitHubSyncService.load_connect_preview(
+            body.preview_token,
+            requested_by_user_id=str(user.user_id),
+            organization_id=str(ctx.org_id) if ctx.org_id else None,
+        )
+        resolve_connect_items(
+            preview.items, strategy=body.strategy, decisions=body.decisions
+        )
+        if body.strategy == "start_from_remote" and any(
+            item.classification in {"local_only", "conflict"} for item in preview.items
+        ) and not body.confirm_destructive:
+            raise GitConnectDecisionError(
+                "start_from_remote would discard local content; set confirm_destructive"
+            )
+    except GitConnectPreviewError as exc:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc)) from exc
+    except GitConnectDecisionError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+    return await _enqueue_git_operation(
+        db,
+        operation="connect",
+        organization_id=ctx.org_id,
+        user=user,
+        job_id=uuid.uuid4(),
+        options={"request": body.model_dump(mode="json")},
+        response=response,
+        ensure_notification=True,
+    )
+
+
+@router.post(
     "/fetch",
-    response_model=GitJobResponse,
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Queue git fetch",
     description="Queue a git fetch operation. Results via WebSocket.",
 )
 async def git_fetch(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
     request: GitOpRequest | None = None,
-) -> GitJobResponse:
+) -> PlatformJobAccepted:
     """Queue a git fetch operation."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = (request.job_id if request and request.job_id else None) or str(uuid.uuid4())
-    job_id = await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_fetch",
+    return await _enqueue_git_operation(
+        db,
+        operation="fetch",
+        organization_id=ctx.org_id,
+        user=user,
+        job_id=request.job_id if request else None,
     )
-    return GitJobResponse(job_id=job_id)
 
 
 @router.post(
     "/commit",
-    response_model=GitJobResponse,
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Queue git commit",
     description="Queue a git commit operation (local only, no push).",
 )
 async def git_commit(
     request: CommitRequest,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
-) -> GitJobResponse:
+) -> PlatformJobAccepted:
     """Queue a git commit."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = request.job_id or str(uuid.uuid4())
-    job_id = await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_commit",
-        message=request.message,
+    return await _enqueue_git_operation(
+        db,
+        operation="commit",
+        organization_id=ctx.org_id,
+        user=user,
+        job_id=request.job_id,
+        options={"message": request.message},
     )
-    return GitJobResponse(job_id=job_id)
 
 
 @router.post(
     "/sync",
-    response_model=GitJobResponse,
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Queue sync (pull + push)",
     description="Queue a combined sync: pull remote changes, push local commits, import entities. Results via WebSocket.",
 )
 async def git_sync(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
     request: SyncRequest | None = None,
-) -> GitJobResponse:
+) -> PlatformJobAccepted:
     """Queue a sync (pull + push + entity import)."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = (request.job_id if request and request.job_id else None) or str(uuid.uuid4())
+    job_id = request.job_id if request and request.job_id else uuid.uuid4()
     confirm_deletes = request.confirm_deletes if request else False
-    job_id = await publish_git_operation(
+    retry_plan = None
+    if request and request.retry_job_id:
+        previous_job = await db.get(PlatformJob, request.retry_job_id)
+        if (
+            previous_job is None
+            or previous_job.organization_id != ctx.org_id
+            or previous_job.requested_by_user_id != str(user.user_id)
+        ):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Retry plan not found")
+        if previous_job.job_type != "workspace.git" or previous_job.status != "failed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Retry plan is not from a failed workspace sync",
+            )
+        try:
+            previous_result = SyncResult.model_validate(
+                previous_job.result
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Retry plan is unavailable",
+            ) from exc
+        if not previous_result.retryable or previous_result.retry_plan is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Workspace sync is not retryable",
+            )
+        retry_plan = previous_result.retry_plan.model_dump(mode="json")
+    return await _enqueue_git_operation(
+        db,
+        operation="sync",
+        organization_id=ctx.org_id,
+        user=user,
         job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_sync",
-        confirm_deletes=confirm_deletes,
+        options={
+            "confirm_deletes": confirm_deletes,
+            "retry_plan": retry_plan,
+        },
     )
-    return GitJobResponse(job_id=job_id)
 
 
 @router.post(
     "/abort-merge",
-    response_model=GitJobResponse,
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Abort merge",
     description="Abort an in-progress merge, returning to pre-pull state.",
 )
 async def git_abort_merge(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
     request: GitOpRequest | None = None,
-) -> GitJobResponse:
+) -> PlatformJobAccepted:
     """Queue a merge abort."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = (request.job_id if request and request.job_id else None) or str(uuid.uuid4())
-    job_id = await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_abort_merge",
+    return await _enqueue_git_operation(
+        db,
+        operation="abort_merge",
+        organization_id=ctx.org_id,
+        user=user,
+        job_id=request.job_id if request else None,
     )
-    return GitJobResponse(job_id=job_id)
 
 
 @router.post(
     "/changes",
-    response_model=GitJobResponse,
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Queue working tree status",
     description="Queue a working tree status check.",
 )
 async def git_changes(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
     request: GitOpRequest | None = None,
-) -> GitJobResponse:
+) -> PlatformJobAccepted:
     """Queue a working tree status check."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = (request.job_id if request and request.job_id else None) or str(uuid.uuid4())
-    job_id = await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_status",
+    return await _enqueue_git_operation(
+        db,
+        operation="status",
+        organization_id=ctx.org_id,
+        user=user,
+        job_id=request.job_id if request else None,
     )
-    return GitJobResponse(job_id=job_id)
 
 
 @router.post(
     "/resolve",
-    response_model=GitJobResponse,
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Queue conflict resolution",
     description="Queue conflict resolution after a failed pull.",
 )
 async def git_resolve(
     request: ResolveRequest,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
-) -> GitJobResponse:
+) -> PlatformJobAccepted:
     """Queue conflict resolution."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = request.job_id or str(uuid.uuid4())
-    job_id = await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_resolve",
-        resolutions=request.resolutions,
+    return await _enqueue_git_operation(
+        db,
+        operation="resolve",
+        organization_id=ctx.org_id,
+        user=user,
+        job_id=request.job_id,
+        options={"resolutions": request.resolutions},
     )
-    return GitJobResponse(job_id=job_id)
 
 
 @router.post(
     "/diff",
-    response_model=GitJobResponse,
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Queue file diff",
     description="Queue a file diff operation.",
 )
 async def git_diff(
     request: DiffRequest,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
-) -> GitJobResponse:
+) -> PlatformJobAccepted:
     """Queue a file diff."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = request.job_id or str(uuid.uuid4())
-    job_id = await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_diff",
-        path=request.path,
+    return await _enqueue_git_operation(
+        db,
+        operation="diff",
+        organization_id=ctx.org_id,
+        user=user,
+        job_id=request.job_id,
+        options={"path": request.path},
     )
-    return GitJobResponse(job_id=job_id)
 
 
 @router.post(
     "/discard",
-    response_model=GitJobResponse,
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Discard working tree changes",
     description="Discard uncommitted changes for specific files (git checkout -- <path>).",
 )
 async def git_discard(
     request: DiscardRequest,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     db: DbSession,
-) -> GitJobResponse:
+) -> PlatformJobAccepted:
     """Queue a discard operation."""
     config = await get_github_config(db, ctx.org_id)
     if not config or not config.token or not config.repo_url:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="GitHub not configured")
 
-    job_id = request.job_id or str(uuid.uuid4())
-    job_id = await publish_git_operation(
-        job_id=job_id,
-        org_id=str(ctx.org_id) if ctx.org_id else "",
-        user_id=str(user.user_id),
-        user_email=user.email,
-        op_type="git_discard",
-        paths=request.paths,
+    return await _enqueue_git_operation(
+        db,
+        operation="discard",
+        organization_id=ctx.org_id,
+        user=user,
+        job_id=request.job_id,
+        options={"paths": request.paths},
     )
-    return GitJobResponse(job_id=job_id)
-
-

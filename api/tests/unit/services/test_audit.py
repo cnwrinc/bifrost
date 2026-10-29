@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.services.audit import emit_audit
+from src.services.audit import (
+    emit_audit,
+    emit_file_policy_deny,
+    emit_table_policy_deny,
+)
 from src.services.audit_context import (
     ActorContext,
     clear_actor,
@@ -129,6 +133,39 @@ class TestEmitAudit:
         assert created["details"] == {"email": "new@example.com"}
 
     @pytest.mark.asyncio
+    async def test_writes_surface_from_actor(self, monkeypatch):
+        """emit_audit persists the actor's surface (R2a-2).
+
+        operation_id is resolved separately, from the request scope, at
+        emit time — see tests/unit/services/test_audit_operation_id.py.
+        """
+        created = {}
+
+        async def fake_create(**kwargs):
+            created.update(kwargs)
+            return MagicMock(id=uuid4())
+
+        mock_repo = MagicMock()
+        mock_repo.create = AsyncMock(side_effect=fake_create)
+        monkeypatch.setattr(
+            "src.services.audit.AuditLogRepository", lambda session: mock_repo
+        )
+
+        set_actor(
+            ActorContext(
+                user_id=uuid4(),
+                organization_id=uuid4(),
+                source="http",
+                surface="mcp",
+            )
+        )
+
+        await emit_audit(_session_mock(), "agents.list")
+
+        assert created["surface"] == "mcp"
+        assert created["operation_id"] is None
+
+    @pytest.mark.asyncio
     async def test_swallows_repository_errors(self, monkeypatch):
         """Audit failures must NOT propagate to the caller."""
         mock_repo = MagicMock()
@@ -180,3 +217,68 @@ class TestEmitAudit:
         )
 
         assert captured["user_id"] == bob_id
+
+
+@pytest.mark.asyncio
+async def test_file_policy_deny_uses_canonical_scope_payload(monkeypatch):
+    emitted = AsyncMock()
+    monkeypatch.setattr("src.services.audit.emit_audit", emitted)
+    solution_id = uuid4()
+    actor = ActorContext(user_id=uuid4(), organization_id=uuid4())
+    db = MagicMock()
+
+    await emit_file_policy_deny(
+        db,
+        policy_action="write",
+        location="reports",
+        path="quarterly/result.csv",
+        scope=str(solution_id),
+        solution_id=solution_id,
+        actor_override=actor,
+    )
+
+    emitted.assert_awaited_once_with(
+        db,
+        "policy.deny",
+        resource_type="file",
+        outcome="failure",
+        details={
+            "policy_action": "write",
+            "location": "reports",
+            "path": "quarterly/result.csv",
+            "scope": str(solution_id),
+            "solution_id": str(solution_id),
+        },
+        actor_override=actor,
+    )
+
+
+@pytest.mark.asyncio
+async def test_table_policy_deny_uses_canonical_table_payload(monkeypatch):
+    emitted = AsyncMock()
+    monkeypatch.setattr("src.services.audit.emit_audit", emitted)
+    table_id = uuid4()
+    actor = ActorContext(user_id=uuid4(), organization_id=uuid4())
+    db = MagicMock()
+
+    await emit_table_policy_deny(
+        db,
+        policy_action="subscribe",
+        table_id=table_id,
+        table_name="customers",
+        actor_override=actor,
+    )
+
+    emitted.assert_awaited_once_with(
+        db,
+        "policy.deny",
+        resource_type="table_document",
+        resource_id=None,
+        outcome="failure",
+        details={
+            "policy_action": "subscribe",
+            "table_id": str(table_id),
+            "table_name": "customers",
+        },
+        actor_override=actor,
+    )

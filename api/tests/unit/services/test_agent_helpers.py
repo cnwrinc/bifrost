@@ -18,7 +18,7 @@ class TestResolveAgentTools:
         """resolve_agent_tools returns tool definitions from agent config."""
         mock_get_system_tools.return_value = [
             {
-                "id": "execute_workflow",
+                "id": "bifrost_workflow_execute",
                 "description": "Execute a workflow",
                 "parameters": {"type": "object", "properties": {}},
             }
@@ -30,7 +30,7 @@ class TestResolveAgentTools:
         # stays focused on the system-tool tier without needing a real DB.
         mock_agent.organization_id = None
         mock_agent.tools = []
-        mock_agent.system_tools = ["execute_workflow"]
+        mock_agent.system_tools = ["bifrost_workflow_execute"]
         mock_agent.knowledge_sources = []
         mock_agent.delegated_agents = []
 
@@ -38,7 +38,7 @@ class TestResolveAgentTools:
         assert isinstance(tools, list)
         assert isinstance(id_map, dict)
         assert len(tools) == 1
-        assert tools[0].name == "execute_workflow"
+        assert tools[0].name == "bifrost_workflow_execute"
 
     @pytest.mark.asyncio
     @patch("src.services.mcp_server.server.get_system_tools")
@@ -151,6 +151,10 @@ class TestBuildAgentSystemPrompt:
         assert result == "Base prompt." + AUTONOMOUS_MODE_SUFFIX
         assert "conclusive" in result
         assert "Do NOT ask questions" in result
+        assert "exact callable name and input schema" in result
+        assert "supplied by the runtime or returned by discovery" in result
+        assert "Never guess a tool name, arguments, or schema" in result
+        assert "reasonable alternatives" not in result
 
     def test_chat_mode_returns_prompt_verbatim(self):
         """mode=chat returns prompt unchanged (no suffix)."""

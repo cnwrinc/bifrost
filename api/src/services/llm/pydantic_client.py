@@ -6,12 +6,18 @@ Pydantic AI without changing those callers while the higher-level chat loop is
 cut over separately.
 """
 
+import json
+from typing import Any, cast
 import logging
 from collections.abc import AsyncGenerator
+from uuid import uuid4
 
+from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.direct import model_request_stream
 from pydantic_ai.messages import (
     BinaryContent,
+    LoadCapabilityCallPart,
+    LoadCapabilityReturnPart,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -22,36 +28,93 @@ from pydantic_ai.messages import (
     TextPartDelta,
     ToolCallPart,
     ToolReturnPart,
+    ToolSearchArgs,
+    ToolSearchCallPart,
+    ToolSearchReturnContent,
+    ToolSearchReturnPart,
     UserPromptPart,
     UserContent,
 )
-from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import ToolDefinition as PydanticToolDefinition
 
 from src.services.agent_runtime.model_factory import (
     create_agent_model,
     provider_name_for_config,
+    reasoning_settings,
 )
-from src.services.agent_runtime.usage import provider_reported_cost
+from src.services.agent_runtime.model_failover import FailoverModel
+from src.services.agent_runtime.retry_transport import ai_retry_context
+from src.services.agent_runtime.usage import provider_reported_cost, reasoning_tokens
 from src.services.llm.base import (
     BaseLLMClient,
+    LLMConfig,
     LLMMessage,
     LLMResponse,
     LLMStreamChunk,
     ToolCallRequest,
     ToolDefinition,
+    request_max_tokens,
 )
+from src.services.opencode_go import is_opencode_go_endpoint, opencode_go_extra_headers
 
 logger = logging.getLogger(__name__)
+_TOOL_SEARCH_ARGS = TypeAdapter(ToolSearchArgs)
+_TOOL_SEARCH_RETURN = TypeAdapter(ToolSearchReturnContent)
 
 
 class PydanticAIClient(BaseLLMClient):
     """Provider-neutral implementation of Bifrost's existing LLM contract."""
 
+    def __init__(
+        self,
+        config: LLMConfig,
+        *,
+        fallback_configs: list[LLMConfig] | tuple[LLMConfig, ...] = (),
+        session_id: str | None = None,
+    ) -> None:
+        super().__init__(config)
+        self.fallback_configs: tuple[LLMConfig, ...] = tuple(fallback_configs)
+        # OpenCode Go keeps routing and prompt-cache affinity per session.
+        # Direct LLM calls have no conversation of their own, so this client
+        # instance is the unit of session stability.
+        self._session_id = session_id or f"bifrost-{uuid4()}"
+
     @property
     def provider_name(self) -> str:
         return provider_name_for_config(self.config)
+
+    def _candidate_models(self, resolved_model: str) -> list[Model]:
+        """Build the primary model plus one model per fallback config.
+
+        A per-call model override applies to the primary only: it names a
+        model on the primary's provider and may not exist elsewhere.
+        Fallbacks always use their own profile's configured model.
+        """
+        models = [create_agent_model(self.config, model=resolved_model)]
+        models.extend(
+            create_agent_model(fallback) for fallback in self.fallback_configs
+        )
+        return models
+
+    def _candidate_settings(self, max_tokens: int | None) -> list[ModelSettings | None]:
+        """Build per-candidate settings aligned with ``_candidate_models``."""
+        settings: list[ModelSettings | None] = [self._model_settings(max_tokens)]
+        settings.extend(
+            self._settings_for_config(fallback, None)
+            for fallback in self.fallback_configs
+        )
+        return settings
+
+    def _chain_or_single(self, resolved_model: str, max_tokens: int | None) -> Model:
+        """Return a lone model or a FailoverModel when fallbacks exist."""
+        models = self._candidate_models(resolved_model)
+        if len(models) == 1:
+            return models[0]
+        return FailoverModel(
+            models, candidate_settings=self._candidate_settings(max_tokens)
+        )
 
     async def complete(
         self,
@@ -66,17 +129,23 @@ class PydanticAIClient(BaseLLMClient):
         # response. Anthropic rejects high-output non-streaming requests that
         # could exceed ten minutes, so this preserves the legacy contract
         # without leaking provider-specific behavior into callers.
-        async with model_request_stream(
-            create_agent_model(self.config, model=model),
-            self.convert_messages(messages),
-            model_settings=self._model_settings(max_tokens),
-            model_request_parameters=self._request_parameters(
-                tools, require_tool_call=require_tool_call
-            ),
-        ) as stream:
-            async for _ in stream:
-                pass
-            response = stream.get()
+        resolved_model = model or self.config.model
+        with ai_retry_context(
+            provider=self.provider_name,
+            model=resolved_model,
+            surface="llm_client.complete",
+        ):
+            async with model_request_stream(
+                self._chain_or_single(resolved_model, max_tokens),
+                self.convert_messages(messages),
+                model_settings=self._model_settings(max_tokens),
+                model_request_parameters=self._request_parameters(
+                    tools, require_tool_call=require_tool_call
+                ),
+            ) as stream:
+                async for _ in stream:
+                    pass
+                response = stream.get()
         return self._convert_response(response)
 
     async def stream(
@@ -88,45 +157,78 @@ class PydanticAIClient(BaseLLMClient):
         model: str | None = None,
     ) -> AsyncGenerator[LLMStreamChunk, None]:
         try:
-            async with model_request_stream(
-                create_agent_model(self.config, model=model),
-                self.convert_messages(messages),
-                model_settings=self._model_settings(max_tokens),
-                model_request_parameters=self._request_parameters(tools),
-            ) as stream:
-                async for event in stream:
-                    if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
-                        if event.part.content:
-                            yield LLMStreamChunk(type="delta", content=event.part.content)
-                    elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-                        if event.delta.content_delta:
-                            yield LLMStreamChunk(type="delta", content=event.delta.content_delta)
+            resolved_model = model or self.config.model
+            with ai_retry_context(
+                provider=self.provider_name,
+                model=resolved_model,
+                surface="llm_client.stream",
+            ):
+                async with model_request_stream(
+                    self._chain_or_single(resolved_model, max_tokens),
+                    self.convert_messages(messages),
+                    model_settings=self._model_settings(max_tokens),
+                    model_request_parameters=self._request_parameters(tools),
+                ) as stream:
+                    async for event in stream:
+                        if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+                            if event.part.content:
+                                yield LLMStreamChunk(type="delta", content=event.part.content)
+                        elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                            if event.delta.content_delta:
+                                yield LLMStreamChunk(type="delta", content=event.delta.content_delta)
 
-                response = stream.get()
-                for tool_call in response.tool_calls:
+                    response = stream.get()
+                    for tool_call in response.tool_calls:
+                        yield LLMStreamChunk(
+                            type="tool_call",
+                            tool_call=ToolCallRequest(
+                                id=tool_call.tool_call_id,
+                                name=tool_call.tool_name,
+                                arguments=tool_call.args_as_dict(),
+                            ),
+                        )
                     yield LLMStreamChunk(
-                        type="tool_call",
-                        tool_call=ToolCallRequest(
-                            id=tool_call.tool_call_id,
-                            name=tool_call.tool_name,
-                            arguments=tool_call.args_as_dict(),
-                        ),
+                        type="done",
+                        finish_reason=response.finish_reason,
+                        input_tokens=response.usage.input_tokens,
+                        output_tokens=response.usage.output_tokens,
+                        cache_read_tokens=response.usage.cache_read_tokens,
+                        cache_write_tokens=response.usage.cache_write_tokens,
+                        reasoning_tokens=reasoning_tokens(response.usage),
+                        provider_cost=provider_reported_cost(response),
                     )
-                yield LLMStreamChunk(
-                    type="done",
-                    finish_reason=response.finish_reason,
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    cache_read_tokens=response.usage.cache_read_tokens,
-                    cache_write_tokens=response.usage.cache_write_tokens,
-                    provider_cost=provider_reported_cost(response),
-                )
         except Exception as exc:
             logger.error("Pydantic AI streaming error: %s", exc)
             yield LLMStreamChunk(type="error", error=str(exc))
 
     def _model_settings(self, max_tokens: int | None) -> ModelSettings:
-        return ModelSettings(max_tokens=max_tokens or self.config.max_tokens)
+        return self._settings_for_config(self.config, max_tokens)
+
+    def _settings_for_config(
+        self, config: LLMConfig, max_tokens: int | None
+    ) -> ModelSettings:
+        resolved_max_tokens = request_max_tokens(config, max_tokens)
+        settings: dict[str, Any] = {}
+        if resolved_max_tokens is not None:
+            settings["max_tokens"] = resolved_max_tokens
+        if is_opencode_go_endpoint(config.endpoint):
+            settings["extra_headers"] = opencode_go_extra_headers(self._session_id)
+        if (
+            config.provider == "openai"
+            and provider_name_for_config(config) not in ("openrouter", "opencode_go")
+        ):
+            settings["openai_store"] = False
+        elif config.provider == "anthropic":
+            # Prompt caching for ai.complete/ai.stream as well; see model_factory.
+            from src.services.agent_runtime.model_factory import anthropic_prompt_cache_settings
+
+            settings.update(
+                anthropic_prompt_cache_settings(
+                    config.anthropic_prompt_cache_supported
+                )
+            )
+        settings.update(reasoning_settings(config, max_tokens=resolved_max_tokens))
+        return cast(ModelSettings, settings)
 
     @staticmethod
     def _request_parameters(
@@ -169,20 +271,37 @@ class PydanticAIClient(BaseLLMClient):
     @classmethod
     def convert_messages(cls, messages: list[LLMMessage]) -> list[ModelMessage]:
         """Convert Bifrost's stable message DTOs to provider-neutral history."""
+        capability_load_ids = cls._completed_capability_load_ids(messages)
+        tool_searches = cls._completed_tool_searches(messages)
         converted: list[ModelMessage] = []
         for message in messages:
             if message.role == "assistant":
                 parts = []
                 if message.content:
                     parts.append(TextPart(message.content))
-                parts.extend(
-                    ToolCallPart(
-                        tool_name=call.name,
-                        args=call.arguments,
-                        tool_call_id=call.id,
-                    )
-                    for call in message.tool_calls or []
-                )
+                for call in message.tool_calls or []:
+                    if call.id in capability_load_ids:
+                        parts.append(
+                            LoadCapabilityCallPart(
+                                tool_call_id=call.id,
+                                args=cast(dict[str, str], call.arguments),
+                            )
+                        )
+                    elif call.id in tool_searches:
+                        parts.append(
+                            ToolSearchCallPart(
+                                tool_call_id=call.id,
+                                args=tool_searches[call.id][0],
+                            )
+                        )
+                    else:
+                        parts.append(
+                            ToolCallPart(
+                                tool_name=call.name,
+                                args=call.arguments,
+                                tool_call_id=call.id,
+                            )
+                        )
                 if parts:
                     converted.append(ModelResponse(parts=parts))
                 continue
@@ -190,11 +309,22 @@ class PydanticAIClient(BaseLLMClient):
             if message.role == "system":
                 request_parts = [SystemPromptPart(message.content or "")]
             elif message.role == "tool":
-                tool_return = ToolReturnPart(
-                    tool_name=message.tool_name or "tool",
-                    content=message.content or "",
-                    tool_call_id=message.tool_call_id or "unknown-tool-call",
-                )
+                if message.tool_call_id in capability_load_ids:
+                    tool_return = LoadCapabilityReturnPart(
+                        content=cls._capability_load_return_content(message.content),
+                        tool_call_id=message.tool_call_id,
+                    )
+                elif message.tool_call_id in tool_searches:
+                    tool_return = ToolSearchReturnPart(
+                        content=tool_searches[message.tool_call_id][1],
+                        tool_call_id=message.tool_call_id,
+                    )
+                else:
+                    tool_return = ToolReturnPart(
+                        tool_name=message.tool_name or "tool",
+                        content=message.content or "",
+                        tool_call_id=message.tool_call_id or "unknown-tool-call",
+                    )
                 if (
                     converted
                     and isinstance(converted[-1], ModelRequest)
@@ -208,6 +338,94 @@ class PydanticAIClient(BaseLLMClient):
                 request_parts = [UserPromptPart(cls.convert_user_content(message))]
             converted.append(ModelRequest(parts=request_parts))
         return converted
+
+    @staticmethod
+    def _completed_tool_searches(
+        messages: list[LLMMessage],
+    ) -> dict[str, tuple[ToolSearchArgs, ToolSearchReturnContent]]:
+        """Restore native discovery state from completed portable chat receipts.
+
+        Pydantic AI owns search and availability reconstruction. This adapter
+        restores its public typed parts after storage in the existing DTOs;
+        namesake calls and malformed or failed receipts remain generic.
+        """
+        candidates: dict[str, ToolSearchArgs] = {}
+        completed: dict[str, tuple[ToolSearchArgs, ToolSearchReturnContent]] = {}
+        for message in messages:
+            if message.role == "assistant":
+                for call in message.tool_calls or []:
+                    if call.name != "search_tools" or set(call.arguments) != {"queries"}:
+                        continue
+                    try:
+                        args = _TOOL_SEARCH_ARGS.validate_python(call.arguments, strict=True)
+                    except ValidationError:
+                        continue
+                    if args["queries"] and all(query.strip() for query in args["queries"]):
+                        candidates[call.id] = args
+            elif (
+                message.role == "tool"
+                and message.tool_name == "search_tools"
+                and message.tool_call_id in candidates
+            ):
+                try:
+                    decoded = json.loads(message.content or "")
+                    if not isinstance(decoded, dict) or not set(decoded).issubset(
+                        {"discovered_tools", "message"}
+                    ):
+                        continue
+                    receipt = _TOOL_SEARCH_RETURN.validate_python(decoded, strict=True)
+                except (json.JSONDecodeError, ValidationError):
+                    continue
+                completed[message.tool_call_id] = (candidates[message.tool_call_id], receipt)
+        return completed
+
+    @staticmethod
+    def _completed_capability_load_ids(messages: list[LLMMessage]) -> set[str]:
+        """Find durable receipts for Pydantic AI's reserved capability loader.
+
+        Chat history intentionally stores Bifrost's provider-neutral tool call
+        shape, rather than Pydantic AI's transient availability-delta parts.
+        Recreate its typed load parts only where the persisted request and
+        receipt exactly match the reserved framework contract. Namesake calls
+        without that receipt retain their generic part type.
+        """
+        candidate_ids: set[str] = set()
+        completed_ids: set[str] = set()
+        for message in messages:
+            if message.role == "assistant":
+                for call in message.tool_calls or []:
+                    if (
+                        call.name == "load_capability"
+                        and isinstance(call.arguments.get("id"), str)
+                        and set(call.arguments) == {"id"}
+                    ):
+                        candidate_ids.add(call.id)
+            elif (
+                message.role == "tool"
+                and message.tool_name == "load_capability"
+                and message.tool_call_id in candidate_ids
+                and PydanticAIClient._is_capability_load_return(message.content)
+            ):
+                completed_ids.add(message.tool_call_id)
+        return completed_ids
+
+    @staticmethod
+    def _is_capability_load_return(content: str | None) -> bool:
+        try:
+            decoded = json.loads(content or "")
+        except json.JSONDecodeError:
+            return False
+        return (
+            isinstance(decoded, dict)
+            and set(decoded).issubset({"instructions"})
+            and ("instructions" not in decoded or isinstance(decoded["instructions"], str))
+        )
+
+    @staticmethod
+    def _capability_load_return_content(content: str | None) -> dict[str, str]:
+        """Decode a receipt already validated by ``_is_capability_load_return``."""
+        decoded = json.loads(content or "")
+        return cast(dict[str, str], decoded)
 
     @staticmethod
     def _convert_response(response: ModelResponse) -> LLMResponse:
@@ -227,6 +445,7 @@ class PydanticAIClient(BaseLLMClient):
             output_tokens=response.usage.output_tokens,
             cache_read_tokens=response.usage.cache_read_tokens,
             cache_write_tokens=response.usage.cache_write_tokens,
+            reasoning_tokens=reasoning_tokens(response.usage),
             provider_cost=provider_reported_cost(response),
             model=response.model_name,
         )

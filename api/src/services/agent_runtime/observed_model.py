@@ -5,7 +5,7 @@ import math
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import pydantic_core
@@ -24,6 +24,8 @@ from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
 
+from src.services.agent_runtime.retry_transport import ai_retry_context
+
 
 @dataclass(frozen=True)
 class ModelCallEvent:
@@ -36,6 +38,9 @@ class ModelCallEvent:
     response: ModelResponse | None = None
     error: str | None = None
     context_breakdown: dict[str, int | str] | None = None
+    # Provider this candidate bills under (see provider_name_for_config).
+    billing_provider: str | None = None
+    request_model: str | None = None
 
 
 ModelCallObserver = Callable[[ModelCallEvent], Awaitable[None]]
@@ -44,9 +49,18 @@ ModelCallObserver = Callable[[ModelCallEvent], Awaitable[None]]
 class ObservedModel(WrapperModel):
     """Report every provider request while leaving Pydantic AI in control of the loop."""
 
-    def __init__(self, wrapped: Model, observer: ModelCallObserver):
+    def __init__(
+        self,
+        wrapped: Model,
+        observer: ModelCallObserver,
+        *,
+        retry_surface: str = "agent",
+        billing_provider: str | None = None,
+    ):
         super().__init__(wrapped)
         self._observer = observer
+        self._retry_surface = retry_surface
+        self._billing_provider = billing_provider
 
     @staticmethod
     def _estimated_input_tokens(
@@ -70,12 +84,57 @@ class ObservedModel(WrapperModel):
         return max(1, content_tokens + (messages_count * 8) + (tools_count * 16))
 
     @staticmethod
+    def _provider_facing_messages(
+        messages: list[ModelMessage],
+    ) -> list[ModelMessage]:
+        """Copy messages without Bifrost-only nested-dispatch receipts.
+
+        ``ToolReturnPart.metadata`` remains on the original history for audit
+        and progress handling, but Pydantic AI does not send it as provider
+        context. Measurements and preflight estimates must use the same
+        provider-facing shape.
+        """
+        provider_messages: list[ModelMessage] = []
+        for message in messages:
+            if not isinstance(message, ModelRequest):
+                provider_messages.append(message)
+                continue
+            parts = [
+                replace(part, metadata=None)
+                if isinstance(part, ToolReturnPart) and part.metadata is not None
+                else part
+                for part in message.parts
+            ]
+            provider_messages.append(
+                replace(message, parts=parts)
+                if any(original is not copied for original, copied in zip(message.parts, parts))
+                else message
+            )
+        return provider_messages
+
+    @staticmethod
     def _context_breakdown(
         messages: list[ModelMessage],
         model_request_parameters: ModelRequestParameters,
     ) -> dict[str, int | str]:
-        """Measure request composition without recording prompt contents."""
+        """Measure request composition without recording prompt contents.
 
+        Byte fields measure provider-facing serialized or UTF-8 context, not
+        provider token attribution. Application-only ``ToolReturnPart``
+        metadata is excluded while the original messages retain it for audit.
+        ``estimated_input_tokens`` remains the
+        existing conservative whole-request budget estimate; instruction bytes
+        are deliberately not added to it because provider instruction handling
+        can already include them in serialized message history.
+
+        ``tool_schema_bytes`` retains its compatibility meaning: all framework
+        function-tool definitions. Active/deferred counts follow framework
+        visibility and history reveals: ``defer_loading`` stays set after a
+        capability loads. These are not an exact provider wire representation,
+        cache key, or billed-token split.
+        """
+
+        provider_messages = ObservedModel._provider_facing_messages(messages)
         categories = {
             "system_prompt_bytes": 0,
             "user_history_bytes": 0,
@@ -85,13 +144,13 @@ class ObservedModel(WrapperModel):
             "other_history_bytes": 0,
         }
         last_user_part: tuple[int, int] | None = None
-        for message_index, message in enumerate(messages):
+        for message_index, message in enumerate(provider_messages):
             if isinstance(message, ModelRequest):
                 for part_index, part in enumerate(message.parts):
                     if isinstance(part, UserPromptPart):
                         last_user_part = (message_index, part_index)
 
-        for message_index, message in enumerate(messages):
+        for message_index, message in enumerate(provider_messages):
             if isinstance(message, ModelResponse):
                 categories["assistant_history_bytes"] += len(
                     pydantic_core.to_json(message, fallback=str)
@@ -118,19 +177,47 @@ class ObservedModel(WrapperModel):
                 else:
                     categories["other_history_bytes"] += size
 
+        instructions = Model._get_instruction_parts(
+            provider_messages, model_request_parameters
+        ) or []
+        instruction_bytes = sum(len(part.content.encode()) for part in instructions)
+        active_tools = []
+        deferred_tools = []
+        for tool in model_request_parameters.function_tools:
+            visibility = model_request_parameters.visibility_of(tool.name)
+            revealed = (
+                model_request_parameters.tool_visibility is None
+                and tool.name in model_request_parameters.revealed_tool_names
+            )
+            if visibility in {"visible", "via_history"} or revealed:
+                active_tools.append(tool)
+            else:
+                deferred_tools.append(tool)
         tool_schema = pydantic_core.to_json(
             model_request_parameters.function_tools,
             fallback=str,
         )
-        serialized_messages = ModelMessagesTypeAdapter.dump_json(messages)
+        active_tool_schema = pydantic_core.to_json(active_tools, fallback=str)
+        deferred_tool_schema = pydantic_core.to_json(deferred_tools, fallback=str)
+        serialized_messages = ModelMessagesTypeAdapter.dump_json(provider_messages)
         result: dict[str, int | str] = {
             **categories,
+            "instruction_bytes": instruction_bytes,
             "tool_schema_bytes": len(tool_schema),
+            "active_tools_count": len(active_tools),
+            "deferred_tools_count": len(deferred_tools),
+            "active_tool_schema_bytes": len(active_tool_schema) if active_tools else 0,
+            "deferred_tool_schema_bytes": len(deferred_tool_schema) if deferred_tools else 0,
             "messages_serialized_bytes": len(serialized_messages),
             "tool_schema_sha256": hashlib.sha256(tool_schema).hexdigest(),
         }
+        # This is an estimated diagnostic prefix, never an asserted provider
+        # cache key or billed-token amount. Deferred schemas remain separately
+        # observable above without being represented as active prompt bytes.
         result["provider_cache_prefix_bytes"] = (
-            categories["system_prompt_bytes"] + len(tool_schema)
+            categories["system_prompt_bytes"]
+            + instruction_bytes
+            + (len(active_tool_schema) if active_tools else 0)
         )
         result["replayed_history_bytes"] = sum(
             categories[key]
@@ -143,9 +230,12 @@ class ObservedModel(WrapperModel):
         )
         result["estimated_input_tokens"] = ObservedModel._estimated_input_tokens(
             messages_serialized_bytes=len(serialized_messages),
-            tool_schema_bytes=len(tool_schema),
+            # Withheld schemas are discovery inventory, not active context.
+            # Already-revealed schemas may also be represented in history;
+            # counting both remains deliberately conservative.
+            tool_schema_bytes=len(active_tool_schema) if active_tools else 0,
             messages_count=len(messages),
-            tools_count=len(model_request_parameters.function_tools),
+            tools_count=len(active_tools),
         )
         return result
 
@@ -183,15 +273,22 @@ class ObservedModel(WrapperModel):
                 messages_count=len(messages),
                 tools_count=tools_count,
                 context_breakdown=context_breakdown,
+                billing_provider=self._billing_provider,
+                request_model=self.wrapped.model_name,
             )
         )
         started = time.monotonic()
         try:
-            response = await self.wrapped.request(
-                messages,
-                model_settings,
-                model_request_parameters,
-            )
+            with ai_retry_context(
+                provider=self.wrapped.system,
+                model=self.wrapped.model_name,
+                surface=self._retry_surface,
+            ):
+                response = await self.wrapped.request(
+                    messages,
+                    model_settings,
+                    model_request_parameters,
+                )
         except Exception as exc:
             await self._observer(
                 ModelCallEvent(
@@ -201,6 +298,8 @@ class ObservedModel(WrapperModel):
                     duration_ms=int((time.monotonic() - started) * 1_000),
                     error=str(exc),
                     context_breakdown=context_breakdown,
+                    billing_provider=self._billing_provider,
+                    request_model=self.wrapped.model_name,
                 )
             )
             raise
@@ -213,6 +312,8 @@ class ObservedModel(WrapperModel):
                 duration_ms=int((time.monotonic() - started) * 1_000),
                 response=response,
                 context_breakdown=context_breakdown,
+                billing_provider=self._billing_provider,
+                request_model=self.wrapped.model_name,
             )
         )
         return response
@@ -235,23 +336,30 @@ class ObservedModel(WrapperModel):
                 messages_count=len(messages),
                 tools_count=tools_count,
                 context_breakdown=context_breakdown,
+                billing_provider=self._billing_provider,
+                request_model=self.wrapped.model_name,
             )
         )
         started = time.monotonic()
         try:
-            async with self.wrapped.request_stream(
-                messages,
-                model_settings,
-                model_request_parameters,
-                run_context,
-            ) as response_stream:
-                yield response_stream
-                # Agent graphs can stop consuming after a final-result event,
-                # before OpenAI-compatible providers send their trailing
-                # usage-only chunk. Resume the same iterator so actual usage
-                # and cost are captured before persistence.
-                async for _ in response_stream:
-                    pass
+            with ai_retry_context(
+                provider=self.wrapped.system,
+                model=self.wrapped.model_name,
+                surface=self._retry_surface,
+            ):
+                async with self.wrapped.request_stream(
+                    messages,
+                    model_settings,
+                    model_request_parameters,
+                    run_context,
+                ) as response_stream:
+                    yield response_stream
+                    # Agent graphs can stop consuming after a final-result event,
+                    # before OpenAI-compatible providers send their trailing
+                    # usage-only chunk. Resume the same iterator so actual usage
+                    # and cost are captured before persistence.
+                    async for _ in response_stream:
+                        pass
             response = response_stream.get()
         except Exception as exc:
             await self._observer(
@@ -262,6 +370,8 @@ class ObservedModel(WrapperModel):
                     duration_ms=int((time.monotonic() - started) * 1_000),
                     error=str(exc),
                     context_breakdown=context_breakdown,
+                    billing_provider=self._billing_provider,
+                    request_model=self.wrapped.model_name,
                 )
             )
             raise
@@ -274,5 +384,7 @@ class ObservedModel(WrapperModel):
                 duration_ms=int((time.monotonic() - started) * 1_000),
                 response=response,
                 context_breakdown=context_breakdown,
+                billing_provider=self._billing_provider,
+                request_model=self.wrapped.model_name,
             )
         )

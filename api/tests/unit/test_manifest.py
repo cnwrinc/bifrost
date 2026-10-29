@@ -14,7 +14,7 @@ def sample_manifest():
     form_id = str(uuid4())
     return {
         "organizations": [{"id": org_id, "name": "TestOrg"}],
-        "roles": [{"id": role_id, "name": "admin", "organization_id": org_id}],
+        "roles": [{"id": role_id, "name": "admin"}],
         "workflows": {
             wf_id: {
                 "id": wf_id,
@@ -41,8 +41,6 @@ def sample_manifest():
         },
         "agents": {},
         "apps": {},
-        "_wf_id": wf_id,
-        "_form_id": form_id,
     }
 
 
@@ -52,7 +50,7 @@ def test_parse_manifest_from_yaml(sample_manifest):
 
     yaml_str = yaml.dump(sample_manifest, default_flow_style=False)
     manifest = parse_manifest(yaml_str)
-    wf_id = sample_manifest["_wf_id"]
+    wf_id = next(iter(sample_manifest["workflows"]))
     assert wf_id in manifest.workflows
     assert manifest.workflows[wf_id].name == "my_workflow"
     assert manifest.workflows[wf_id].path == "workflows/my_workflow.py"
@@ -70,7 +68,7 @@ def test_serialize_manifest(sample_manifest):
     # Should be valid YAML
     reparsed = yaml.safe_load(output)
     assert "workflows" in reparsed
-    wf_id = sample_manifest["_wf_id"]
+    wf_id = next(iter(sample_manifest["workflows"]))
     assert wf_id in reparsed["workflows"]
 
 
@@ -131,7 +129,7 @@ def test_validate_manifest_missing_org(sample_manifest):
     """Detect reference to non-existent organization."""
     from bifrost.manifest import parse_manifest, validate_manifest
 
-    wf_id = sample_manifest["_wf_id"]
+    wf_id = next(iter(sample_manifest["workflows"]))
     sample_manifest["workflows"][wf_id]["organization_id"] = str(uuid4())
     yaml_str = yaml.dump(sample_manifest, default_flow_style=False)
     manifest = parse_manifest(yaml_str)
@@ -322,7 +320,7 @@ def test_validate_manifest_missing_role(sample_manifest):
     """Detect reference to non-existent role."""
     from bifrost.manifest import parse_manifest, validate_manifest
 
-    wf_id = sample_manifest["_wf_id"]
+    wf_id = next(iter(sample_manifest["workflows"]))
     sample_manifest["workflows"][wf_id]["roles"] = [str(uuid4())]
     yaml_str = yaml.dump(sample_manifest, default_flow_style=False)
     manifest = parse_manifest(yaml_str)
@@ -405,7 +403,7 @@ class TestSerializeManifestDir:
         # Verify YAML content is correct
         wf_data = yaml.safe_load(files["workflows.yaml"])
         assert "workflows" in wf_data
-        wf_id = sample_manifest["_wf_id"]
+        wf_id = next(iter(sample_manifest["workflows"]))
         assert wf_id in wf_data["workflows"]
 
         org_data = yaml.safe_load(files["organizations.yaml"])
@@ -1202,6 +1200,40 @@ class TestEventManifest:
         assert len(evt_rest.subscriptions) == len(evt_orig.subscriptions)
         assert evt_rest.subscriptions[0].workflow_id == evt_orig.subscriptions[0].workflow_id
 
+    def test_webhook_config_never_carries_the_signing_secret(self):
+        """A manifest written before the secret moved out of config still
+        parses, and neither import nor export carries the secret."""
+        from types import SimpleNamespace
+
+        from bifrost.manifest import ManifestEventSource, parse_manifest, serialize_manifest
+
+        es_id = str(uuid4())
+        legacy = parse_manifest(yaml.dump({
+            "events": {
+                es_id: {
+                    "id": es_id,
+                    "name": "Signed hook",
+                    "source_type": "webhook",
+                    "adapter_name": "generic",
+                    "webhook_config": {"secret": "LEGACY-PLAINTEXT", "signature_header": "X-Sig"},
+                },
+            },
+        }))
+        assert legacy.events[es_id].webhook_config == {"signature_header": "X-Sig"}
+        assert "LEGACY-PLAINTEXT" not in serialize_manifest(legacy)
+
+        row = SimpleNamespace(
+            id=es_id, name="Signed hook", source_type="webhook", event_type=None,
+            organization_id=None, is_active=True,
+        )
+        webhook = SimpleNamespace(
+            adapter_name="generic", integration_id=None,
+            config={"secret": "ROW-PLAINTEXT", "signature_header": "X-Sig"},
+            rate_limit_per_minute=60, rate_limit_window_seconds=60, rate_limit_enabled=True,
+        )
+        exported = ManifestEventSource.from_row(row, webhook=webhook)
+        assert exported.webhook_config == {"signature_header": "X-Sig"}
+
     def test_event_split_file(self, full_manifest_data):
         """Events serialize to events.yaml in split format."""
         from bifrost.manifest import parse_manifest, serialize_manifest_dir, parse_manifest_dir
@@ -1391,6 +1423,8 @@ class TestConfigDictKeyCollision:
                     integration_id=integ_id,
                     key="api_url",
                     config_type="string",
+                    required=True,
+                    position=2,
                     organization_id=org_id_1,
                     value="https://org1.example.com",
                 ),
@@ -1411,6 +1445,7 @@ class TestConfigDictKeyCollision:
         assert config_id_1 in restored.configs
         assert config_id_2 in restored.configs
         assert restored.configs[config_id_1].value == "https://org1.example.com"
+        assert (restored.configs[config_id_1].required, restored.configs[config_id_1].position) == (True, 2)
         assert restored.configs[config_id_2].value == "https://org2.example.com"
 
 
@@ -1541,6 +1576,11 @@ class TestManifestSchemaCoverage:
     INTEGRATION_IGNORED = {
         "id",            # manifest uses UUID dict key; id is a field inside
         "is_deleted",    # soft-delete flag, internal
+        "logo_data",     # uploaded UI chrome, not portable manifest content
+        "logo_content_type",
+        "logo_thumbnail_data",
+        "logo_thumbnail_content_type",
+        "logo_thumbnail_version",
         "created_at",
         "updated_at",
     }
@@ -2083,7 +2123,7 @@ class TestInlineAgentContent:
             delegated_agent_ids=[delegate_id],
             knowledge_sources=["faq", "runbooks"],
             system_tools=["execute_workflow", "search_knowledge"],
-            llm_model="claude-sonnet-4",
+            llm_profile="Fast Chat",
             llm_max_tokens=8000,
             max_iterations=15,
             max_token_budget=120000,
@@ -2100,7 +2140,7 @@ class TestInlineAgentContent:
         assert rt.delegated_agent_ids == [delegate_id]
         assert rt.knowledge_sources == ["faq", "runbooks"]
         assert rt.system_tools == ["execute_workflow", "search_knowledge"]
-        assert rt.llm_model == "claude-sonnet-4"
+        assert rt.llm_profile == "Fast Chat"
         assert rt.llm_max_tokens == 8000
         assert rt.max_iterations == 15
         assert rt.max_token_budget == 120000
@@ -2570,6 +2610,66 @@ def test_manifest_workflow_carries_tool_description():
     assert wf2.tool_description is None
 
 
+def test_manifest_workflow_requested_permissions_round_trip():
+    from bifrost.manifest import ManifestWorkflow
+
+    data = {
+        "id": "55555555-5555-5555-5555-555555555555",
+        "path": "workflows/x.py",
+        "function_name": "x",
+        "requested_permissions": {
+            "mode": "restricted",
+            "grants": [{"permission": "tables.read"}],
+        },
+    }
+    dumped = ManifestWorkflow.model_validate(data).model_dump(mode="json")
+    assert dumped["requested_permissions"] == data["requested_permissions"]
+
+
+def test_manifest_workflow_rejects_obsolete_permission_placement():
+    from pydantic import ValidationError
+
+    from bifrost.manifest import ManifestWorkflow
+
+    with pytest.raises(ValidationError, match="boundary"):
+        ManifestWorkflow.model_validate(
+            {
+                "id": "55555555-5555-5555-5555-555555555555",
+                "path": "workflows/x.py",
+                "function_name": "x",
+                "requested_permissions": {
+                    "mode": "restricted",
+                    "grants": [{"permission": "tables.read", "boundary": "platform"}],
+                },
+            }
+        )
+
+
+def test_manifest_workflow_requested_permissions_absent_stays_absent():
+    from bifrost.manifest import ManifestWorkflow
+    from bifrost.manifest_codec import Destination
+
+    wf = ManifestWorkflow(id="66666666-6666-6666-6666-666666666666", path="p.py", function_name="f")
+    assert wf.requested_permissions is None
+    assert "requested_permissions" not in wf.view(Destination.INSTALL)
+
+
+def test_manifest_workflow_requested_permissions_is_not_an_orm_column():
+    from bifrost.manifest import ManifestWorkflow
+    from bifrost.manifest_codec import Destination
+
+    wf = ManifestWorkflow.model_validate(
+        {
+            "id": "77777777-7777-7777-7777-777777777777",
+            "path": "p.py",
+            "function_name": "f",
+            "requested_permissions": {"mode": "full"},
+        }
+    )
+    for dest in (Destination.GIT_SYNC, Destination.INSTALL):
+        assert "requested_permissions" not in wf.to_orm_values(dest).direct
+
+
 # =============================================================================
 # ManifestPolicyRule tests (Task 10)
 # =============================================================================
@@ -3025,3 +3125,19 @@ class TestSolutionFilePolicyBundleRoundTrip:
 
         (tmp_path / ".bifrost").mkdir(parents=True)
         assert _collect_file_policies(pathlib.Path(tmp_path)) == []
+
+
+def test_manifest_workflow_git_sync_view_ignores_requested_permissions():
+    from bifrost.manifest import ManifestWorkflow
+    from bifrost.manifest_codec import Destination
+
+    wf = ManifestWorkflow.model_validate(
+        {
+            "id": "88888888-8888-8888-8888-888888888888",
+            "path": "p.py",
+            "function_name": "f",
+            "requested_permissions": {"mode": "full"},
+        }
+    )
+    assert "requested_permissions" not in wf.view(Destination.GIT_SYNC)
+    assert wf.view(Destination.INSTALL)["requested_permissions"] == {"mode": "full", "grants": []}

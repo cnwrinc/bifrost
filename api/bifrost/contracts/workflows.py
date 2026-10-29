@@ -7,6 +7,7 @@ decorated Python function. Only the update surface needs flag generation.
 from __future__ import annotations
 
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -28,6 +29,7 @@ class WorkflowUpdateRequest(BaseModel):
     description: str | None = Field(default=None, max_length=2000)
     category: str | None = Field(default=None, max_length=100)
     timeout_seconds: int | None = Field(default=None, ge=0, le=86400)
+    memory_request_mib: int | None = Field(default=None, ge=1, le=262144)
     execution_mode: Literal["sync", "async"] | None = Field(default=None)
     time_saved: int | None = Field(default=None, ge=0)
     value: float | None = Field(default=None, ge=0.0)
@@ -38,3 +40,4 @@ class WorkflowUpdateRequest(BaseModel):
     allowed_methods: list[str] | None = Field(default=None)
     public_endpoint: bool | None = Field(default=None)
     disable_global_key: bool | None = Field(default=None)
+    run_identity_id: UUID | None = Field(default=None)

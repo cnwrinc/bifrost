@@ -18,8 +18,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 DESCRIPTOR_FILENAME = "bifrost.solution.yaml"
 
@@ -39,11 +38,14 @@ class SolutionDescriptor(BaseModel):
     loose org/global workflows, tables, and files. Config values, integrations,
     OAuth, and knowledge are shared instance resources without a Solution-owned
     value tier, so this flag does not govern them.
+
+    ``allow_inbound_access`` is the inbound counterpart: whether this install
+    may be targeted by a per-call ``solution=`` ref from outside itself.
     """
 
     # Ignore unknown/legacy keys (e.g. a pre-standard ``scope:``) so old
     # descriptors keep loading after scope was removed from the schema.
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     slug: str
     name: str
@@ -51,7 +53,12 @@ class SolutionDescriptor(BaseModel):
     # and free-form; PEP 440 ordering is only attempted by the server's
     # downgrade gate (unordered versions never block).
     version: str | None = None
-    global_repo_access: bool = False
+    # Canonical name; ``global_repo_access`` still accepted (deprecated).
+    allow_outbound_access: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("allow_outbound_access", "global_repo_access"),
+    )
+    allow_inbound_access: bool = True
     git_connected: bool = False
     git_repo_url: str | None = None
     # Subfolder of the connected repo holding this descriptor (omni-repo).
@@ -110,5 +117,11 @@ def load_descriptor(path: Path | str) -> SolutionDescriptor:
     resolved = os.path.realpath(os.path.join(root, DESCRIPTOR_FILENAME))
     if not resolved.startswith(root + os.sep) or not os.path.isfile(resolved):
         raise FileNotFoundError(f"No {DESCRIPTOR_FILENAME} at {Path(root) / DESCRIPTOR_FILENAME}")
-    data = yaml.safe_load(Path(resolved).read_text()) or {}
-    return SolutionDescriptor.model_validate(data)
+    from bifrost.definition_validation import read_yaml_mapping, validate_definition
+
+    data = read_yaml_mapping(Path(resolved).read_text(encoding="utf-8"), path=DESCRIPTOR_FILENAME)
+    # ``scope`` was removed from the portable descriptor. Old descriptors may
+    # carry any historic value, so retain its documented ignore behavior while
+    # rejecting every other unsupported fixed key.
+    data.pop("scope", None)
+    return validate_definition(SolutionDescriptor, data, path=DESCRIPTOR_FILENAME)

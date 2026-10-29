@@ -4,7 +4,7 @@ Use workflows for server-side logic, integrations, secrets, durable execution, f
 
 ## Authoring contract
 
-Import decorators and SDK modules from `bifrost`. Workflow inputs come from the function signature; do not add a `ctx` parameter.
+Import decorators and SDK modules from `bifrost`. Workflow inputs come from the function signature; do not add a `ctx` parameter. Who is calling (user, organization, admin flag) is on `context` (`from bifrost import context`) — never take identity as an input; see `best-practices/security.md`.
 
 ```python
 from bifrost import tables, workflow
@@ -32,8 +32,36 @@ Choose the decorator by consumer:
 | `@workflow` | General execution from apps, forms, events, other workflows, or the CLI |
 | `@tool` | A callable intentionally exposed to an AI agent; equivalent to a tool workflow |
 | `@data_provider` | Dynamic form or select options |
+| `@service` | Long-lived supervised work bridging an external system — full contract in `references/services.md` |
 
 An agent's `tool_ids` must reference `@tool` registrations, not plain workflows.
+
+## Decorator attributes
+
+`@workflow` accepts only identity and discovery metadata:
+
+| Attribute | Default | Use |
+|---|---|---|
+| `name` | Function name | Workflow name and source-level execution identity |
+| `description` | First docstring line | Human-readable workflow description |
+| `category` | `"General"` | Organization and filtering hint |
+| `tags` | `[]` | Filtering and search hints |
+| `is_tool` | `False` | Register as an AI tool; prefer `@tool` for new tools |
+
+Other keyword arguments are accepted only for backwards-compatible parsing:
+the runtime logs a warning and ignores them. Configure timeouts, execution
+mode, schedules, endpoints, access, ROI, retries, cache TTL, and tool-specific
+descriptions on the persisted workflow through the Bifrost UI or API.
+
+## Supervised services
+
+`@service` is covered in full in `references/services.md` (authoring
+contract, supervision SDK, lifecycle CLI, ownership, handoff checklist).
+The one rule that decides the decorator: if the work holds a connection,
+subscription, or listener indefinitely instead of returning a result, it is
+a service — register it with `bifrost workflows register` like a workflow
+(the platform detects `@service` and ensures the supervised definition)
+and manage it with `bifrost services ...`.
 
 ## Test-driven iteration
 

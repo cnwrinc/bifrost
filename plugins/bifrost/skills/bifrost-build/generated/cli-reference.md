@@ -54,7 +54,7 @@ Options:
   --system-tools TEXT             system_tools (repeat for multiple).
   --mcp-connection-ids TEXT       mcp_connection_ids (repeat for multiple;
                                   comma-split also accepted).
-  --llm-model TEXT                llm_model
+  --llm-profile-id TEXT           llm_profile_id (UUID).
   --llm-max-tokens INTEGER        llm_max_tokens
   --max-iterations INTEGER        max_iterations
   --max-token-budget INTEGER      max_token_budget
@@ -144,7 +144,7 @@ Options:
   --clear-roles / --no-clear-roles
                                   clear_roles (tri-state; omit to leave
                                   unchanged).
-  --llm-model TEXT                llm_model
+  --llm-profile-id TEXT           llm_profile_id (UUID).
   --llm-max-tokens INTEGER        llm_max_tokens
   --max-iterations INTEGER        max_iterations
   --max-token-budget INTEGER      max_token_budget
@@ -156,6 +156,107 @@ Options:
                                   --scope are synonyms.)
   --json                          Emit JSON instead of human-readable output.
   --help                          Show this message and exit.
+```
+
+## `app`
+
+```
+Usage: app [OPTIONS] COMMAND [ARGS]...
+
+  Create, bind, run, and deploy an App project.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  bind        Bind a cloned Vite project to an existing App.
+  create      Create a Vite project and its remote App record.
+  deploy      Build and atomically deploy the current App project.
+  migrate     Migrate a pulled v1 App directory into an independent V2...
+  start       Run the local Vite App against live Bifrost resources.
+  swap-slugs  Atomically exchange v1 and independent V2 App slugs during...
+```
+
+### `app bind`
+
+```
+Usage: app bind [OPTIONS] REF [PATH]
+
+  Bind a cloned Vite project to an existing App.
+
+Options:
+  --url TEXT  Bifrost instance URL.
+  --help      Show this message and exit.
+```
+
+### `app create`
+
+```
+Usage: app create [OPTIONS] [PATH]
+
+  Create a Vite project and its remote App record.
+
+Options:
+  --name TEXT  App display name (default: directory name).
+  --slug TEXT  URL slug (default: derived from name).
+  --org TEXT   Organization UUID or name.
+  --global     Create a globally visible App.
+  --url TEXT   Bifrost instance URL.
+  --help       Show this message and exit.
+```
+
+### `app deploy`
+
+```
+Usage: app deploy [OPTIONS] [PATH]
+
+  Build and atomically deploy the current App project.
+
+Options:
+  --help  Show this message and exit.
+```
+
+### `app migrate`
+
+```
+Usage: app migrate [OPTIONS] SOURCE PATH
+
+  Migrate a pulled v1 App directory into an independent V2 App project.
+
+Options:
+  --name TEXT  App display name (default: destination name).
+  --slug TEXT  Temporary V2 URL slug (default: derived from name).
+  --org TEXT   Organization UUID or name.
+  --global     Create a globally visible App.
+  --url TEXT   Bifrost instance URL.
+  --help       Show this message and exit.
+```
+
+### `app start`
+
+```
+Usage: app start [OPTIONS] [PATH]
+
+  Run the local Vite App against live Bifrost resources.
+
+Options:
+  --org TEXT         Run against another authorized organization.
+  --port INTEGER     [default: 3000]
+  --host TEXT        [default: 127.0.0.1]
+  --public-url TEXT
+  --help             Show this message and exit.
+```
+
+### `app swap-slugs`
+
+```
+Usage: app swap-slugs [OPTIONS] APP_A APP_B
+
+  Atomically exchange v1 and independent V2 App slugs during cutover.
+
+Options:
+  --url TEXT  Bifrost instance URL.
+  --help      Show this message and exit.
 ```
 
 ## `apps`
@@ -176,7 +277,9 @@ Commands:
   list      List all applications (wrapped ``{applications, total}``...
   publish   Rebuild and publish an application, polling durable progress.
   replace   Repoint an application's source directory.
+  sdk       Inspect or update deployed App SDK bundles.
   set-deps  Replace an application's npm dependencies.
+  source    Download retained deployed App source artifacts.
   update    Update application metadata (patch-without-draft).
 ```
 
@@ -299,6 +402,45 @@ Options:
   --help            Show this message and exit.
 ```
 
+### `apps sdk`
+
+```
+Usage: apps sdk [OPTIONS] COMMAND [ARGS]...
+
+  Inspect or update deployed App SDK bundles.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  status  Show SDK provenance/status for one deployed App, or all visible...
+  update  Queue deployed App SDK rebuild/update jobs and follow their...
+```
+
+#### `apps sdk status`
+
+```
+Usage: apps sdk status [OPTIONS] [REF]
+
+  Show SDK provenance/status for one deployed App, or all visible Apps.
+
+Options:
+  --help  Show this message and exit.
+```
+
+#### `apps sdk update`
+
+```
+Usage: apps sdk update [OPTIONS] [REF]
+
+  Queue deployed App SDK rebuild/update jobs and follow their progress.
+
+Options:
+  --all   Update every actionable visible App.
+  --help  Show this message and exit.
+```
+
 ### `apps set-deps`
 
 ```
@@ -315,6 +457,32 @@ Options:
                {name: version} file.  [required]
   --json       Emit JSON instead of human-readable output.
   --help       Show this message and exit.
+```
+
+### `apps source`
+
+```
+Usage: apps source [OPTIONS] COMMAND [ARGS]...
+
+  Download retained deployed App source artifacts.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  export  Write the retained deployed source zip for an independent App.
+```
+
+#### `apps source export`
+
+```
+Usage: apps source export [OPTIONS] REF DESTINATION
+
+  Write the retained deployed source zip for an independent App.
+
+Options:
+  --help  Show this message and exit.
 ```
 
 ### `apps update`
@@ -349,6 +517,69 @@ Options:
                        Mirrors `apps create --deps`.
   --json               Emit JSON instead of human-readable output.
   --help               Show this message and exit.
+```
+
+## `audit`
+
+```
+Usage: audit [OPTIONS] COMMAND [ARGS]...
+
+  Read the audit log and explain access decisions.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  explain  Explain a stored access check: how it was decided then, and...
+  list     List audit log entries, group them, or aggregate access checks...
+```
+
+### `audit explain`
+
+```
+Usage: audit explain [OPTIONS] EVENT_ID
+
+  Explain a stored access check: how it was decided then, and how it would be
+  now.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `audit list`
+
+```
+Usage: audit list [OPTIONS]
+
+  List audit log entries, group them, or aggregate access checks by time.
+
+Options:
+  --action TEXT                   Action prefix, e.g. 'user.' or
+                                  'access.check'.
+  --outcome [success|failure]     Only successes or failures.
+  --resource-type TEXT            Only events on this resource type.
+  --user TEXT                     Acting user: UUID, email, or identity name.
+  --execution TEXT                Workflow execution ID.
+  --workflow TEXT                 Only events naming this workflow: UUID,
+                                  name, or path::function.
+  --org TEXT                      Only events in this organization: UUID or
+                                  name, or 'global'.
+  --since TEXT                    Start of the time range (ISO 8601,
+                                  inclusive).
+  --until TEXT                    End of the time range (ISO 8601, inclusive).
+  --search TEXT                   Free-text search on actor, organization,
+                                  action, resource type, IP, and details.
+  --group-by [workflow|action|resource_type|outcome|user|organization]
+                                  Count matching events per value instead of
+                                  listing them.
+  --aggregate [1h|6h|24h]         Group exact access checks into fixed UTC
+                                  windows.
+  --limit INTEGER RANGE           Maximum entries to return (server default
+                                  50).  [1<=x<=500]
+  --json                          Emit JSON instead of human-readable output.
+  --help                          Show this message and exit.
 ```
 
 ## `claims`
@@ -537,9 +768,8 @@ Usage: configs get [OPTIONS] REF
 
   Get a single configuration value by UUID or key.
 
-  The server does not expose a per-record GET endpoint for configs, so this
-  resolves the ref via :class:`RefResolver` and locates the entry in the ``GET
-  /api/config`` list payload.
+  Resolves the ref via :class:`RefResolver`, then reads ``GET
+  /api/config/{uuid}`` directly.
 
 Options:
   --json  Emit JSON instead of human-readable output.
@@ -628,14 +858,50 @@ Options:
   --help  Show this message and exit.
 
 Commands:
+  create-graph-source  Create a Microsoft Graph webhook source with...
   create-source        Create a new event source.
+  delete-source        Delete an event source after its provider...
   get-source           Get a single event source by UUID or name.
   get-subscription     Get a single subscription by source ref +...
   list-sources         List all event sources (wrapped ``{items, total}``...
   list-subscriptions   List subscriptions for an event source.
+  resubscribe-source   Replace an event source's external provider...
+  rotate-secret        Generate a new signing secret for a webhook source.
   subscribe            Subscribe a workflow or agent to an event source.
   update-source        Update an event source.
   update-subscription  Update an event subscription.
+```
+
+### `events create-graph-source`
+
+```
+Usage: events create-graph-source [OPTIONS]
+
+  Create a Microsoft Graph webhook source with first-class flags.
+
+  ``--user-id`` is the Microsoft Graph object ID, not a Bifrost user ID. HOME
+  scopes the source to the caller organization; use ``--org`` to target
+  another organization. Microsoft Graph sources cannot be global.
+
+Options:
+  --name TEXT                     Event source name.  [required]
+  --integration TEXT              Microsoft integration UUID or name.
+                                  [required]
+  --user-id TEXT                  Microsoft Graph user object ID.  [required]
+  --resource [messages|events|mailFolders|contacts]
+                                  User resource collection to monitor.
+                                  [required]
+  --change-type [created|updated|deleted]
+                                  Graph change type. Repeat for multiple
+                                  values.  [default: created]
+  --global                        Target global scope (org=NULL). Alias for
+                                  --org global.
+  --org, --organization, --scope TEXT
+                                  Org UUID/name, or 'none'/'global' for global
+                                  scope. Omit = your org. (--organization /
+                                  --scope are synonyms.)
+  --json                          Emit JSON instead of human-readable output.
+  --help                          Show this message and exit.
 ```
 
 ### `events create-source`
@@ -685,6 +951,18 @@ Options:
   --help                          Show this message and exit.
 ```
 
+### `events delete-source`
+
+```
+Usage: events delete-source [OPTIONS] REF
+
+  Delete an event source after its provider subscription is removed.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
 ### `events get-source`
 
 ```
@@ -703,9 +981,6 @@ Options:
 Usage: events get-subscription [OPTIONS] SOURCE_REF SUBSCRIPTION_ID
 
   Get a single subscription by source ref + subscription UUID.
-
-  The server has no per-subscription GET endpoint, so this lists the source's
-  subscriptions and filters client-side.
 
 Options:
   --json  Emit JSON instead of human-readable output.
@@ -732,6 +1007,34 @@ Usage: events list-subscriptions [OPTIONS] SOURCE_REF
   List subscriptions for an event source.
 
   ``SOURCE_REF`` is a UUID or event source name.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `events resubscribe-source`
+
+```
+Usage: events resubscribe-source [OPTIONS] REF
+
+  Replace an event source's external provider subscription.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `events rotate-secret`
+
+```
+Usage: events rotate-secret [OPTIONS] REF
+
+  Generate a new signing secret for a webhook source.
+
+  The output's ``raw_secret`` is the only time the new secret is shown;
+  configure it in the sending service before it is lost. Requests signed with
+  the previous secret are rejected from now on.
 
 Options:
   --json  Emit JSON instead of human-readable output.
@@ -872,9 +1175,10 @@ Commands:
   delete    Delete a workspace file, optionally guarded by its current...
   exists    Check if a file exists.
   list      List files in a directory (default: location root).
+  move      Move one file within a location as a durable server-side job.
   policies  Manage file access policies.
   read      Read a workspace file and write its contents to stdout.
-  search    Search workspace file contents.
+  search    Search workspace and Solution source like grep, one page at a...
   stat      Show existence, version, size, and last-edit metadata without...
   write     Write to a workspace file.
 ```
@@ -928,6 +1232,32 @@ Options:
   --solution TEXT  Solution install slug or UUID. When given, targets that
                    install's file scope (location defaults to "solutions").
                    Slug resolved via GET /api/solutions.
+  --json           Emit JSON instead of human-readable output.
+  --help           Show this message and exit.
+```
+
+### `files move`
+
+```
+Usage: files move [OPTIONS] SOURCE DESTINATION
+
+  Move one file within a location as a durable server-side job.
+
+  The file is copied server-side, its metadata follows it, and the original is
+  deleted only after the copy is verified. Workspace files cannot be moved.
+  Prints the final path.
+
+Options:
+  --location TEXT  Storage location. Special: "workspace" (default), "temp",
+                   "uploads". Custom names (e.g. "reports") are accepted;
+                   "_repo", "_tmp", and "_apps" are blocked.  [required]
+  --solution TEXT  Solution install slug or UUID. When given, targets that
+                   install's file scope (location defaults to "solutions").
+                   Slug resolved via GET /api/solutions.
+  --rename         If the destination exists, use the next free 'name (n).ext'
+                   instead of failing.
+  --timeout FLOAT  Seconds to follow the move job; the job keeps running after
+                   the CLI stops waiting.  [default: 14400]
   --json           Emit JSON instead of human-readable output.
   --help           Show this message and exit.
 ```
@@ -1037,17 +1367,32 @@ Options:
 ```
 Usage: files search [OPTIONS] QUERY
 
-  Search workspace file contents.
+  Search workspace and Solution source like grep, one page at a time.
+
+  Examples:
+    bifrost files search get_client --include '*.py'
+    bifrost files search 'def .*_sync' --regex --files
+    bifrost files search halo --solution covi-psa
 
 Options:
-  --regex                      Treat query as a regex.
+  --regex                         Treat query as a Python regex.
   --case-sensitive
-  --include TEXT               Glob restricting which files to search
-                               (default: "**/*").
-  --max-results INTEGER RANGE  Maximum results to return (default: 1000, max:
-                               10000).  [1<=x<=10000]
-  --json                       Emit JSON instead of human-readable output.
-  --help                       Show this message and exit.
+  --include TEXT                  ripgrep-style glob over paths, e.g. '*.py',
+                                  'workflows/**', '*.{ts,tsx}'.
+  --source [all|workspace|solutions]
+                                  Search workspace source, Solution source, or
+                                  both.  [default: all]
+  --solution TEXT                 Restrict to one Solution install's deployed
+                                  source (slug or UUID). Unlike other files
+                                  verbs, this targets Solution source, not
+                                  runtime files.
+  --files                         List matching files instead of lines.
+  -C, --context INTEGER RANGE     [default: 1; 0<=x<=5]
+  --limit INTEGER RANGE           Results per page.  [default: 25; 1<=x<=200]
+  --cursor TEXT                   next_cursor from the previous page (printed
+                                  under 'More results').
+  --json                          Emit JSON instead of human-readable output.
+  --help                          Show this message and exit.
 ```
 
 ### `files stat`
@@ -1298,6 +1643,7 @@ Usage: integrations create [OPTIONS]
 
 Options:
   --name TEXT               name  [required]
+  --description TEXT        description
   --config-schema TEXT      config_schema (repeat for multiple).
   --entity-id TEXT          entity_id
   --entity-id-name TEXT     entity_id_name
@@ -1337,8 +1683,8 @@ Usage: integrations update [OPTIONS] REF
 
   Update an integration.
 
-  ``REF`` is a UUID or integration name. When ``--config-schema`` replaces the
-  existing schema with one that drops keys, the command refuses unless
+  ``REF`` is a UUID or integration name. When ``--config-schema`` drops keys
+  that have saved ``Config`` values, the server refuses with 409 unless
   ``--force-remove-keys`` is passed — removed keys cascade-delete related
   ``Config`` rows (integration-level defaults and per-org overrides).
 
@@ -1348,6 +1694,7 @@ Options:
                                   integration (cascade-deletes related
                                   configs).
   --name TEXT                     name
+  --description TEXT              description
   --list-entities-data-provider TEXT
                                   workflow ref (UUID or name) for
                                   list_entities_data_provider_id.
@@ -1474,6 +1821,33 @@ Options:
   --help                        Show this message and exit.
 ```
 
+## `permissions`
+
+```
+Usage: permissions [OPTIONS] COMMAND [ARGS]...
+
+  Inspect the permission catalog.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  list  List checked permissions by area, with name, scope and enforcement.
+```
+
+### `permissions list`
+
+```
+Usage: permissions list [OPTIONS]
+
+  List checked permissions by area, with name, scope and enforcement.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
 ## `policy-rule`
 
 ```
@@ -1549,8 +1923,8 @@ Usage: policy-rule get [OPTIONS] {file|table} NAME
 
   Get a single policy rule by domain and name.
 
-  Uses the usages endpoint (which 404s when not found) to confirm the rule
-  exists, then fetches the full record from the list.
+  Reads ``GET /api/policy-rules/{domain}/{name}`` directly. Solution-managed
+  rules are readable (writes stay blocked).
 
 Options:
   --scope TEXT  Organization UUID for org-scoped rules.
@@ -1664,6 +2038,118 @@ Options:
   --help  Show this message and exit.
 ```
 
+## `retention`
+
+```
+Usage: retention [OPTIONS] COMMAND [ARGS]...
+
+  Show and change how long runs, events, and audit events are kept.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  preview  Show what a retention run would do now, without changing...
+  run      Run retention now: delete expired runs and events, or archive...
+  set      Change a retention window.
+  show     Show the retention windows, what the oldest data is, and the...
+```
+
+### `retention preview`
+
+```
+Usage: retention preview [OPTIONS] {runs|audit}
+
+  Show what a retention run would do now, without changing anything.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `retention run`
+
+```
+Usage: retention run [OPTIONS] {runs|audit}
+
+  Run retention now: delete expired runs and events, or archive aged audit
+  events.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `retention set`
+
+```
+Usage: retention set [OPTIONS] COMMAND [ARGS]...
+
+  Change a retention window.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  audit  Set the audit database window, the archive window, or both.
+  runs   Set how long finished runs and their events are kept.
+```
+
+#### `retention set audit`
+
+```
+Usage: retention set audit [OPTIONS]
+
+  Set the audit database window, the archive window, or both.
+
+  A window you leave out keeps its current value.
+
+  Examples:
+    bifrost retention set audit --database 60
+    bifrost retention set audit --archive forever
+
+Options:
+  --database INTEGER      Days audit events stay in the database before they
+                          are archived.
+  --archive DAYS|FOREVER  Days archived audit events are kept before deletion,
+                          or 'forever'.
+  --json                  Emit JSON instead of human-readable output.
+  --help                  Show this message and exit.
+```
+
+#### `retention set runs`
+
+```
+Usage: retention set runs [OPTIONS]
+
+  Set how long finished runs and their events are kept.
+
+  Examples:
+    bifrost retention set runs --days 60
+    bifrost retention set runs --forever
+
+Options:
+  --days INTEGER  Keep finished runs and events this many days (30 to 3650).
+  --forever       Keep finished runs and events forever.
+  --json          Emit JSON instead of human-readable output.
+  --help          Show this message and exit.
+```
+
+### `retention show`
+
+```
+Usage: retention show [OPTIONS]
+
+  Show the retention windows, what the oldest data is, and the last run of
+  each.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
 ## `roles`
 
 ```
@@ -1693,8 +2179,6 @@ Usage: roles create [OPTIONS]
 Options:
   --name TEXT         name  [required]
   --description TEXT  description
-  --permissions TEXT  permissions as JSON literal or @path to a YAML/JSON
-                      file.
   --json              Emit JSON instead of human-readable output.
   --help              Show this message and exit.
 ```
@@ -1750,10 +2234,192 @@ Usage: roles update [OPTIONS] REF
 Options:
   --name TEXT         name
   --description TEXT  description
-  --permissions TEXT  permissions as JSON literal or @path to a YAML/JSON
-                      file.
   --json              Emit JSON instead of human-readable output.
   --help              Show this message and exit.
+```
+
+## `services`
+
+```
+Usage: services [OPTIONS] COMMAND [ARGS]...
+
+  Manage supervised services.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  attempts  List attempt history newest-first for a service.
+  disable   Disable a service: stops the live attempt, blocks future claims.
+  enable    Enable a service (distinct from start: no desired-state change).
+  get       Get a single service by definition UUID or workflow name.
+  list      List service definitions (wrapped ``{items, total}`` payload).
+  logs      List trailing persisted logs for a service.
+  restart   Rolling restart: stays desired-running, stops the live...
+  start     Request running: clears suppression so the claim loop picks...
+  stop      Request stopped: durable desire is stored before termination.
+  update    Update a service's lifecycle policy.
+```
+
+### `services attempts`
+
+```
+Usage: services attempts [OPTIONS] REF
+
+  List attempt history newest-first for a service.
+
+  ``REF`` is a definition UUID or workflow name.
+
+Options:
+  --limit INTEGER   Max results (server default 100, max 1000).
+  --offset INTEGER  Skip results.
+  --json            Emit JSON instead of human-readable output.
+  --help            Show this message and exit.
+```
+
+### `services disable`
+
+```
+Usage: services disable [OPTIONS] REF
+
+  Disable a service: stops the live attempt, blocks future claims.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `services enable`
+
+```
+Usage: services enable [OPTIONS] REF
+
+  Enable a service (distinct from start: no desired-state change).
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `services get`
+
+```
+Usage: services get [OPTIONS] REF
+
+  Get a single service by definition UUID or workflow name.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `services list`
+
+```
+Usage: services list [OPTIONS]
+
+  List service definitions (wrapped ``{items, total}`` payload).
+
+Options:
+  --limit INTEGER   Max results (server default 100, max 1000).
+  --offset INTEGER  Skip results.
+  --json            Emit JSON instead of human-readable output.
+  --help            Show this message and exit.
+```
+
+### `services logs`
+
+```
+Usage: services logs [OPTIONS] REF
+
+  List trailing persisted logs for a service.
+
+  ``REF`` is a definition UUID or workflow name. Page through older lines by
+  passing the previous response's ``continuation_token`` back via
+  ``--continuation-token``.
+
+Options:
+  --attempt-id TEXT               Scope to one attempt UUID.
+  --level TEXT                    Level allowlist, e.g. INFO. Repeat for
+                                  multiple values.
+  --start-date TEXT               ISO timestamp lower bound.
+  --end-date TEXT                 ISO timestamp upper bound.
+  --limit INTEGER                 Max lines per page (server default 200, max
+                                  1000).
+  --continuation-token TEXT       Keyset cursor from the previous page (load-
+                                  older paging).
+  --order [chronological|newest_first]
+                                  Log order (server default chronological).
+  --json                          Emit JSON instead of human-readable output.
+  --help                          Show this message and exit.
+```
+
+### `services restart`
+
+```
+Usage: services restart [OPTIONS] REF
+
+  Rolling restart: stays desired-running, stops the live attempt if any.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `services start`
+
+```
+Usage: services start [OPTIONS] REF
+
+  Request running: clears suppression so the claim loop picks it up.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `services stop`
+
+```
+Usage: services stop [OPTIONS] REF
+
+  Request stopped: durable desire is stored before termination.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `services update`
+
+```
+Usage: services update [OPTIONS] REF
+
+  Update a service's lifecycle policy.
+
+  ``REF`` is a definition UUID or workflow name. Unset flags are omitted from
+  the payload so only the supplied fields are patched.
+
+Options:
+  --startup-policy [automatic|manual]
+                                  startup_policy
+  --restart-policy [always|on_failure|never]
+                                  restart_policy
+  --graceful-shutdown-seconds INTEGER
+                                  graceful_shutdown_seconds
+  --startup-grace-seconds INTEGER
+                                  startup_grace_seconds
+  --restart-backoff-initial-seconds INTEGER
+                                  restart_backoff_initial_seconds
+  --restart-backoff-max-seconds INTEGER
+                                  restart_backoff_max_seconds
+  --crash-loop-max-restarts INTEGER
+                                  crash_loop_max_restarts
+  --crash-loop-window-seconds INTEGER
+                                  crash_loop_window_seconds
+  --json                          Emit JSON instead of human-readable output.
+  --help                          Show this message and exit.
 ```
 
 ## `solution`
@@ -1767,19 +2433,25 @@ Options:
   --help  Show this message and exit.
 
 Commands:
-  bind          Bind this local Solution workspace to an existing install.
-  capture       Adopt loose _repo/ entities into an install (migration).
-  create        Create a Solution workspace and remote install.
-  deploy        Non-interactive full-replace deploy of the current...
-  export        Download a Solution's workspace zip (shareable or full...
-  init          Alias for `solution create`: scaffold and create a remote...
-  install       Install a Solution from a workspace zip (drag-and-drop...
-  migrate-app   Migrate a v1 inline app dir to a scaffolded standalone_v2...
-  pull          Pull captured entities into the local .bifrost/ manifest...
-  scaffold-app  Scaffold a standalone_v2 React app (package.json, vite,...
-  sdk           Manage the app's vendored Bifrost SDK.
-  start         Run the app's dev server + local workflows on one stable...
-  swap-slugs    Atomically exchange two apps' slugs (v1→v2 migration...
+  bind              Bind this local Solution workspace to an existing...
+  capture           Adopt loose _repo/ entities into an install (migration).
+  create            Create a Solution workspace and remote install.
+  deploy            Non-interactive full-replace deploy of the current...
+  export            Download a Solution's workspace zip (shareable or...
+  git               Connect or disconnect a managed Solution repository.
+  import-workspace  Import a Solution package as unattached workspace...
+  init              Alias for `solution create`: scaffold and create a...
+  install           Install a Solution from a workspace zip...
+  install-repo      Install a Solution from a repository and make Git its...
+  migrate-app       Migrate a v1 inline App directory to a scaffolded V2...
+  pull              Pull captured entities into the local .bifrost/...
+  pull-manifests    Pull captured entities into the local .bifrost/...
+  scaffold-app      Scaffold a standalone_v2 React app (package.json,...
+  sdk               Manage the app's vendored Bifrost SDK.
+  start             Run the app's dev server + local workflows on one...
+  swap-slugs        Atomically exchange two apps' slugs (v1→v2 migration...
+  sync              Update a Git-connected Solution from its configured ref.
+  update            Edit install-local fields (name, scope, access gates)...
 ```
 
 ### `solution bind`
@@ -1835,8 +2507,12 @@ Options:
   --name TEXT                     Display name (defaults to slug).
   --version TEXT                  Bundle version recorded on the install at
                                   deploy time.  [default: 0.1.0]
-  --global-repo-access / --no-global-repo-access
-                                  [default: no-global-repo-access]
+  --allow-outbound-access / --no-allow-outbound-access
+                                  Let the install fall back to shared _repo
+                                  resources.
+  --allow-inbound-access / --no-allow-inbound-access
+                                  Let other installs target this one via per-
+                                  call solution refs.
   --url TEXT                      Bifrost instance URL (default: current
                                   profile).
   --global                        Target global scope (org=NULL). Alias for
@@ -1891,6 +2567,70 @@ Options:
   --help                   Show this message and exit.
 ```
 
+### `solution git`
+
+```
+Usage: solution git [OPTIONS] COMMAND [ARGS]...
+
+  Connect or disconnect a managed Solution repository.
+
+Options:
+  --help  Show this message and exit.
+
+Commands:
+  connect     Connect an existing install; repository updates become its...
+  disconnect  Disconnect Git so future updates are manual Solution...
+```
+
+#### `solution git connect`
+
+```
+Usage: solution git connect [OPTIONS] SOLUTION_REF REPOSITORY_URL
+
+  Connect an existing install; repository updates become its sole writer.
+
+Options:
+  --subpath TEXT  Solution workspace path inside the repository.
+  --ref TEXT      Git ref to update from.  [default: main]
+  --help          Show this message and exit.
+```
+
+#### `solution git disconnect`
+
+```
+Usage: solution git disconnect [OPTIONS] SOLUTION_REF
+
+  Disconnect Git so future updates are manual Solution deployments.
+
+Options:
+  --help  Show this message and exit.
+```
+
+### `solution import-workspace`
+
+```
+Usage: solution import-workspace [OPTIONS] [ARCHIVE]
+
+  Import a Solution package as unattached workspace content (one-time
+  snapshot).
+
+Options:
+  --repo TEXT       Solution git repository URL (snapshot import; mutually
+                    exclusive with ARCHIVE).
+  --ref TEXT        Git ref to import (default branch when omitted).
+  --path TEXT       Package subfolder within the repository.
+  --org TEXT        Target organization name or UUID for scoped definitions.
+                    Omit for global workspace content.
+  --global          Target global workspace content (the default).
+  --keep-all        Keep every conflicting destination item.
+  --replace-all     Replace every conflicting destination item.
+  --decisions FILE
+  --preview         Print the staged collision preview without queuing an
+                    import.
+  --json            Emit raw preview and terminal job JSON.
+  --help            Show this message and exit.
+```
+
 ### `solution init`
 
 ```
@@ -1904,8 +2644,12 @@ Options:
   --name TEXT                     Display name (defaults to slug).
   --version TEXT                  Bundle version recorded on the install at
                                   deploy time.  [default: 0.1.0]
-  --global-repo-access / --no-global-repo-access
-                                  [default: no-global-repo-access]
+  --allow-outbound-access / --no-allow-outbound-access
+                                  Let the install fall back to shared _repo
+                                  resources.
+  --allow-inbound-access / --no-allow-inbound-access
+                                  Let other installs target this one via per-
+                                  call solution refs.
   --url TEXT                      Bifrost instance URL (default: current
                                   profile).
   --global                        Target global scope (org=NULL). Alias for
@@ -1945,13 +2689,26 @@ Options:
   --help                          Show this message and exit.
 ```
 
+### `solution install-repo`
+
+```
+Usage: solution install-repo [OPTIONS] REPOSITORY_URL
+
+  Install a Solution from a repository and make Git its sole writer.
+
+Options:
+  --subpath TEXT  Solution workspace path inside the repository.
+  --ref TEXT      Git ref to install.  [default: main]
+  --help          Show this message and exit.
+```
+
 ### `solution migrate-app`
 
 ```
 Usage: solution migrate-app [OPTIONS] SOURCE V2_SLUG
 
-  Migrate a v1 inline app dir to a scaffolded standalone_v2 app: scaffold +
-  port source + rewrite imports + install shadcn. STOPS before build/wire and
+  Migrate a v1 inline App directory to a scaffolded V2 App: scaffold + port
+  source + rewrite imports + install shadcn. STOPS before build/wire and
   prints a checklist of the judgment steps left to you.
 
 Options:
@@ -1963,6 +2720,25 @@ Options:
 
 ```
 Usage: solution pull [OPTIONS] [PATH]
+
+  Pull captured entities into the local .bifrost/ manifest (does not touch
+  source code).
+
+Options:
+  --solution TEXT                 Target install id (override when ambiguous).
+  --global                        Target global scope (org=NULL). Alias for
+                                  --org global.
+  --org, --organization, --scope TEXT
+                                  Org UUID/name, or 'none'/'global' for global
+                                  scope. Omit = your org. (--organization /
+                                  --scope are synonyms.)
+  --help                          Show this message and exit.
+```
+
+### `solution pull-manifests`
+
+```
+Usage: solution pull-manifests [OPTIONS] [PATH]
 
   Pull captured entities into the local .bifrost/ manifest (does not touch
   source code).
@@ -2002,7 +2778,31 @@ Options:
   --help  Show this message and exit.
 
 Commands:
-  update  Re-vendor the Bifrost SDK into the app (re-download + reinstall).
+  deployed-status  Show deployed SDK status for Apps owned by a Solution...
+  deployed-update  Queue deployed SDK update jobs for Apps owned by a...
+  update           Re-vendor the Bifrost SDK into the app (re-download +...
+```
+
+#### `solution sdk deployed-status`
+
+```
+Usage: solution sdk deployed-status [OPTIONS] SOLUTION_REF
+
+  Show deployed SDK status for Apps owned by a Solution install.
+
+Options:
+  --help  Show this message and exit.
+```
+
+#### `solution sdk deployed-update`
+
+```
+Usage: solution sdk deployed-update [OPTIONS] SOLUTION_REF
+
+  Queue deployed SDK update jobs for Apps owned by a Solution install.
+
+Options:
+  --help  Show this message and exit.
 ```
 
 #### `solution sdk update`
@@ -2048,6 +2848,46 @@ Usage: solution swap-slugs [OPTIONS] APP_A APP_B
 
 Options:
   --help  Show this message and exit.
+```
+
+### `solution sync`
+
+```
+Usage: solution sync [OPTIONS] SOLUTION_REF
+
+  Update a Git-connected Solution from its configured ref.
+
+Options:
+  --help  Show this message and exit.
+```
+
+### `solution update`
+
+```
+Usage: solution update [OPTIONS] [PATH]
+
+  Edit install-local fields (name, scope, access gates) of an existing
+  install.
+
+Options:
+  --solution TEXT                 Install id or unique slug (default:
+                                  workspace binding or descriptor slug).
+  --name TEXT                     New display name.
+  --allow-outbound-access / --no-allow-outbound-access
+                                  Let the install fall back to shared _repo
+                                  resources.
+  --allow-inbound-access / --no-allow-inbound-access
+                                  Let other installs target this one via per-
+                                  call solution refs.
+  --url TEXT                      Bifrost instance URL (default: current
+                                  profile).
+  --global                        Target global scope (org=NULL). Alias for
+                                  --org global.
+  --org, --organization, --scope TEXT
+                                  Org UUID/name, or 'none'/'global' for global
+                                  scope. Omit = your org. (--organization /
+                                  --scope are synonyms.)
+  --help                          Show this message and exit.
 ```
 
 ## `tables`
@@ -2209,13 +3049,200 @@ Usage: tables update [OPTIONS] REF
   break on rename. No confirmation is required; the warning just nudges the
   caller to grep their workspace before committing.
 
+  Passing ``--org``/``--global`` re-scopes the table (HOME leaves the scope
+  unchanged, since omitting org sends no ``organization_id``).
+
 Options:
-  --name TEXT         name
-  --description TEXT  description
-  --schema TEXT       schema as JSON literal or @path to a YAML/JSON file.
-  --policies TEXT     policies as JSON literal or @path to a YAML/JSON file.
-  --json              Emit JSON instead of human-readable output.
-  --help              Show this message and exit.
+  --name TEXT                     name
+  --description TEXT              description
+  --schema TEXT                   schema as JSON literal or @path to a
+                                  YAML/JSON file.
+  --policies TEXT                 policies as JSON literal or @path to a
+                                  YAML/JSON file.
+  --global                        Target global scope (org=NULL). Alias for
+                                  --org global.
+  --org, --organization, --scope TEXT
+                                  Org UUID/name, or 'none'/'global' for global
+                                  scope. Omit = your org. (--organization /
+                                  --scope are synonyms.)
+  --json                          Emit JSON instead of human-readable output.
+  --help                          Show this message and exit.
+```
+
+## `users`
+
+```
+Usage: users [OPTIONS] COMMAND [ARGS]...
+
+  Show and change what a user can do, and ask what their access would be.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  access  Show a user's access, or check what it would allow.
+  create  Create a custom identity in --org, or Global.
+  list    List the people you may read, or with --identities the identities.
+  roles   Show and replace a user's roles.
+```
+
+### `users access`
+
+```
+Usage: users access [OPTIONS] COMMAND [ARGS]...
+
+  Show a user's access, or check what it would allow.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  check  Show how the access model decides USER performing --operation in...
+  show   Show what USER can do, and where.
+```
+
+#### `users access check`
+
+```
+Usage: users access check [OPTIONS] USER
+
+  Show how the access model decides USER performing --operation in --org.
+
+  USER is a UUID, email, or identity name.
+
+  Examples:
+
+    bifrost users access check ada@contoso.test --org global --operation tables.documents.create
+    bifrost users access check ada@contoso.test --org Contoso --operation tables.documents.create --workflow "Sync Invoices"
+
+Options:
+  --org TEXT        Organization UUID or name, or 'global'.  [required]
+  --operation TEXT  Catalog operation id or 'METHOD /api/path'.  [required]
+  --workflow TEXT   Workflow whose powers apply (UUID, name, or path::func).
+                    Omit to act directly.
+  --json            Emit JSON instead of human-readable output.
+  --help            Show this message and exit.
+```
+
+#### `users access show`
+
+```
+Usage: users access show [OPTIONS] USER
+
+  Show what USER can do, and where.
+
+  Lists every place the user reaches and the permissions held there. `bifrost
+  users access USER` is the same as `bifrost users access show USER`.
+
+  USER is a UUID, email, or identity name.
+
+  Example:
+
+    bifrost users access ada@contoso.test
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `users create`
+
+```
+Usage: users create [OPTIONS]
+
+  Create a custom identity in --org, or Global.
+
+  The identity starts with the User base role and no additional roles; give it
+  roles with `bifrost users roles set`, then point a workflow at it with
+  `bifrost workflows update --run-as`.
+
+  Example:
+
+    bifrost users create --identity --org Contoso --name "Contoso Nightly"
+
+Options:
+  --identity   Create an identity (the only thing created here).  [required]
+  --org TEXT   Organization UUID or name, or 'global'.  [required]
+  --name TEXT  The identity's name.  [required]
+  --json       Emit JSON instead of human-readable output.
+  --help       Show this message and exit.
+```
+
+### `users list`
+
+```
+Usage: users list [OPTIONS]
+
+  List the people you may read, or with --identities the identities.
+
+  Identities are the accounts that run work no person started: each
+  organization's default, the global default, and custom ones.
+
+Options:
+  --identities  List identities instead of people.
+  --json        Emit JSON instead of human-readable output.
+  --help        Show this message and exit.
+```
+
+### `users roles`
+
+```
+Usage: users roles [OPTIONS] COMMAND [ARGS]...
+
+  Show and replace a user's roles.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+
+Commands:
+  get  Show USER's base role and additional roles, with the places each...
+  set  Replace USER's additional roles, and optionally their base role.
+```
+
+#### `users roles get`
+
+```
+Usage: users roles get [OPTIONS] USER
+
+  Show USER's base role and additional roles, with the places each applies.
+
+  USER is a UUID, email, or identity name.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+#### `users roles set`
+
+```
+Usage: users roles set [OPTIONS] USER
+
+  Replace USER's additional roles, and optionally their base role.
+
+  USER is a UUID, email, or identity name.
+
+  The --role options replace the additional roles; --no-roles removes them
+  all. With only --base, the additional roles stay as they are.
+
+  Examples:
+
+    bifrost users roles set ada@contoso.test --role Helpdesk=org:Contoso,org:Fabrikam
+    bifrost users roles set ada@contoso.test --base User --role Auditor=all
+    bifrost users roles set ada@contoso.test --no-roles
+
+Options:
+  --base TEXT           Base role (UUID or name). Omit to keep the current
+                        one.
+  --role ROLE[=PLACES]  Additional role, repeatable. PLACES is a comma list of
+                        org:<organization>, customers, global or all; omit it
+                        for the role's default (the user's home organization).
+  --no-roles            Remove every additional role.
+  --json                Emit JSON instead of human-readable output.
+  --help                Show this message and exit.
 ```
 
 ## `workflows`
@@ -2230,17 +3257,19 @@ Options:
   --help  Show this message and exit.
 
 Commands:
-  delete         Delete a workflow by removing its function from the...
-  execute        Execute a registered workflow remotely and stream logs...
-  get            Get a single workflow by UUID, name, or ``path::func`` ref.
-  grant-role     Grant a role access to a workflow.
-  list           List all workflows visible to the caller.
-  list-orphaned  List all orphaned workflows (backing file deleted or...
-  register       Register a decorated function from an existing workspace...
-  remap          Move references from one workflow ID to another active...
-  replace        Repoint an orphaned workflow to a new file location.
-  revoke-role    Revoke a role's access from a workflow.
-  update         Update a workflow's editable properties.
+  delete           Delete a workflow by removing its function from the...
+  execute          Execute a registered workflow remotely and stream logs...
+  get              Get a single workflow by UUID, name, or ``path::func``...
+  grant            Grant the identity a workflow runs as what Recommended...
+  grant-role       Grant a role access to a workflow.
+  list             List all workflows visible to the caller.
+  list-orphaned    List all orphaned workflows (backing file deleted or...
+  recommendations  Show what the identity a workflow runs as would also...
+  register         Register a decorated function from an existing...
+  remap            Move references from one workflow ID to another active...
+  replace          Repoint an orphaned workflow to a new file location.
+  revoke-role      Revoke a role's access from a workflow.
+  update           Update a workflow's editable properties.
 ```
 
 ### `workflows delete`
@@ -2297,13 +3326,41 @@ Usage: workflows get [OPTIONS] REF
 
   Get a single workflow by UUID, name, or ``path::func`` ref.
 
-  The server does not expose a per-record GET endpoint for workflows, so this
-  resolves the ref via :class:`RefResolver` and locates the entry in the ``GET
-  /api/workflows`` list payload.
+  Resolves ``REF`` via :class:`RefResolver`, then calls ``GET
+  /api/workflows/{uuid}`` directly (platform admin only; admins can read any
+  org's workflow by id).
 
 Options:
   --json  Emit JSON instead of human-readable output.
   --help  Show this message and exit.
+```
+
+### `workflows grant`
+
+```
+Usage: workflows grant [OPTIONS] REF
+
+  Grant the identity a workflow runs as what Recommended Access recommends.
+
+  Each grant is merged into the identity's existing assignment of that role. A
+  recommendation without a grant needs a role chosen: use `bifrost users roles
+  set`. A default identity is shared by every workflow that runs as it, so
+  granting to one needs --yes.
+
+  Examples:
+
+    bifrost workflows grant "Sync Invoices" --recommendation 1
+    bifrost workflows grant "Sync Invoices" --all
+    bifrost workflows grant "Sync Invoices" --recommendation 1 --yes
+
+Options:
+  --recommendation N  Number of a recommendation from `workflows
+                      recommendations`, repeatable.
+  --all               Apply every recommendation that has a grant.
+  --yes               Confirm granting to a default identity, which other
+                      workflows share.
+  --json              Emit JSON instead of human-readable output.
+  --help              Show this message and exit.
 ```
 
 ### `workflows grant-role`
@@ -2344,6 +3401,25 @@ Usage: workflows list-orphaned [OPTIONS]
   Orphaned workflows are workflows whose source file no longer exists or no
   longer contains the decorated function. They can be repointed with ``bifrost
   workflows replace``.
+
+Options:
+  --json  Emit JSON instead of human-readable output.
+  --help  Show this message and exit.
+```
+
+### `workflows recommendations`
+
+```
+Usage: workflows recommendations [OPTIONS] REF
+
+  Show what the identity a workflow runs as would also need.
+
+  Recommended Access, based on the access checks the workflow's recent runs
+  recorded: reach into other organizations, roles its policies look for, and
+  the workflow's own roles. Empty until runs are observed. Apply the grants
+  with `bifrost workflows grant`.
+
+  ``REF`` is a UUID, workflow name, or ``path::func`` locator.
 
 Options:
   --json  Emit JSON instead of human-readable output.
@@ -2415,9 +3491,9 @@ Usage: workflows replace [OPTIONS] REF
 
   ``REF`` is a UUID or workflow name (use ``bifrost workflows list-orphaned``
   to find orphaned UUIDs). The target file must exist in the workspace and
-  contain a ``@workflow``, ``@tool``, or ``@data_provider`` decorated function
-  with the given name. The workflow UUID is preserved so form/agent references
-  remain intact.
+  contain a ``@workflow``, ``@tool``, ``@data_provider``, or ``@service``
+  decorated function with the given name. The workflow UUID is preserved so
+  form/agent references remain intact.
 
 Options:
   --path TEXT           Workspace-relative path to the .py file containing the
@@ -2457,6 +3533,11 @@ Usage: workflows update [OPTIONS] REF
   :mod:`bifrost.refs` for resolution rules.
 
 Options:
+  --run-as TEXT                   Identity the workflow runs as when no person
+                                  starts it: UUID, name, or name with its
+                                  place, e.g. 'Default Identity (Contoso)'.
+  --run-as-default                Run as the organization's default identity
+                                  again.
   --organization-id TEXT          organization_id
   --access-level TEXT             access_level
   --clear-roles / --no-clear-roles
@@ -2468,6 +3549,7 @@ Options:
   --description TEXT              description
   --category TEXT                 category
   --timeout-seconds INTEGER       timeout_seconds
+  --memory-request-mib INTEGER    memory_request_mib
   --tags TEXT                     tags (repeat for multiple).
   --endpoint-enabled / --no-endpoint-enabled
                                   endpoint_enabled (tri-state; omit to leave

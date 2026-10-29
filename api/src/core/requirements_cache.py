@@ -8,15 +8,15 @@ installed packages survive container restarts.
 Persistence Flow:
 1. User installs package via /api/packages/install
 2. API handler appends package to requirements, saves to S3 + Redis cache
-3. API broadcasts "recycle_workers" to all workers
-4. Workers recycle processes; ProcessPoolManager calls install_requirements() at pool startup
+3. API records the package change; every executor applies it and recycles
+4. ProcessPoolManager calls install_requirements() at pool startup
 5. pip install runs from requirements.txt (shared filesystem, all workers inherit)
 
 Read path: Redis cache → S3 fallback (re-caches on hit)
 Source of truth: S3 (_repo/requirements.txt) via RepoStorage
 
 Related Files:
-- api/src/routers/packages.py - Saves requirements + broadcasts recycle
+- api/src/routers/packages.py - Saves requirements + records the change
 - api/scripts/init_container.py - Warms cache on container startup
 - api/src/services/execution/simple_worker.py - Installs on worker startup
 
@@ -29,6 +29,8 @@ import json
 import logging
 import os
 from typing import Any, TypedDict
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.redis_client import get_redis_client
 
@@ -79,16 +81,14 @@ def get_requirements_sync() -> str | None:
 
     Lookup order:
     1. Redis cache (fast path)
-    2. API endpoint GET /api/sdk/requirements — preferred cold-cache fallback
-       (no S3 env vars required; uses engine token from credentials file)
-    3. Direct S3 via botocore — legacy fallback when BIFROST_S3_* are present
-    4. None (not found)
+    2. Direct S3 via the parent-only CRT transport while the privileged setup helper still has
+       storage credentials (re-caches on hit)
+    3. None (not found)
 
     Returns:
         Requirements content string, or None if not found
     """
     from src.core.module_cache_sync import (
-        _fetch_requirements_from_api,
         _get_s3_client,
         _get_sync_redis,
     )
@@ -103,21 +103,7 @@ def get_requirements_sync() -> str | None:
                 return content
             return None
 
-        # Redis miss — try API endpoint first (Phase 2: no S3 env required)
-        logger.info("[requirements] Redis cache empty, trying API endpoint")
-        api_content = _fetch_requirements_from_api()
-        if api_content:
-            try:
-                content_hash = hashlib.sha256(api_content.encode()).hexdigest()
-                cached_data = CachedRequirements(content=api_content, hash=content_hash)
-                client.setex(REQUIREMENTS_KEY, REQUIREMENTS_CACHE_TTL, json.dumps(cached_data))
-                logger.info("[requirements] Re-cached requirements from API to Redis")
-            except Exception as e:
-                logger.warning(f"[requirements] Failed to re-cache to Redis: {e}")
-            return api_content
-
-        # API not available — fall back to direct S3 (legacy path)
-        logger.info("[requirements] API unavailable, falling back to S3")
+        logger.info("[requirements] Redis cache empty, reading S3")
         content = _read_requirements_from_s3(_get_s3_client)
         if not content:
             return None
@@ -138,7 +124,7 @@ def get_requirements_sync() -> str | None:
 
 
 def _read_requirements_from_s3(get_client_fn: Any) -> str | None:
-    """Read _repo/requirements.txt from S3 using a sync botocore client."""
+    """Read _repo/requirements.txt from S3 using the synchronous CRT transport."""
     bucket = os.environ.get("BIFROST_S3_BUCKET")
     if not bucket:
         return None
@@ -211,20 +197,19 @@ async def warm_requirements_cache() -> bool:
         return False
 
 
-async def save_requirements(content: str) -> None:
+async def save_requirements(content: str, db: AsyncSession) -> None:
     """
     Save requirements.txt to S3 and update Redis cache.
 
     Args:
         content: Full requirements.txt content
     """
-    from src.services.repo_storage import RepoStorage
+    from src.services.file_index_service import FileIndexService
 
     content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-    # Write to S3 (source of truth)
-    repo = RepoStorage()
-    await repo.write("requirements.txt", content.encode())
+    # Write to S3 (source of truth) and index it in the caller's transaction
+    await FileIndexService(db).write("requirements.txt", content.encode())
 
     # Update Redis cache (workers read this synchronously at startup)
     await set_requirements(content, content_hash)

@@ -5,11 +5,52 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { renderWithProviders, screen, waitFor } from "@/test-utils";
+import {
+	fireEvent,
+	renderWithProviders,
+	screen,
+	waitFor,
+	within,
+} from "@/test-utils";
+import { act } from "@testing-library/react";
+import { useContext } from "react";
 import { SolutionDetail } from "./SolutionDetail";
+import { UNSAFE_NavigationContext, useLocation } from "react-router-dom";
 
 const APP_LOGO_DATA_URL =
 	"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=";
+
+const wsMocks = vi.hoisted(() => ({
+	platformJobCallback: undefined as
+		((job: Record<string, unknown>) => void) | undefined,
+	jobSpecificCallback: undefined as
+		((job: Record<string, unknown>) => void) | undefined,
+}));
+
+vi.mock("@/services/websocket", () => ({
+	webSocketService: {
+		onAnyPlatformJobUpdate: vi.fn(
+			(callback: (job: Record<string, unknown>) => void) => {
+				wsMocks.platformJobCallback = callback;
+				return vi.fn();
+			},
+		),
+		onPlatformJobUpdate: vi.fn(
+			(
+				_jobId: string,
+				callback: (job: Record<string, unknown>) => void,
+			) => {
+				wsMocks.jobSpecificCallback = callback;
+				return vi.fn();
+			},
+		),
+	},
+}));
+
+let mobileAccess = false;
+vi.mock("@/hooks/useMediaQuery", () => ({
+	useMediaQuery: () => mobileAccess,
+}));
 
 const mockNavigate = vi.fn();
 vi.mock("react-router-dom", async () => {
@@ -70,13 +111,19 @@ const mockDownloadSolutionExportJob = vi.fn();
 const mockGetSolutionCaptureCandidates = vi.fn();
 const mockCaptureSolutionEntities = vi.fn();
 const mockSyncSolution = vi.fn();
+const mockDisconnectSolutionGit = vi.fn();
+const mockPreviewSolutionFromRepo = vi.fn();
 const mockGetSolutionReadme = vi.fn();
+const mockGetSolutionSdkStatus = vi.fn();
+const mockUpdateSolutionAppSdks = vi.fn();
 const mockCreateWorkflowKey = vi.fn();
 const mockRevokeWorkflowKey = vi.fn();
 vi.mock("@/services/solutions", () => ({
 	getSolutionEntities: (...a: unknown[]) => mockGetSolutionEntities(...a),
 	getSolutionSetup: (...a: unknown[]) => mockGetSolutionSetup(...a),
 	getSolutionReadme: (...a: unknown[]) => mockGetSolutionReadme(...a),
+	getSolutionSdkStatus: (...a: unknown[]) => mockGetSolutionSdkStatus(...a),
+	updateSolutionAppSdks: (...a: unknown[]) => mockUpdateSolutionAppSdks(...a),
 	updateSolution: (...a: unknown[]) => mockUpdateSolution(...a),
 	deleteSolution: (...a: unknown[]) => mockDeleteSolution(...a),
 	uninstallSolution: (...a: unknown[]) => mockUninstallSolution(...a),
@@ -84,14 +131,25 @@ vi.mock("@/services/solutions", () => ({
 		mockGetSolutionDeletionSummary(...a),
 	setSolutionConfig: (...a: unknown[]) => mockSetSolutionConfig(...a),
 	exportSolution: (...a: unknown[]) => mockExportSolution(...a),
-	createSolutionExportJob: (...a: unknown[]) => mockCreateSolutionExportJob(...a),
-	listSolutionExportJobs: (...a: unknown[]) => mockListSolutionExportJobs(...a),
+	createSolutionExportJob: (...a: unknown[]) =>
+		mockCreateSolutionExportJob(...a),
+	listSolutionExportJobs: (...a: unknown[]) =>
+		mockListSolutionExportJobs(...a),
 	downloadSolutionExportJob: (...a: unknown[]) =>
 		mockDownloadSolutionExportJob(...a),
 	syncSolution: (...a: unknown[]) => mockSyncSolution(...a),
+	previewSolutionFromRepo: (...a: unknown[]) =>
+		mockPreviewSolutionFromRepo(...a),
+	disconnectSolutionGit: (...a: unknown[]) => mockDisconnectSolutionGit(...a),
 	getSolutionCaptureCandidates: (...a: unknown[]) =>
 		mockGetSolutionCaptureCandidates(...a),
-	captureSolutionEntities: (...a: unknown[]) => mockCaptureSolutionEntities(...a),
+	captureSolutionEntities: (...a: unknown[]) =>
+		mockCaptureSolutionEntities(...a),
+}));
+
+const mockObservePlatformJob = vi.fn();
+vi.mock("@/services/platformJobs", () => ({
+	observePlatformJob: (...args: unknown[]) => mockObservePlatformJob(...args),
 }));
 
 vi.mock("@/services/workflowKeys", () => ({
@@ -126,27 +184,27 @@ function makeEntities(statusOverride = "active") {
 				function_name: "sync_tickets",
 			},
 		],
-			apps: [
-				{
-					id: "app-1",
-					name: "Solution App",
-					slug: "solution-app",
-					description: "Solution app",
-					app_model: "standalone_v2",
-					is_published: true,
-					has_unpublished_changes: false,
-					logo_url: APP_LOGO_DATA_URL,
-				},
-			],
-			forms: [
-				{
-					id: "form-1",
-					name: "Ticket Intake",
-					description: "Collect ticket context",
-					is_active: true,
-					organization_id: "org-1",
-				},
-			],
+		apps: [
+			{
+				id: "app-1",
+				name: "Solution App",
+				slug: "solution-app",
+				description: "Solution app",
+				app_model: "standalone_v2",
+				is_published: true,
+				has_unpublished_changes: false,
+				logo_url: APP_LOGO_DATA_URL,
+			},
+		],
+		forms: [
+			{
+				id: "form-1",
+				name: "Ticket Intake",
+				description: "Collect ticket context",
+				is_active: true,
+				organization_id: "org-1",
+			},
+		],
 		agents: [],
 		tables: [{ id: "tbl-1", name: "Customers" }],
 		claims: [
@@ -186,10 +244,27 @@ async function renderPage() {
 }
 
 beforeEach(() => {
+	mobileAccess = false;
 	vi.clearAllMocks();
 	mockGetSolutionEntities.mockResolvedValue(makeEntities());
 	mockGetSolutionSetup.mockResolvedValue({ setup_complete: true, items: [] });
 	mockGetSolutionReadme.mockResolvedValue({ readme: null });
+	mockGetSolutionSdkStatus.mockResolvedValue({
+		solution_id: "sol-1",
+		sdk_status: "current",
+		actionable_count: 0,
+		apps: [],
+	});
+	mockUpdateSolutionAppSdks.mockResolvedValue({
+		solution_id: "sol-1",
+		accepted: [],
+		skipped: [],
+	});
+	mockPreviewSolutionFromRepo.mockResolvedValue({ diff: {} });
+	mockObservePlatformJob.mockReturnValue({
+		promise: Promise.resolve(undefined),
+		cancel: vi.fn(),
+	});
 	mockListSolutionExportJobs.mockResolvedValue({ jobs: [] });
 	mockCreateSolutionExportJob.mockResolvedValue({
 		id: "job-1",
@@ -199,10 +274,7 @@ beforeEach(() => {
 		created_at: "2026-06-25T12:00:00Z",
 		updated_at: "2026-06-25T12:00:00Z",
 	});
-	mockDownloadSolutionExportJob.mockResolvedValue({
-		blob: new Blob(["zipbytes"]),
-		filename: "backup.zip",
-	});
+	mockDownloadSolutionExportJob.mockResolvedValue(undefined);
 	mockGetSolutionDeletionSummary.mockResolvedValue({
 		solution_id: "sol-1",
 		files: 2,
@@ -214,6 +286,7 @@ beforeEach(() => {
 		claims: 1,
 		config_declarations: 2,
 		events: 0,
+		external_event_subscriptions: 0,
 	});
 	mockGetSolutionCaptureCandidates.mockResolvedValue({
 		workflows: [],
@@ -236,6 +309,82 @@ beforeEach(() => {
 	});
 });
 
+it("opens a bookmarked Exports tab and keeps tab navigation in the URL", async () => {
+	function Location() {
+		return (
+			<output aria-label="Current tab URL">{useLocation().search}</output>
+		);
+	}
+	const { user } = renderWithProviders(
+		<>
+			<SolutionDetail />
+			<Location />
+		</>,
+		{ initialEntries: ["/solutions/sol-1?tab=exports&from=docs"] },
+	);
+	const exports = await screen.findByRole("tab", { name: "Exports" });
+	expect(exports).toHaveAttribute("aria-selected", "true");
+	expect(
+		await screen.findByText("No backup exports queued yet."),
+	).toBeInTheDocument();
+	await user.click(screen.getByRole("tab", { name: /^Overview/ }));
+	expect(
+		screen.getByRole("status", { name: "Current tab URL" }),
+	).toHaveTextContent("tab=overview");
+	expect(
+		screen.getByRole("status", { name: "Current tab URL" }),
+	).toHaveTextContent("from=docs");
+});
+
+it("adds one history entry per tab selection so Back returns to the bookmarked tab", async () => {
+	function HistoryControls() {
+		const { navigator } = useContext(UNSAFE_NavigationContext);
+		return <button onClick={() => navigator.go(-1)}>Browser Back</button>;
+	}
+	const { user } = renderWithProviders(
+		<>
+			<HistoryControls />
+			<SolutionDetail />
+		</>,
+		{
+			initialEntries: ["/solutions/sol-1?tab=exports"],
+		},
+	);
+	await screen.findByText("No backup exports queued yet.");
+	await user.click(screen.getByRole("tab", { name: "Overview" }));
+	await user.click(screen.getByRole("button", { name: "Browser Back" }));
+	expect(screen.getByRole("tab", { name: "Exports" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+});
+
+it("keeps the bookmarked tab while focusing another tab and changes it on activation", async () => {
+	const { user } = renderWithProviders(<SolutionDetail />, {
+		initialEntries: ["/solutions/sol-1?tab=exports"],
+	});
+	await screen.findByText("No backup exports queued yet.");
+	act(() => screen.getByRole("tab", { name: "Overview" }).focus());
+	expect(screen.getByRole("tab", { name: "Exports" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await user.keyboard("{Enter}");
+	expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+});
+
+it("keeps Overview as the default for an unknown tab bookmark", async () => {
+	renderWithProviders(<SolutionDetail />, {
+		initialEntries: ["/solutions/sol-1?tab=unknown"],
+	});
+	expect(
+		await screen.findByRole("tab", { name: /^Overview/ }),
+	).toHaveAttribute("aria-selected", "true");
+});
+
 describe("SolutionDetail", () => {
 	it("renders the breadcrumb link and install name", async () => {
 		await renderPage();
@@ -255,7 +404,9 @@ describe("SolutionDetail", () => {
 		expect(
 			await screen.findByText(/no setup instructions provided/i),
 		).toBeInTheDocument();
-		expect(screen.queryByText(/add setup instructions/i)).not.toBeInTheDocument();
+		expect(
+			screen.queryByText(/add setup instructions/i),
+		).not.toBeInTheDocument();
 		expect(
 			screen.queryByRole("button", { name: /write readme/i }),
 		).not.toBeInTheDocument();
@@ -280,7 +431,9 @@ describe("SolutionDetail", () => {
 		await renderPage();
 		await screen.findByTestId("solution-detail");
 
-		expect(screen.getByTestId("tab-overview")).toHaveTextContent("Overview");
+		expect(screen.getByTestId("tab-overview")).toHaveTextContent(
+			"Overview",
+		);
 
 		// Contents collapses the 6 entity inventories; its count is the total
 		// (1 workflow + 1 app + 1 form + 0 agents + 1 table + 1 claim = 5 in the
@@ -325,10 +478,16 @@ describe("SolutionDetail", () => {
 		await screen.findByTestId("solution-detail");
 
 		await waitFor(() =>
-			expect(screen.queryByTestId("continue-setup")).not.toBeInTheDocument(),
+			expect(
+				screen.queryByTestId("continue-setup"),
+			).not.toBeInTheDocument(),
 		);
-		expect(screen.queryByTestId("incomplete-badge")).not.toBeInTheDocument();
-		expect(screen.queryByTestId("config-tab-warning")).not.toBeInTheDocument();
+		expect(
+			screen.queryByTestId("incomplete-badge"),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByTestId("config-tab-warning"),
+		).not.toBeInTheDocument();
 	});
 
 	it("returns to overview when completed setup is dismissed", async () => {
@@ -353,7 +512,9 @@ describe("SolutionDetail", () => {
 		await screen.findByTestId("solution-detail");
 
 		await user.click(screen.getByTestId("tab-configuration"));
-		expect(await screen.findByText(/all required setup is complete/i)).toBeInTheDocument();
+		expect(
+			await screen.findByText(/all required setup is complete/i),
+		).toBeInTheDocument();
 		await user.click(screen.getByRole("button", { name: /done/i }));
 
 		await waitFor(() =>
@@ -405,7 +566,7 @@ describe("SolutionDetail", () => {
 		await user.click(screen.getByTestId("tab-exports"));
 
 		expect(
-			await screen.findByText("Failed to list backup exports"),
+			await screen.findByText("Couldn't load backup exports."),
 		).toBeInTheDocument();
 	});
 
@@ -414,7 +575,9 @@ describe("SolutionDetail", () => {
 		await screen.findByTestId("solution-detail");
 
 		await user.click(screen.getByTestId("solution-actions"));
-		await user.click(await screen.findByRole("menuitem", { name: /export/i }));
+		await user.click(
+			await screen.findByRole("menuitem", { name: /export/i }),
+		);
 		await user.click(screen.getByLabelText(/^backup/i));
 		await user.type(screen.getByLabelText(/^password/i), "hunter2");
 		await user.click(screen.getByRole("button", { name: /queue backup/i }));
@@ -444,7 +607,9 @@ describe("SolutionDetail", () => {
 		const workflows = screen.getByTestId("chip-workflows");
 		expect(workflows).toHaveTextContent("Workflows");
 		expect(workflows).toHaveTextContent("1");
-		expect(screen.getByTestId("chip-claims")).toHaveTextContent("Custom Claims");
+		expect(screen.getByTestId("chip-claims")).toHaveTextContent(
+			"Custom Claims",
+		);
 	});
 
 	it("opens the requested Contents filter from an Overview entity count", async () => {
@@ -457,9 +622,13 @@ describe("SolutionDetail", () => {
 			"data-state",
 			"active",
 		);
-		expect(screen.getByTestId("chip-workflows")).toHaveTextContent("Workflows");
+		expect(screen.getByTestId("chip-workflows")).toHaveTextContent(
+			"Workflows",
+		);
 		expect(screen.getByText("Sync Tickets")).toBeInTheDocument();
-		expect(screen.queryByTestId("summary-workflows")).not.toBeInTheDocument();
+		expect(
+			screen.queryByTestId("summary-workflows"),
+		).not.toBeInTheDocument();
 	});
 
 	it("opens Files directly from the Overview Files count", async () => {
@@ -477,15 +646,18 @@ describe("SolutionDetail", () => {
 			"data-state",
 			"active",
 		);
-		expect(await screen.findByTestId("solution-files-explorer"))
-			.toHaveTextContent("Files Explorer sol-1 My Solution");
+		expect(
+			await screen.findByTestId("solution-files-explorer"),
+		).toHaveTextContent("Files Explorer sol-1 My Solution");
 	});
 
 	it("renders the update action and the overflow menu in the header", async () => {
 		const { user } = await renderPage();
 		await screen.findByTestId("solution-detail");
 
-		expect(screen.getByRole("button", { name: /update/i })).toBeInTheDocument();
+		expect(
+			screen.getByRole("button", { name: /update/i }),
+		).toBeInTheDocument();
 
 		// The secondary actions (Capture, Export, Edit, Delete) live behind the
 		// "⋯" overflow menu now, not as a flat row of buttons.
@@ -511,101 +683,107 @@ describe("SolutionDetail", () => {
 		await screen.findByTestId("solution-detail");
 
 		await user.click(screen.getByTestId("solution-actions"));
-		await user.click(await screen.findByRole("menuitem", { name: /capture/i }));
+		await user.click(
+			await screen.findByRole("menuitem", { name: /capture/i }),
+		);
 
 		expect(
-			await screen.findByRole("heading", { name: /capture existing entities/i }),
+			await screen.findByRole("heading", {
+				name: /capture existing entities/i,
+			}),
 		).toBeInTheDocument();
-		expect(await screen.findByLabelText(/capture orders/i)).toBeInTheDocument();
+		expect(
+			await screen.findByLabelText(/capture orders/i),
+		).toBeInTheDocument();
 	});
 
-		it("shows the setup-incomplete banner", async () => {
-			await renderPage();
-			expect(
-				await screen.findByTestId("required-config-warning"),
-			).toBeInTheDocument();
-			expect(
-				screen.getByText(/setup incomplete .* 1 required config needs a value/i),
-			).toBeInTheDocument();
-		});
+	it("shows the setup-incomplete banner", async () => {
+		await renderPage();
+		expect(
+			await screen.findByTestId("required-config-warning"),
+		).toBeInTheDocument();
+		expect(
+			screen.getByText(
+				/setup incomplete .* 1 required config needs a value/i,
+			),
+		).toBeInTheDocument();
+	});
 
-		it("uses the workflow list execute action instead of making the card open execution", async () => {
-			const { user } = await renderPage();
-			await screen.findByTestId("solution-detail");
+	it("opens workflow execution from the shared card", async () => {
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
 
-			await user.click(screen.getByTestId("tab-contents"));
-			await user.click(screen.getByTestId("chip-workflows"));
-			const execute = screen.getByRole("button", { name: /execute workflow/i });
-			await user.click(execute);
+		await user.click(screen.getByTestId("tab-contents"));
+		await user.click(screen.getByTestId("chip-workflows"));
+		expect(
+			screen
+				.getAllByRole("link", { name: "Sync Tickets" })
+				.map((link) => link.getAttribute("href")),
+		).toContain("/workflows/Sync%20Tickets/execute?from=solution:sol-1");
+	});
 
-			expect(mockNavigate).toHaveBeenCalledWith(
-				"/workflows/Sync%20Tickets/execute?from=solution:sol-1",
-			);
-		});
+	it("opens the shared form card without exposing edit controls", async () => {
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
 
-		it("uses the forms list launch action without exposing edit controls", async () => {
-			const { user } = await renderPage();
-			await screen.findByTestId("solution-detail");
+		await user.click(screen.getByTestId("tab-contents"));
+		await user.click(screen.getByTestId("chip-forms"));
+		expect(screen.getByText("Ticket Intake")).toBeInTheDocument();
+		expect(
+			screen.queryByRole("button", { name: /edit form/i }),
+		).not.toBeInTheDocument();
 
-			await user.click(screen.getByTestId("tab-contents"));
-			await user.click(screen.getByTestId("chip-forms"));
-			expect(screen.getByText("Ticket Intake")).toBeInTheDocument();
-			expect(
-				screen.queryByRole("button", { name: /edit form/i }),
-			).not.toBeInTheDocument();
+		expect(
+			screen
+				.getAllByRole("link", { name: "Ticket Intake" })
+				.map((link) => link.getAttribute("href")),
+		).toContain("/execute/form-1?from=solution:sol-1");
+	});
 
-			await user.click(screen.getByRole("button", { name: /launch/i }));
-			expect(mockNavigate).toHaveBeenCalledWith(
-				"/execute/form-1?from=solution:sol-1",
-			);
-		});
+	it("opens sharing for a solution-managed form without exposing edit controls", async () => {
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
 
-		it("opens sharing for a solution-managed form without exposing edit controls", async () => {
-			const { user } = await renderPage();
-			await screen.findByTestId("solution-detail");
+		await user.click(screen.getByTestId("tab-contents"));
+		await user.click(screen.getByTestId("chip-forms"));
+		await user.click(
+			screen.getByRole("button", { name: "Ticket Intake actions" }),
+		);
 
-			await user.click(screen.getByTestId("tab-contents"));
-			await user.click(screen.getByTestId("chip-forms"));
-			await user.click(
-				screen.getByRole("button", { name: "Ticket Intake actions" }),
-			);
+		expect(
+			screen.getByRole("menuitem", { name: "Share Form" }),
+		).toBeInTheDocument();
+		expect(
+			screen.queryByRole("menuitem", { name: "Edit Form" }),
+		).not.toBeInTheDocument();
 
-			expect(
-				screen.getByRole("menuitem", { name: "Share Form" }),
-			).toBeInTheDocument();
-			expect(
-				screen.queryByRole("menuitem", { name: "Edit Form" }),
-			).not.toBeInTheDocument();
+		await user.click(screen.getByRole("menuitem", { name: "Share Form" }));
+		expect(screen.getByRole("dialog")).toHaveTextContent(
+			"Share Ticket Intake",
+		);
+	});
 
-			await user.click(
-				screen.getByRole("menuitem", { name: "Share Form" }),
-			);
-			expect(screen.getByRole("dialog")).toHaveTextContent(
-				"Share Ticket Intake",
-			);
-		});
+	it("uses the applications list open behavior for solution apps", async () => {
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
 
-		it("uses the applications list open behavior for solution apps", async () => {
-			const { user } = await renderPage();
-			await screen.findByTestId("solution-detail");
+		await user.click(screen.getByTestId("tab-contents"));
+		await user.click(screen.getByTestId("chip-apps"));
+		expect(screen.queryByText(/open published/i)).not.toBeInTheDocument();
+		expect(screen.getByTestId("entity-logo")).toHaveAttribute(
+			"src",
+			APP_LOGO_DATA_URL,
+		);
+		expect(
+			screen
+				.getAllByRole("link", { name: "Solution App" })
+				.map((link) => link.getAttribute("href")),
+		).toContain("/apps/solution-app?from=solution:sol-1");
+	});
 
-			await user.click(screen.getByTestId("tab-contents"));
-			await user.click(screen.getByTestId("chip-apps"));
-			expect(screen.queryByText(/open published/i)).not.toBeInTheDocument();
-			expect(screen.getByTestId("entity-logo")).toHaveAttribute(
-				"src",
-				APP_LOGO_DATA_URL,
-			);
-			await user.click(screen.getByRole("button", { name: /solution app/i }));
-
-			expect(mockNavigate).toHaveBeenCalledWith(
-				"/apps/solution-app?from=solution:sol-1",
-			);
-		});
-
-		it("navigates a table row to its entity page with ?from=solution:", async () => {
-			const { user } = await renderPage();
-			await screen.findByTestId("solution-detail");
+	it("navigates a table row to its entity page with ?from=solution:", async () => {
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
 
 		await user.click(screen.getByTestId("tab-contents"));
 		await user.click(screen.getByTestId("chip-tables"));
@@ -617,18 +795,35 @@ describe("SolutionDetail", () => {
 		);
 	});
 
+	it("opens entity table row hrefs on ctrl-click with ?from=solution:", async () => {
+		const open = vi.spyOn(window, "open").mockImplementation(() => null);
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
+
+		await user.click(screen.getByTestId("tab-contents"));
+		await user.click(screen.getByTestId("chip-tables"));
+		const row = screen.getByRole("row", { name: /customers/i });
+		fireEvent.click(within(row).getAllByText("-")[0], {
+			ctrlKey: true,
+		});
+
+		expect(open).toHaveBeenCalledWith(
+			"/tables/tbl-1?from=solution:sol-1",
+			"_blank",
+		);
+	});
+
 	it("filters entity rows with the tab's search box", async () => {
 		const { user } = await renderPage();
 		await screen.findByTestId("solution-detail");
 
 		await user.click(screen.getByTestId("tab-contents"));
 		await user.click(screen.getByTestId("chip-tables"));
-		expect(screen.getByRole("row", { name: /customers/i })).toBeInTheDocument();
+		expect(
+			screen.getByRole("row", { name: /customers/i }),
+		).toBeInTheDocument();
 
-		await user.type(
-			screen.getByPlaceholderText("Search tables..."),
-			"zzz",
-		);
+		await user.type(screen.getByPlaceholderText("Search tables..."), "zzz");
 		// SearchBox debounces input before propagating it.
 		expect(await screen.findByText(/no tables match/i)).toBeInTheDocument();
 		expect(
@@ -679,10 +874,66 @@ describe("SolutionDetail", () => {
 		await screen.findByTestId("solution-detail");
 
 		expect(screen.getByTestId("update-solution")).toBeInTheDocument();
+		expect(
+			screen.getByRole("button", { name: "Connect Git" }),
+		).toBeInTheDocument();
 		expect(screen.queryByTestId("update-now")).not.toBeInTheDocument();
 		expect(
 			screen.queryByTestId("update-available-badge"),
 		).not.toBeInTheDocument();
+	});
+
+	it("offers Update from the configured ref and Disconnect Git for a connected install", async () => {
+		const entities = makeEntities();
+		entities.solution = {
+			...entities.solution,
+			git_connected: true,
+			git_repo_url: "https://github.com/acme/sol",
+			git_ref: "main",
+		} as unknown as typeof entities.solution;
+		mockGetSolutionEntities.mockResolvedValue(entities);
+
+		await renderPage();
+		await screen.findByTestId("solution-detail");
+
+		expect(
+			screen.getByRole("button", { name: "Update from main" }),
+		).toBeInTheDocument();
+		expect(
+			screen.getByRole("button", { name: "Disconnect Git" }),
+		).toBeInTheDocument();
+		expect(screen.getByTestId("git-provenance")).toHaveTextContent(
+			"https://github.com/acme/sol @ main",
+		);
+	});
+
+	it("confirms disconnect before making the solution manually writable", async () => {
+		mockDisconnectSolutionGit.mockResolvedValue({ id: "sol-1" });
+		const entities = makeEntities();
+		entities.solution = {
+			...entities.solution,
+			git_connected: true,
+			git_repo_url: "https://github.com/acme/sol",
+			git_ref: "main",
+		} as unknown as typeof entities.solution;
+		mockGetSolutionEntities.mockResolvedValue(entities);
+
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
+		await user.click(
+			screen.getByRole("button", { name: "Disconnect Git" }),
+		);
+
+		expect(
+			await screen.findByRole("heading", { name: "Disconnect Git?" }),
+		).toBeInTheDocument();
+		expect(mockDisconnectSolutionGit).not.toHaveBeenCalled();
+		await user.click(
+			screen.getByRole("button", { name: "Disconnect Git" }),
+		);
+		await waitFor(() =>
+			expect(mockDisconnectSolutionGit).toHaveBeenCalledWith("sol-1"),
+		);
 	});
 
 	it("surfaces 'Update now' + an Update-available badge for a git-connected install with an available update", async () => {
@@ -733,8 +984,151 @@ describe("SolutionDetail", () => {
 		// On success the entities query refetches (clears the badge once the
 		// backend drops update_available_version).
 		await waitFor(() =>
-			expect(mockGetSolutionEntities.mock.calls.length).toBeGreaterThan(1),
+			expect(mockGetSolutionEntities.mock.calls.length).toBeGreaterThan(
+				1,
+			),
 		);
+	});
+
+	it("refreshes the Solution after a queued Git sync reaches a terminal success", async () => {
+		mockSyncSolution.mockResolvedValue({ job_id: "solution-sync-job" });
+		const entities = makeEntities();
+		entities.solution = {
+			...entities.solution,
+			git_connected: true,
+			git_repo_url: "https://github.com/acme/sol",
+			git_ref: "main",
+		} as unknown as typeof entities.solution;
+		mockGetSolutionEntities.mockResolvedValue(entities);
+
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
+		await user.click(screen.getByTestId("update-now"));
+		await user.click(screen.getByTestId("confirm-update-now"));
+
+		await waitFor(() =>
+			expect(mockObservePlatformJob).toHaveBeenCalledWith(
+				"solution-sync-job",
+				expect.any(Function),
+			),
+		);
+		const entityReadsBeforeTerminal =
+			mockGetSolutionEntities.mock.calls.length;
+
+		act(() => wsMocks.jobSpecificCallback?.({ status: "running" }));
+		expect(mockGetSolutionEntities).toHaveBeenCalledTimes(
+			entityReadsBeforeTerminal,
+		);
+
+		act(() => wsMocks.jobSpecificCallback?.({ status: "succeeded" }));
+		await waitFor(() =>
+			expect(mockGetSolutionEntities.mock.calls.length).toBeGreaterThan(
+				entityReadsBeforeTerminal,
+			),
+		);
+	});
+
+	it("refreshes the Solution after a queued Git sync fails terminally", async () => {
+		mockSyncSolution.mockResolvedValue({ job_id: "failed-sync-job" });
+		const entities = makeEntities();
+		entities.solution = {
+			...entities.solution,
+			git_connected: true,
+			git_repo_url: "https://github.com/acme/sol",
+			git_ref: "main",
+		} as unknown as typeof entities.solution;
+		mockGetSolutionEntities.mockResolvedValue(entities);
+
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
+		await user.click(screen.getByTestId("update-now"));
+		await user.click(screen.getByTestId("confirm-update-now"));
+		const entityReadsBeforeTerminal =
+			mockGetSolutionEntities.mock.calls.length;
+
+		act(() => wsMocks.jobSpecificCallback?.({ status: "failed" }));
+		await waitFor(() =>
+			expect(mockGetSolutionEntities.mock.calls.length).toBeGreaterThan(
+				entityReadsBeforeTerminal,
+			),
+		);
+	});
+
+	it("keeps Solution app SDK update action busy until durable jobs reach terminal state", async () => {
+		mockGetSolutionSdkStatus.mockResolvedValue({
+			solution_id: "sol-1",
+			sdk_status: "update_available",
+			actionable_count: 1,
+			apps: [
+				{
+					application_id: "app-1",
+					slug: "dispatch-board",
+					sdk_status: "update_available",
+					sdk_source_available: true,
+					actionable: true,
+				},
+			],
+		});
+		mockUpdateSolutionAppSdks.mockResolvedValue({
+			solution_id: "sol-1",
+			accepted: [
+				{
+					application_id: "app-1",
+					job_id: "job-1",
+					status: "queued",
+					reused: false,
+					notification_id: null,
+				},
+			],
+			skipped: [],
+		});
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
+
+		await user.click(screen.getByTestId("solution-actions"));
+		await user.click(screen.getByTestId("update-solution-app-sdks"));
+		await user.click(screen.getByTestId("solution-actions"));
+		expect(
+			screen.getByTestId("update-solution-app-sdks"),
+		).toHaveTextContent("Updating app SDKs");
+		expect(screen.getByTestId("update-solution-app-sdks")).toHaveAttribute(
+			"aria-disabled",
+			"true",
+		);
+
+		act(() => {
+			wsMocks.platformJobCallback?.({
+				id: "job-1",
+				job_type: "application.sdk_update",
+				resource_type: "application",
+				resource_id: "app-1",
+				status: "running",
+				title: "Update app SDK",
+			});
+		});
+		expect(
+			screen.getByTestId("update-solution-app-sdks"),
+		).toHaveTextContent("Updating app SDKs");
+
+		act(() => {
+			wsMocks.platformJobCallback?.({
+				id: "job-1",
+				job_type: "application.sdk_update",
+				resource_type: "application",
+				resource_id: "app-1",
+				status: "succeeded",
+				title: "Update app SDK",
+			});
+		});
+
+		await waitFor(() =>
+			expect(
+				screen.getByTestId("update-solution-app-sdks"),
+			).toHaveTextContent("Update app SDKs"),
+		);
+		expect(
+			screen.getByTestId("update-solution-app-sdks"),
+		).not.toHaveAttribute("aria-disabled", "true");
 	});
 
 	it("renders a Files chip in Contents when the install has files", async () => {
@@ -764,13 +1158,32 @@ describe("SolutionDetail", () => {
 		await user.click(screen.getByTestId("tab-contents"));
 		await user.click(screen.getByTestId("chip-files"));
 
-		expect(await screen.findByTestId("solution-files-explorer"))
-			.toHaveTextContent("Files Explorer sol-1 My Solution");
+		expect(
+			await screen.findByTestId("solution-files-explorer"),
+		).toHaveTextContent("Files Explorer sol-1 My Solution");
 		expect(mockFilesExplorer).toHaveBeenCalledWith({
 			install: "sol-1",
 			installName: "My Solution",
 			embedded: true,
 		});
+		await user.selectOptions(
+			screen.getByRole("combobox", { name: "Content type" }),
+			"all",
+		);
+		expect(
+			screen.queryByTestId("solution-files-explorer"),
+		).not.toBeInTheDocument();
+		await user.selectOptions(
+			screen.getByRole("combobox", { name: "Content type" }),
+			"files",
+		);
+		expect(
+			await screen.findByTestId("solution-files-explorer"),
+		).toBeInTheDocument();
+		expect(screen.getByTestId("chip-files")).toHaveAttribute(
+			"aria-pressed",
+			"true",
+		);
 	});
 
 	it("shows 'Uninstall' in the overflow menu for an active solution", async () => {
@@ -778,7 +1191,9 @@ describe("SolutionDetail", () => {
 		await screen.findByTestId("solution-detail");
 
 		await user.click(screen.getByTestId("solution-actions"));
-		expect(await screen.findByTestId("uninstall-solution")).toBeInTheDocument();
+		expect(
+			await screen.findByTestId("uninstall-solution"),
+		).toBeInTheDocument();
 		expect(screen.getByTestId("hard-delete-solution")).toBeInTheDocument();
 	});
 
@@ -811,8 +1226,29 @@ describe("SolutionDetail", () => {
 
 		// Overflow menu has no Uninstall but still has Delete permanently.
 		await user.click(screen.getByTestId("solution-actions"));
-		expect(screen.queryByTestId("uninstall-solution")).not.toBeInTheDocument();
+		expect(
+			screen.queryByTestId("uninstall-solution"),
+		).not.toBeInTheDocument();
 		expect(screen.getByTestId("hard-delete-solution")).toBeInTheDocument();
+	});
+
+	it("opens the zip install dialog with explicit reactivate intent for an inactive solution", async () => {
+		mockGetSolutionEntities.mockResolvedValue(makeEntities("inactive"));
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
+
+		await user.click(screen.getByTestId("reactivate-solution"));
+
+		const dialog = await screen.findByTestId("solution-dialog");
+		expect(
+			within(dialog).getByText("Reactivate Solution"),
+		).toBeInTheDocument();
+		expect(
+			within(dialog).getByText(
+				"Choose the exported package for this inactive install. Confirming reactivates the existing install in place.",
+			),
+		).toBeInTheDocument();
+		expect(within(dialog).queryByText("From a repository")).toBeNull();
 	});
 
 	it("opens the hard-delete modal, lists deletion summary, disables Confirm until slug typed", async () => {
@@ -830,11 +1266,16 @@ describe("SolutionDetail", () => {
 		expect(summaryList).toHaveTextContent(/2 files/);
 		expect(summaryList).toHaveTextContent(/1 table/);
 		expect(summaryList).toHaveTextContent(/3 workflows/);
+		expect(
+			screen.queryByTestId("deletion-summary-external-listeners"),
+		).toBeNull();
 
 		expect(screen.getByTestId("hard-delete-slug")).toHaveTextContent(
 			"my-solution",
 		);
-		expect(screen.getByText("Type the Solution slug to confirm")).toBeInTheDocument();
+		expect(
+			screen.getByText("Type the Solution slug to confirm"),
+		).toBeInTheDocument();
 
 		// Confirm is disabled until slug is typed.
 		const confirmBtn = screen.getByTestId("confirm-hard-delete");
@@ -847,6 +1288,34 @@ describe("SolutionDetail", () => {
 		await user.clear(input);
 		await user.type(input, "my-solution");
 		expect(confirmBtn).not.toBeDisabled();
+	});
+
+	it("warns about external listeners the hard-delete will also remove", async () => {
+		mockGetSolutionDeletionSummary.mockResolvedValue({
+			solution_id: "sol-1",
+			files: 0,
+			tables: 0,
+			workflows: 1,
+			apps: 0,
+			forms: 0,
+			agents: 0,
+			claims: 0,
+			config_declarations: 0,
+			events: 2,
+			external_event_subscriptions: 3,
+		});
+		const { user } = await renderPage();
+		await screen.findByTestId("solution-detail");
+
+		await user.click(screen.getByTestId("solution-actions"));
+		await user.click(await screen.findByTestId("hard-delete-solution"));
+
+		const warning = await screen.findByTestId(
+			"deletion-summary-external-listeners",
+		);
+		expect(warning).toHaveTextContent(
+			/3 external listeners outside this Solution will also be removed/,
+		);
 	});
 
 	it("calls deleteSolution with confirm=slug and navigates away on hard-delete", async () => {
@@ -873,10 +1342,231 @@ describe("SolutionDetail", () => {
 		await user.click(screen.getByTestId("confirm-hard-delete"));
 
 		await waitFor(() =>
-			expect(mockDeleteSolution).toHaveBeenCalledWith("sol-1", "my-solution"),
+			expect(mockDeleteSolution).toHaveBeenCalledWith(
+				"sol-1",
+				"my-solution",
+			),
 		);
 		await waitFor(() =>
 			expect(mockNavigate).toHaveBeenCalledWith("/solutions"),
 		);
 	});
+});
+
+describe("Solution access layouts", () => {
+	it.each([true, false])(
+		"preserves keyboard access and search on mobile=%s",
+		async (mobile) => {
+			mobileAccess = mobile;
+			const { user } = await renderPage();
+			await screen.findByTestId("solution-detail");
+			await user.click(screen.getByTestId("tab-access"));
+			if (mobile) {
+				expect(screen.queryByRole("table")).not.toBeInTheDocument();
+				expect(
+					screen.queryByRole("radio", { name: "Grid view" }),
+				).not.toBeInTheDocument();
+			} else {
+				expect(screen.getByRole("table")).toBeInTheDocument();
+				await user.click(
+					screen.getByRole("radio", { name: "Grid view" }),
+				);
+				expect(screen.queryByRole("table")).not.toBeInTheDocument();
+			}
+			const record = screen.getByRole("button", { name: /Sync Tickets/ });
+			record.focus();
+			await user.keyboard("{Enter}");
+			expect(await screen.findByRole("dialog")).toHaveAccessibleName(
+				"Sync Tickets",
+			);
+			await user.keyboard("{Escape}");
+			await waitFor(() => expect(record).toHaveFocus());
+			await user.type(
+				screen.getByPlaceholderText("Search access..."),
+				"does not exist",
+			);
+			expect(
+				await screen.findByText(/No access rows match/),
+			).toBeInTheDocument();
+		},
+	);
+});
+
+it("retains failed configuration input and retries the scoped payload", async () => {
+	let rejectSave!: (reason: Error) => void;
+	mockSetSolutionConfig
+		.mockImplementationOnce(
+			() =>
+				new Promise<void>((_resolve, reject) => {
+					rejectSave = reject;
+				}),
+		)
+		.mockResolvedValueOnce(undefined);
+	const { user } = await renderPage();
+	await screen.findByTestId("solution-detail");
+	await user.click(screen.getByTestId("tab-configuration"));
+	const input = screen.getByLabelText("api_token");
+	await user.type(input, "synthetic-value{Enter}");
+	expect(input).toBeDisabled();
+	expect(screen.getByTestId("save-config-api_token")).toBeDisabled();
+	rejectSave(new Error("Synthetic save failure"));
+	expect(await screen.findByRole("alert")).toHaveTextContent(
+		"Your entry is ready to retry",
+	);
+	expect(input).toHaveValue("synthetic-value");
+	await user.click(screen.getByRole("button", { name: "Retry save" }));
+	await waitFor(() => expect(input).toHaveValue(""));
+	expect(mockSetSolutionConfig).toHaveBeenCalledTimes(2);
+	expect(mockSetSolutionConfig.mock.calls[1]).toEqual(
+		mockSetSolutionConfig.mock.calls[0],
+	);
+});
+
+it("distinguishes setup loading and failure from an empty configuration", async () => {
+	const entities = makeEntities();
+	entities.configs = [];
+	entities.required_configs_unset = [];
+	mockGetSolutionEntities.mockResolvedValue(entities);
+	let rejectSetup!: (reason: Error) => void;
+	mockGetSolutionSetup
+		.mockImplementationOnce(
+			() =>
+				new Promise((_resolve, reject) => {
+					rejectSetup = reject;
+				}),
+		)
+		.mockResolvedValueOnce({ setup_complete: true, items: [] });
+	const { user } = await renderPage();
+	await screen.findByTestId("solution-detail");
+	await user.click(screen.getByTestId("tab-configuration"));
+	expect(screen.getByRole("status")).toHaveTextContent(
+		"Loading setup requirements",
+	);
+	expect(
+		screen.queryByText("This Solution declares no configuration."),
+	).not.toBeInTheDocument();
+	rejectSetup(new Error("Synthetic setup failure"));
+	expect(await screen.findByRole("alert")).toHaveTextContent(
+		"Couldn't load setup requirements",
+	);
+	expect(
+		screen.queryByText("This Solution declares no configuration."),
+	).not.toBeInTheDocument();
+	await user.click(
+		screen.getByRole("button", { name: "Retry setup status" }),
+	);
+	expect(
+		await screen.findByText("This Solution declares no configuration."),
+	).toBeInTheDocument();
+});
+
+it("rechecks endpoint status after a rotation partially fails", async () => {
+	let hasKey = true;
+	mockGetSolutionSetup.mockImplementation(async () => ({
+		setup_complete: hasKey,
+		items: [
+			{
+				kind: "workflow_endpoint_key",
+				key: "wf-1",
+				workflow_id: "wf-1",
+				workflow_name: "Sync Tickets",
+				required: true,
+				is_set: hasKey,
+			},
+		],
+	}));
+	mockRevokeWorkflowKey.mockImplementation(async () => {
+		hasKey = false;
+	});
+	mockCreateWorkflowKey
+		.mockRejectedValueOnce(new Error("Synthetic creation failure"))
+		.mockResolvedValueOnce({ raw_key: "synthetic-test-key" });
+	const { user } = await renderPage();
+	await screen.findByTestId("solution-detail");
+	await user.click(screen.getByTestId("tab-configuration"));
+	await user.click(
+		screen.getByRole("button", { name: "Rotate endpoint key" }),
+	);
+	expect(await screen.findByRole("alert")).toHaveTextContent(
+		"Couldn't finish generating",
+	);
+	await user.click(
+		screen.getByRole("button", { name: "Retry key generation" }),
+	);
+	await screen.findByRole("dialog");
+	expect(mockRevokeWorkflowKey).toHaveBeenCalledTimes(1);
+	expect(mockCreateWorkflowKey).toHaveBeenCalledTimes(2);
+	expect(mockGetSolutionSetup.mock.calls.length).toBeGreaterThanOrEqual(3);
+});
+
+it("recovers export history loading without treating failure as empty", async () => {
+	mockListSolutionExportJobs
+		.mockRejectedValueOnce(new Error("Synthetic lookup failure"))
+		.mockResolvedValueOnce({ jobs: [] });
+	const { user } = await renderPage();
+	await screen.findByTestId("solution-detail");
+	await user.click(screen.getByTestId("tab-exports"));
+	expect(await screen.findByRole("alert")).toHaveTextContent(
+		"Couldn't load backup exports",
+	);
+	expect(
+		screen.queryByText("No backup exports queued yet."),
+	).not.toBeInTheDocument();
+	await user.click(screen.getByRole("button", { name: "Retry exports" }));
+	expect(
+		await screen.findByText("No backup exports queued yet."),
+	).toBeInTheDocument();
+});
+
+it("keeps failed export downloads available for retry", async () => {
+	mockListSolutionExportJobs.mockResolvedValue({
+		jobs: [
+			{
+				id: "retry-job",
+				status: "completed",
+				download_url: "/fixture",
+				created_at: "2026-09-06T12:00:00Z",
+			},
+		],
+	});
+	mockDownloadSolutionExportJob
+		.mockRejectedValueOnce(new Error("Synthetic download failure"))
+		.mockResolvedValueOnce(undefined);
+	const { user } = await renderPage();
+	await screen.findByTestId("solution-detail");
+	await user.click(screen.getByTestId("tab-exports"));
+	await user.click(screen.getByRole("button", { name: "Download" }));
+	expect(await screen.findByRole("alert")).toHaveTextContent(
+		"Couldn't download this export",
+	);
+	await user.click(screen.getByRole("button", { name: "Retry download" }));
+	await waitFor(() =>
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument(),
+	);
+	expect(mockDownloadSolutionExportJob.mock.calls).toEqual([
+		["retry-job"],
+		["retry-job"],
+	]);
+});
+
+it("distinguishes failed README lookup from missing instructions and retries", async () => {
+	mockGetSolutionReadme
+		.mockRejectedValueOnce(new Error("Synthetic README failure"))
+		.mockResolvedValueOnce({ readme: "# Recovered setup instructions" });
+	const { user } = await renderPage();
+	await screen.findByTestId("solution-detail");
+	expect(await screen.findByRole("alert")).toHaveTextContent(
+		"Couldn't load setup instructions",
+	);
+	expect(
+		screen.queryByText("No setup instructions provided."),
+	).not.toBeInTheDocument();
+	await user.click(
+		screen.getByRole("button", { name: "Retry instructions" }),
+	);
+	expect(
+		await screen.findByRole("heading", {
+			name: "Recovered setup instructions",
+		}),
+	).toBeInTheDocument();
 });

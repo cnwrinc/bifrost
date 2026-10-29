@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
-import { AlertCircle } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { AlertCircle, X } from "lucide-react";
 import { toast } from "sonner";
+import { getErrorMessage } from "@/lib/api-error";
 
 import {
 	Dialog,
@@ -14,19 +15,30 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { OrganizationSelect } from "@/components/forms/OrganizationSelect";
 import { RolesMultiSelect } from "@/components/forms/RolesMultiSelect";
+import { useOrganizations } from "@/hooks/useOrganizations";
+import { useRoles } from "@/hooks/useRoles";
+import { UserLookupNotice } from "./UserLookupNotice";
 import { useBulkUserOperation } from "@/hooks/useUsers";
+import { GLOBAL_TARGET } from "@/lib/authorization";
+import { cn } from "@/lib/utils";
+import { useAuthorization } from "@/services/authorization";
 
 import type { components } from "@/lib/v1";
 
-type User = components["schemas"]["UserPublic"];
 type BulkUserResponse = components["schemas"]["BulkUserResponse"];
+
+/** A selected row: a user, or an identity on the Identities list. */
+export type BulkTarget = Pick<components["schemas"]["UserPublic"], "id"> & {
+	name?: string | null;
+	email?: string;
+};
 
 export interface BulkDialogSharedProps {
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
-	users: User[];
+	users: BulkTarget[];
 	/** Fires when the operation resolved with at least one failed entry. */
-	onPartialFailure: (result: BulkUserResponse, users: User[]) => void;
+	onPartialFailure: (result: BulkUserResponse, users: BulkTarget[]) => void;
 	/**
 	 * Fires after a successful submit (any rows succeeded). Parent uses this
 	 * to clear the row selection. Cancel/dismiss intentionally does NOT call
@@ -38,15 +50,115 @@ export interface BulkDialogSharedProps {
 function summarize(result: BulkUserResponse, action: string) {
 	if (result.failed.length === 0) {
 		toast.success(`${action} (${result.succeeded.length})`);
-	} else if (result.succeeded.length === 0) {
-		toast.error(`${action} failed`, {
-			description: `${result.failed.length} user(s) could not be updated`,
-		});
-	} else {
-		toast.warning(`${action} partially completed`, {
-			description: `${result.succeeded.length} succeeded · ${result.failed.length} failed`,
-		});
 	}
+}
+
+function BulkSubmitError({ message }: { message: string | null }) {
+	const errorRef = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		if (message) {
+			errorRef.current?.focus();
+			errorRef.current?.scrollIntoView({ block: "nearest" });
+		}
+	}, [message]);
+	if (!message) return null;
+
+	return (
+		<div
+			ref={errorRef}
+			role="alert"
+			tabIndex={-1}
+			className="mt-4 outline-none"
+		>
+			<div className="rounded-[var(--bf-radius-surface)] border border-[var(--bf-danger)]/20 bg-[var(--bf-danger-soft)] p-3 text-sm text-[var(--bf-danger)]">
+				<div className="flex items-start gap-2">
+					<AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+					<p className="min-w-0 break-words">{message}</p>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+export function BulkDialogFrame({
+	open,
+	onOpenChange,
+	title,
+	description,
+	children,
+	footer,
+	maxWidthClassName = "sm:max-w-lg",
+	compact = false,
+	busy = false,
+}: {
+	open: boolean;
+	onOpenChange: (open: boolean) => void;
+	title: string;
+	description: string;
+	children: ReactNode;
+	footer: ReactNode;
+	maxWidthClassName?: string;
+	compact?: boolean;
+	busy?: boolean;
+}) {
+	return (
+		<Dialog
+			open={open}
+			onOpenChange={(nextOpen) => {
+				if (!busy) onOpenChange(nextOpen);
+			}}
+		>
+			<DialogContent
+				showCloseButton={false}
+				onEscapeKeyDown={(event) => {
+					if (busy) event.preventDefault();
+				}}
+				onInteractOutside={(event) => {
+					if (busy) event.preventDefault();
+				}}
+				className={cn(
+					"flex h-[100dvh] w-full max-w-none flex-col gap-0 overflow-hidden rounded-none border-border/70 p-0 shadow-xl motion-reduce:transition-none motion-reduce:animate-none sm:h-auto sm:max-h-[min(90vh,42rem)] sm:w-[min(92vw,42rem)] sm:rounded-[var(--bf-radius-feature)]",
+					maxWidthClassName,
+					compact &&
+						"h-auto max-h-[90dvh] w-[calc(100vw-2rem)] rounded-[var(--bf-radius-feature)]",
+				)}
+			>
+				<DialogHeader className="shrink-0 border-b border-border/70 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] text-left sm:px-6">
+					<div className="flex items-start gap-3">
+						<div className="min-w-0 flex-1">
+							<DialogTitle className="text-pretty break-words">
+								{title}
+							</DialogTitle>
+							<DialogDescription className="mt-1.5 text-sm leading-5">
+								{description}
+							</DialogDescription>
+						</div>
+						<Button
+							type="button"
+							variant="ghost"
+							size="icon-lg"
+							onClick={() => onOpenChange(false)}
+							aria-label="Close dialog"
+							disabled={busy}
+							className="h-11 w-11 shrink-0 rounded-[var(--bf-radius-control)] border border-border/70 bg-background/90 text-foreground hover:bg-muted motion-reduce:transition-none"
+						>
+							<X className="h-5 w-5" />
+						</Button>
+					</div>
+				</DialogHeader>
+				<div
+					inert={busy}
+					aria-busy={busy}
+					className="min-h-0 flex-1 overflow-y-auto px-4 py-4 sm:px-6"
+				>
+					{children}
+				</div>
+				<div className="shrink-0 border-t border-border/70 px-4 py-4 sm:px-6">
+					{footer}
+				</div>
+			</DialogContent>
+		</Dialog>
+	);
 }
 
 // =============================================================================
@@ -67,14 +179,23 @@ function BulkMoveOrgDialogInner({
 	onSuccess,
 }: BulkDialogSharedProps) {
 	const [orgId, setOrgId] = useState<string | null | undefined>(undefined);
+	const [submitError, setSubmitError] = useState<string | null>(null);
+	const lookup = useOrganizations();
+	const authorization = useAuthorization();
+	const lookupReady = lookup.data !== undefined && !lookup.isError;
 	const bulkOp = useBulkUserOperation();
+	const submitBusy = useRef(false);
 
 	const handleSubmit = async () => {
+		if (submitBusy.current || !lookupReady) return;
+		setSubmitError(null);
 		// `undefined` means "no selection". Org select normalizes to null (= platform) or a UUID.
 		if (orgId === undefined) {
-			toast.error("Choose a destination organization");
+			const message = "Choose a destination organization";
+			setSubmitError(message);
 			return;
 		}
+		submitBusy.current = true;
 		try {
 			const result = (await bulkOp.mutateAsync({
 				body: {
@@ -88,44 +209,71 @@ function BulkMoveOrgDialogInner({
 			if (result.succeeded.length > 0) onSuccess?.();
 			onOpenChange(false);
 		} catch (e) {
-			toast.error(
-				e instanceof Error ? e.message : "Bulk move failed",
-			);
+			const message = getErrorMessage(e, "Bulk move failed");
+			setSubmitError(message);
+		} finally {
+			submitBusy.current = false;
 		}
 	};
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent>
-				<DialogHeader>
-					<DialogTitle>Move {users.length} user(s) to organization</DialogTitle>
-					<DialogDescription>
-						Each user's organization will be set to the choice below. Platform
-						admins moved to a non-provider org will be refused — they need to be
-						demoted first.
-					</DialogDescription>
-				</DialogHeader>
-
-				<div className="space-y-2">
-					<Label htmlFor="bulk-org">Destination</Label>
-					<OrganizationSelect
-						value={orgId}
-						onChange={setOrgId}
-						showGlobal={true}
-						placeholder="Select organization..."
-					/>
-				</div>
-
+		<BulkDialogFrame
+			open={open}
+			onOpenChange={onOpenChange}
+			busy={bulkOp.isPending}
+			title={`Move ${users.length} user(s) to organization`}
+			description="Each user's organization will be set to the choice below. Platform admins moved to a non-provider org will be refused — they need to be demoted first."
+			maxWidthClassName="sm:max-w-xl"
+			footer={
 				<DialogFooter>
-					<Button variant="outline" onClick={() => onOpenChange(false)}>
+					<Button
+						variant="outline"
+						disabled={bulkOp.isPending}
+						onClick={() => onOpenChange(false)}
+						className="h-11"
+					>
 						Cancel
 					</Button>
-					<Button onClick={handleSubmit} disabled={bulkOp.isPending}>
+					<Button
+						onClick={handleSubmit}
+						disabled={bulkOp.isPending || !lookupReady}
+						className="h-11"
+					>
 						{bulkOp.isPending ? "Moving..." : "Move users"}
 					</Button>
 				</DialogFooter>
-			</DialogContent>
-		</Dialog>
+			}
+		>
+			<UserLookupNotice
+				resource="organizations"
+				loading={lookup.isLoading}
+				failed={lookup.isError}
+				retrying={lookup.isFetching}
+				onRetry={() => void lookup.refetch()}
+			/>
+			<div className="space-y-2">
+				<Label htmlFor="bulk-org">Destination</Label>
+				<OrganizationSelect
+					id="bulk-org"
+					disabled={!lookupReady || bulkOp.isPending}
+					value={orgId}
+					onChange={setOrgId}
+					// A move needs authority at the destination too.
+					showGlobal={authorization.canAt(
+						"userlifecycle.readwrite",
+						GLOBAL_TARGET,
+					)}
+					filterOrganizations={(org) =>
+						authorization.canAt("userlifecycle.readwrite", {
+							kind: "org",
+							id: org.id,
+						})
+					}
+					placeholder="Select organization..."
+				/>
+			</div>
+			<BulkSubmitError message={submitError} />
+		</BulkDialogFrame>
 	);
 }
 
@@ -133,7 +281,28 @@ function BulkMoveOrgDialogInner({
 // Replace roles
 // =============================================================================
 
-export function BulkReplaceRolesDialog(props: BulkDialogSharedProps) {
+export interface BulkReplaceRolesDialogProps extends BulkDialogSharedProps {
+	/** Who is selected: people on Users, identities on Identities. */
+	subject?: "users" | "identities";
+}
+
+const REPLACE_ROLES_COPY = {
+	users: {
+		title: (count: number) => `Replace roles for ${count} user(s)`,
+		description:
+			"The selected roles below replace every user's current role set (overwrite, not additive). Your own account will be skipped.",
+		empty: "No roles selected — submitting will clear every selected user's roles.",
+	},
+	identities: {
+		title: (count: number) =>
+			`Replace Roles for ${count} ${count === 1 ? "Identity" : "Identities"}`,
+		description:
+			"The selected roles replace each identity's additional roles (overwrite, not additive), placed in its own organization. Base roles stay.",
+		empty: "No roles selected — submitting will remove every selected identity's additional roles.",
+	},
+};
+
+export function BulkReplaceRolesDialog(props: BulkReplaceRolesDialogProps) {
 	if (!props.open) return null;
 	return <BulkReplaceRolesDialogInner {...props} />;
 }
@@ -144,11 +313,20 @@ function BulkReplaceRolesDialogInner({
 	users,
 	onPartialFailure,
 	onSuccess,
-}: BulkDialogSharedProps) {
+	subject = "users",
+}: BulkReplaceRolesDialogProps) {
+	const copy = REPLACE_ROLES_COPY[subject];
 	const [selected, setSelected] = useState<string[]>([]);
+	const [submitError, setSubmitError] = useState<string | null>(null);
+	const lookup = useRoles();
+	const lookupReady = lookup.data !== undefined && !lookup.isError;
 	const bulkOp = useBulkUserOperation();
+	const submitBusy = useRef(false);
 
 	const handleSubmit = async () => {
+		if (submitBusy.current || !lookupReady) return;
+		setSubmitError(null);
+		submitBusy.current = true;
 		try {
 			const result = (await bulkOp.mutateAsync({
 				body: {
@@ -162,48 +340,64 @@ function BulkReplaceRolesDialogInner({
 			if (result.succeeded.length > 0) onSuccess?.();
 			onOpenChange(false);
 		} catch (e) {
-			toast.error(
-				e instanceof Error ? e.message : "Bulk role replace failed",
-			);
+			const message = getErrorMessage(e, "Bulk role replace failed");
+			setSubmitError(message);
+		} finally {
+			submitBusy.current = false;
 		}
 	};
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="max-w-lg">
-				<DialogHeader>
-					<DialogTitle>Replace roles for {users.length} user(s)</DialogTitle>
-					<DialogDescription>
-						The selected roles below replace every user's current role set
-						(overwrite, not additive). Your own account will be skipped.
-					</DialogDescription>
-				</DialogHeader>
-
-				<div className="space-y-2">
-					<Label htmlFor="bulk-roles">Roles</Label>
-					<RolesMultiSelect value={selected} onChange={setSelected} />
-				</div>
-
-				{selected.length === 0 && (
-					<div className="flex items-start gap-2 text-xs text-muted-foreground">
-						<AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
-						<span>
-							No roles selected — submitting will clear every selected user's
-							roles.
-						</span>
-					</div>
-				)}
-
-				<DialogFooter>
-					<Button variant="outline" onClick={() => onOpenChange(false)}>
+		<BulkDialogFrame
+			open={open}
+			onOpenChange={onOpenChange}
+			busy={bulkOp.isPending}
+			title={copy.title(users.length)}
+			description={copy.description}
+			footer={
+				<DialogFooter className="gap-3">
+					<Button
+						variant="outline"
+						disabled={bulkOp.isPending}
+						onClick={() => onOpenChange(false)}
+						className="h-11"
+					>
 						Cancel
 					</Button>
-					<Button onClick={handleSubmit} disabled={bulkOp.isPending}>
+					<Button
+						onClick={handleSubmit}
+						disabled={bulkOp.isPending || !lookupReady}
+						className="h-11"
+					>
 						{bulkOp.isPending ? "Applying..." : "Replace roles"}
 					</Button>
 				</DialogFooter>
-			</DialogContent>
-		</Dialog>
+			}
+		>
+			<UserLookupNotice
+				resource="roles"
+				loading={lookup.isLoading}
+				failed={lookup.isError}
+				retrying={lookup.isFetching}
+				onRetry={() => void lookup.refetch()}
+			/>
+			<div className="space-y-2">
+				<Label htmlFor="bulk-roles">Roles</Label>
+				<RolesMultiSelect
+					disabled={!lookupReady || bulkOp.isPending}
+					value={selected}
+					onChange={setSelected}
+				/>
+			</div>
+
+			{lookupReady && selected.length === 0 && (
+				<div className="mt-3 flex items-start gap-2 rounded-[var(--bf-radius-surface)] border border-[var(--bf-warning)]/20 bg-[var(--bf-warning-soft)] p-3 text-xs text-[var(--bf-warning)]">
+					<AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+					<span>{copy.empty}</span>
+				</div>
+			)}
+			<BulkSubmitError message={submitError} />
+		</BulkDialogFrame>
 	);
 }
 
@@ -224,8 +418,13 @@ export function BulkSetActiveDialog({
 	onSuccess,
 }: BulkSetActiveDialogProps) {
 	const bulkOp = useBulkUserOperation();
+	const submitBusy = useRef(false);
+	const [submitError, setSubmitError] = useState<string | null>(null);
 
 	const handleSubmit = async () => {
+		if (submitBusy.current) return;
+		setSubmitError(null);
+		submitBusy.current = true;
 		try {
 			const result = (await bulkOp.mutateAsync({
 				body: {
@@ -234,47 +433,62 @@ export function BulkSetActiveDialog({
 					is_active: mode === "enable",
 				},
 			})) as BulkUserResponse;
-			summarize(result, mode === "enable" ? "Enable users" : "Disable users");
+			summarize(
+				result,
+				mode === "enable" ? "Enable users" : "Disable users",
+			);
 			if (result.failed.length > 0) onPartialFailure(result, users);
 			if (result.succeeded.length > 0) onSuccess?.();
 			onOpenChange(false);
 		} catch (e) {
-			toast.error(
-				e instanceof Error ? e.message : "Bulk set-active failed",
-			);
+			const message = getErrorMessage(e, "Bulk set-active failed");
+			setSubmitError(message);
+		} finally {
+			submitBusy.current = false;
 		}
 	};
 
 	const verb = mode === "enable" ? "Enable" : "Disable";
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent>
-				<DialogHeader>
-					<DialogTitle>
-						{verb} {users.length} user(s)
-					</DialogTitle>
-					<DialogDescription>
-						{mode === "disable"
-							? "Disabled users can't log in until re-enabled. Your own account will be skipped."
-							: "Re-enable the selected users so they can log in again."}
-					</DialogDescription>
-				</DialogHeader>
-
-				<DialogFooter>
-					<Button variant="outline" onClick={() => onOpenChange(false)}>
+		<BulkDialogFrame
+			open={open}
+			onOpenChange={onOpenChange}
+			busy={bulkOp.isPending}
+			title={`${verb} ${users.length} user(s)`}
+			description={
+				mode === "disable"
+					? "Disabled users can't log in until re-enabled. Your own account will be skipped."
+					: "Re-enable the selected users so they can log in again."
+			}
+			footer={
+				<DialogFooter className="gap-3">
+					<Button
+						variant="outline"
+						disabled={bulkOp.isPending}
+						onClick={() => onOpenChange(false)}
+						className="h-11"
+					>
 						Cancel
 					</Button>
 					<Button
 						onClick={handleSubmit}
 						disabled={bulkOp.isPending}
 						variant={mode === "disable" ? "destructive" : "default"}
+						className="h-11"
 					>
-						{bulkOp.isPending ? `${verb}ing...` : `${verb} users`}
+						{bulkOp.isPending
+							? mode === "enable"
+								? "Enabling..."
+								: "Disabling..."
+							: `${verb} users`}
 					</Button>
 				</DialogFooter>
-			</DialogContent>
-		</Dialog>
+			}
+		>
+			<div />
+			<BulkSubmitError message={submitError} />
+		</BulkDialogFrame>
 	);
 }
 
@@ -286,7 +500,7 @@ export interface BulkResultDialogProps {
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
 	result: BulkUserResponse | null;
-	users: User[];
+	users: BulkTarget[];
 }
 
 export function BulkResultDialog({
@@ -296,7 +510,7 @@ export function BulkResultDialog({
 	users,
 }: BulkResultDialogProps) {
 	const userById = useMemo(() => {
-		const map = new Map<string, User>();
+		const map = new Map<string, BulkTarget>();
 		for (const u of users) map.set(u.id, u);
 		return map;
 	}, [users]);
@@ -304,35 +518,39 @@ export function BulkResultDialog({
 	if (!result) return null;
 
 	return (
-		<Dialog open={open} onOpenChange={onOpenChange}>
-			<DialogContent className="max-w-lg">
-				<DialogHeader>
-					<DialogTitle>Bulk action results</DialogTitle>
-					<DialogDescription>
-						{result.succeeded.length} succeeded · {result.failed.length} failed
-					</DialogDescription>
-				</DialogHeader>
-
-				<div className="max-h-80 overflow-y-auto rounded-lg ring-1 ring-foreground/5 divide-y">
-					{result.failed.map((f) => {
-						const u = userById.get(f.user_id);
-						return (
-							<div key={f.user_id} className="px-3 py-2 text-sm">
-								<div className="font-medium">
-									{u?.name || u?.email || f.user_id}
-								</div>
-								<div className="text-xs text-muted-foreground">
-									{f.reason}
-								</div>
-							</div>
-						);
-					})}
-				</div>
-
-				<DialogFooter>
-					<Button onClick={() => onOpenChange(false)}>Close</Button>
+		<BulkDialogFrame
+			open={open}
+			onOpenChange={onOpenChange}
+			title="Bulk action results"
+			compact
+			description={`${result.succeeded.length} succeeded · ${result.failed.length} failed`}
+			maxWidthClassName="sm:max-w-lg"
+			footer={
+				<DialogFooter className="gap-3">
+					<Button
+						onClick={() => onOpenChange(false)}
+						className="h-11"
+					>
+						Close
+					</Button>
 				</DialogFooter>
-			</DialogContent>
-		</Dialog>
+			}
+		>
+			<div className="divide-y rounded-[var(--bf-radius-surface)] border border-border/70 bg-background">
+				{result.failed.map((f) => {
+					const u = userById.get(f.user_id);
+					return (
+						<div key={f.user_id} className="px-3 py-3 text-sm">
+							<div className="font-medium">
+								{u?.name || u?.email || f.user_id}
+							</div>
+							<div className="mt-1 text-xs text-muted-foreground">
+								{f.reason}
+							</div>
+						</div>
+					);
+				})}
+			</div>
+		</BulkDialogFrame>
 	);
 }

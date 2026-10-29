@@ -5,16 +5,34 @@ Tests chat conversation and message operations.
 Requires LLM configuration to be set for message sending tests.
 """
 
+import asyncio
 import logging
+from urllib.parse import parse_qs, urlparse
 from uuid import UUID, uuid4
 
 import pytest
 
+from shared.chat_context import store_chat_context_usage
+from src.models.contracts.agents import ChatContextUsage
 from src.models.enums import MessageRole
 from src.models.orm import Conversation, Message
 from src.services.chat_attachments import ChatAttachmentService
 
 logger = logging.getLogger(__name__)
+
+
+async def _set_role_permissions(
+    session_factory, role_id: str, permissions: frozenset[str]
+) -> None:
+    from src.services.role_permissions import set_role_permissions
+
+    async with session_factory() as session:
+        await set_role_permissions(
+            session,
+            role_id=UUID(role_id),
+            permissions=permissions,
+        )
+        await session.commit()
 
 
 # =============================================================================
@@ -206,6 +224,121 @@ class TestChatAttachments:
         missing = e2e_client.get(content_url, headers=platform_admin.headers)
         assert missing.status_code == 404
 
+    def test_sdk_artifacts_surface_keeps_attachments_owner_scoped(
+        self,
+        e2e_client,
+        platform_admin,
+        org1_user,
+        org2_user,
+    ):
+        """A regular user's chat uploads are invisible to another regular
+        user through the SDK artifacts surface (list and read by id), not
+        just through the chat-specific attachment endpoints."""
+        agent = e2e_client.post(
+            "/api/agents",
+            json={
+                "name": f"Owner-scoped attachments agent {org1_user.user_id}",
+                "description": "Agent for owner-scoped attachment E2E testing",
+                "system_prompt": "You are a helpful test assistant.",
+                "channels": ["chat"],
+                "access_level": "private",
+            },
+            headers=org1_user.headers,
+        )
+        assert agent.status_code == 201, agent.text
+        agent_id = agent.json()["id"]
+
+        conversation = e2e_client.post(
+            "/api/chat/conversations",
+            json={
+                "agent_id": agent_id,
+                "channel": "chat",
+                "title": "Owner-scoped attachments",
+            },
+            headers=org1_user.headers,
+        )
+        assert conversation.status_code == 201, conversation.text
+        conversation_id = conversation.json()["id"]
+
+        try:
+            upload = e2e_client.post(
+                f"/api/chat/conversations/{conversation_id}/attachments",
+                files=[("files", ("owner-only.txt", b"owner-only content", "text/plain"))],
+                headers={"Authorization": org1_user.headers["Authorization"]},
+            )
+            assert upload.status_code == 200, upload.text
+            artifact_id = upload.json()["attachments"][0]["id"]
+
+            # Owner can list and read via the SDK surface.
+            owner_list = e2e_client.get(
+                "/api/sdk/artifacts",
+                params={"workspace_id": conversation_id},
+                headers=org1_user.headers,
+            )
+            assert owner_list.status_code == 200, owner_list.text
+            assert any(item["id"] == artifact_id for item in owner_list.json())
+
+            owner_read = e2e_client.get(
+                f"/api/sdk/artifacts/{artifact_id}/content",
+                headers=org1_user.headers,
+            )
+            assert owner_read.status_code == 200, owner_read.text
+
+            # A different regular user gets neither the listing nor the content.
+            other_list = e2e_client.get(
+                "/api/sdk/artifacts",
+                params={"workspace_id": conversation_id},
+                headers=org2_user.headers,
+            )
+            assert other_list.status_code == 200, other_list.text
+            assert other_list.json() == []
+
+            other_read = e2e_client.get(
+                f"/api/sdk/artifacts/{artifact_id}/content",
+                headers=org2_user.headers,
+            )
+            assert other_read.status_code == 404, other_read.text
+        finally:
+            e2e_client.delete(
+                f"/api/chat/conversations/{conversation_id}",
+                headers=org1_user.headers,
+            )
+            e2e_client.delete(f"/api/agents/{agent_id}", headers=org1_user.headers)
+
+    def test_html_attachment_content_is_always_downloaded(
+        self,
+        e2e_client,
+        platform_admin,
+        test_conversation,
+    ):
+        auth_headers = {"Authorization": platform_admin.headers["Authorization"]}
+        upload = e2e_client.post(
+            f"/api/chat/conversations/{test_conversation['id']}/attachments",
+            files=[
+                (
+                    "files",
+                    (
+                        "unsafe.html",
+                        b"<script>alert(1)</script>",
+                        "text/html; charset=utf-8",
+                    ),
+                )
+            ],
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200, upload.text
+        attachment = upload.json()["attachments"][0]
+
+        content = e2e_client.get(
+            f"/api/chat/conversations/{test_conversation['id']}"
+            f"/attachments/{attachment['id']}/content",
+            headers=platform_admin.headers,
+        )
+
+        assert content.status_code == 200, content.text
+        assert content.headers["content-type"] == "text/html; charset=utf-8"
+        assert content.headers["content-disposition"].startswith("attachment;")
+
     def test_sdk_document_artifact_returns_readable_opaque_reference(
         self,
         e2e_client,
@@ -284,6 +417,76 @@ class TestChatAttachments:
         )
         assert workspace.status_code == 200, workspace.text
         assert workspace.json() == [ref]
+
+    def test_sdk_serves_html_artifacts_as_downloads(
+        self,
+        e2e_client,
+        platform_admin,
+    ):
+        upload_headers = {
+            key: value
+            for key, value in platform_admin.headers.items()
+            if key.lower() != "content-type"
+        }
+        stored = e2e_client.post(
+            "/api/sdk/artifacts",
+            files={
+                "file": (
+                    "Unsafe.html",
+                    b"<script>window.parent.location='/settings'</script>",
+                    "text/html; charset=utf-8",
+                )
+            },
+            headers=upload_headers,
+        )
+
+        assert stored.status_code == 200, stored.text
+        content = e2e_client.get(
+            f"/api/sdk/artifacts/{stored.json()['id']}/content",
+            headers=platform_admin.headers,
+        )
+        assert content.status_code == 200, content.text
+        assert content.headers["content-type"] == "text/html; charset=utf-8"
+        assert content.headers["content-disposition"] == "attachment"
+
+        download = e2e_client.get(
+            f"/api/sdk/artifacts/{stored.json()['id']}/download-url",
+            headers=platform_admin.headers,
+        )
+        assert download.status_code == 200, download.text
+        query = parse_qs(urlparse(download.json()["url"]).query)
+        assert query["response-content-type"] == ["application/octet-stream"]
+        assert query["response-content-disposition"] == ["attachment"]
+
+    def test_sdk_serves_browser_active_xml_artifacts_as_downloads(
+        self,
+        e2e_client,
+        platform_admin,
+    ):
+        upload_headers = {
+            key: value
+            for key, value in platform_admin.headers.items()
+            if key.lower() != "content-type"
+        }
+        stored = e2e_client.post(
+            "/api/sdk/artifacts",
+            files={
+                "file": (
+                    "active.xml",
+                    b"<svg></svg>",
+                    "text/xml; charset=utf-8",
+                )
+            },
+            headers=upload_headers,
+        )
+
+        assert stored.status_code == 200, stored.text
+        content = e2e_client.get(
+            f"/api/sdk/artifacts/{stored.json()['id']}/content",
+            headers=platform_admin.headers,
+        )
+        assert content.status_code == 200, content.text
+        assert content.headers["content-disposition"] == "attachment"
 
     @pytest.mark.asyncio
     async def test_artifact_library_lists_renames_and_deletes_owned_files(
@@ -483,6 +686,215 @@ class TestConversationsAccessControl:
             except Exception as cleanup_exc:
                 logger.debug(f"agent cleanup skipped: {cleanup_exc}")
 
+    def test_provider_user_can_explicitly_chat_with_cross_org_agent(
+        self,
+        e2e_client,
+        platform_admin,
+        provider_org_user,
+        org1,
+        async_session_factory,
+    ):
+        """A provider user needs a scoped role grant before cross-org chat works."""
+        role_resp = e2e_client.post(
+            "/api/roles",
+            headers=platform_admin.headers,
+            json={"name": f"Contoso Cross-Org Chat {uuid4().hex[:8]}"},
+        )
+        assert role_resp.status_code == 201, role_resp.text
+        role = role_resp.json()
+        asyncio.run(
+            _set_role_permissions(
+                async_session_factory,
+                role["id"],
+                frozenset({"agents.readbasic", "agents.execute"}),
+            )
+        )
+        agent_resp = e2e_client.post(
+            "/api/agents",
+            json={
+                "name": f"Provider Explicit Target {uuid4().hex[:8]}",
+                "system_prompt": "Test only.",
+                "channels": ["chat"],
+                "access_level": "role_based",
+                "organization_id": org1["id"],
+                "role_ids": [role["id"]],
+            },
+            headers=platform_admin.headers,
+        )
+        assert agent_resp.status_code == 201, agent_resp.text
+        agent = agent_resp.json()
+
+        try:
+            refused = e2e_client.post(
+                "/api/chat/conversations",
+                json={
+                    "agent_id": agent["id"],
+                    "channel": "chat",
+                    "title": "Cross-org chat without grant",
+                },
+                headers=provider_org_user.headers,
+            )
+            assert refused.status_code == 403, refused.text
+
+            assignments = e2e_client.get(
+                f"/api/users/{provider_org_user.user_id}/role-assignments",
+                headers=platform_admin.headers,
+            )
+            assert assignments.status_code == 200, assignments.text
+            current = assignments.json()
+            replacement = e2e_client.put(
+                f"/api/users/{provider_org_user.user_id}/role-assignments",
+                headers=platform_admin.headers,
+                json={
+                    "base_role_id": current["base_role"]["id"],
+                    "additional": [
+                        {
+                            "role_id": assignment["role_id"],
+                            "boundaries": [
+                                {
+                                    "kind": boundary["kind"],
+                                    "organization_id": boundary["organization_id"],
+                                }
+                                for boundary in assignment["boundaries"]
+                            ],
+                        }
+                        for assignment in current["additional"]
+                    ]
+                    + [
+                        {
+                            "role_id": role["id"],
+                            "boundaries": [
+                                {"kind": "organization", "organization_id": org1["id"]}
+                            ],
+                        }
+                    ],
+                },
+            )
+            assert replacement.status_code == 200, replacement.text
+
+            response = e2e_client.post(
+                "/api/chat/conversations",
+                json={
+                    "agent_id": agent["id"],
+                    "channel": "chat",
+                    "title": "Cross-org chat with grant",
+                },
+                headers=provider_org_user.headers,
+            )
+            assert response.status_code == 201, response.text
+            assert response.json()["agent_id"] == agent["id"]
+        finally:
+            e2e_client.delete(
+                f"/api/agents/{agent['id']}",
+                headers=platform_admin.headers,
+            )
+            e2e_client.delete(
+                f"/api/roles/{role['id']}",
+                headers=platform_admin.headers,
+            )
+
+
+# =============================================================================
+# Durable Chat Run Tests
+# =============================================================================
+
+
+class TestDurableChatRuns:
+    """Test the request/replay boundary used by the realtime chat client."""
+
+    @pytest.mark.asyncio
+    async def test_state_restores_latest_request_context_without_accumulating(
+        self,
+        e2e_client,
+        platform_admin,
+        test_conversation,
+        db_session,
+    ):
+        conversation_id = UUID(test_conversation["id"])
+        conversation = await db_session.get(Conversation, conversation_id)
+        assert conversation is not None
+        conversation.extra_data = {"channel_marker": "preserved"}
+        await db_session.commit()
+        profile_id = uuid4()
+        for input_tokens, cache_read_tokens in [(105_000, 78_750), (60_000, 45_000)]:
+            await store_chat_context_usage(
+                db_session,
+                conversation_id,
+                ChatContextUsage(
+                    input_tokens=input_tokens,
+                    context_window=475_000,
+                    cache_read_tokens=cache_read_tokens,
+                    model_profile_id=profile_id,
+                ),
+            )
+            await db_session.commit()
+
+        state = e2e_client.get(
+            f"/api/chat/conversations/{conversation_id}/state",
+            headers=platform_admin.headers,
+        )
+        assert state.status_code == 200, state.text
+        assert state.json()["context_usage"] == {
+            "input_tokens": 60_000,
+            "context_window": 475_000,
+            "cache_read_tokens": 45_000,
+            "model_profile_id": str(profile_id),
+        }
+        await db_session.refresh(conversation)
+        assert conversation.extra_data["channel_marker"] == "preserved"
+
+    def test_submission_is_idempotent_and_state_replays_the_persisted_turn(
+        self,
+        e2e_client,
+        platform_admin,
+        test_conversation,
+    ):
+        run_id = str(uuid4())
+        message_id = str(uuid4())
+        request = {
+            "conversation_id": test_conversation["id"],
+            "client_run_id": run_id,
+            "user_message_id": message_id,
+            "content": "Keep this turn durable while I reconnect.",
+        }
+
+        submitted = e2e_client.post(
+            "/api/chat/runs",
+            json=request,
+            headers=platform_admin.headers,
+        )
+        assert submitted.status_code == 201, submitted.text
+        assert submitted.json()["run_id"] == run_id
+        assert submitted.json()["user_message"]["id"] == message_id
+        assert submitted.json()["idempotent"] is False
+
+        repeated = e2e_client.post(
+            "/api/chat/runs",
+            json=request,
+            headers=platform_admin.headers,
+        )
+        assert repeated.status_code == 201, repeated.text
+        assert repeated.json()["run_id"] == run_id
+        assert repeated.json()["user_message"]["id"] == message_id
+        assert repeated.json()["idempotent"] is True
+
+        conflicting = e2e_client.post(
+            "/api/chat/runs",
+            json={**request, "content": "Reuse the id for a different turn."},
+            headers=platform_admin.headers,
+        )
+        assert conflicting.status_code == 409, conflicting.text
+
+        state = e2e_client.get(
+            f"/api/chat/conversations/{test_conversation['id']}/state",
+            headers=platform_admin.headers,
+        )
+        assert state.status_code == 200, state.text
+        payload = state.json()
+        assert any(message["id"] == message_id for message in payload["messages"])
+        assert any(event["run_id"] == run_id for event in payload["events"])
+        assert payload["latest_sequence"] >= 1
+
 
 # =============================================================================
 # Message Tests
@@ -523,6 +935,35 @@ class TestMessages:
             headers=platform_admin.headers,
         )
         assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_messages_returns_the_latest_window_in_display_order(
+        self,
+        e2e_client,
+        db_session,
+        platform_admin,
+        test_conversation,
+    ):
+        conversation_id = UUID(test_conversation["id"])
+        for sequence in range(1, 106):
+            db_session.add(
+                Message(
+                    conversation_id=conversation_id,
+                    role=MessageRole.USER,
+                    content=f"message {sequence}",
+                    sequence=sequence,
+                )
+            )
+        await db_session.commit()
+
+        response = e2e_client.get(
+            f"/api/chat/conversations/{conversation_id}/messages",
+            headers=platform_admin.headers,
+        )
+        assert response.status_code == 200, response.text
+        assert [message["sequence"] for message in response.json()] == list(
+            range(6, 106)
+        )
 
     def test_send_message_without_llm_config(
         self,

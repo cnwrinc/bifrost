@@ -4,18 +4,16 @@ Executions Router
 Provides access to workflow execution history with filtering capabilities.
 """
 
-import base64
-import json
 import logging
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select, and_, desc, func, or_
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from sqlalchemy import select, and_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import defer, selectinload
+from sqlalchemy.orm import selectinload
 
 # Import existing Pydantic models for API compatibility
 from src.models import (
@@ -27,66 +25,91 @@ from src.models import (
     ExecutionLogPublic,
 )
 from src.models.contracts.executions import (
-    AIUsagePublicSimple,
-    AIUsageTotalsSimple,
-    ExecutionSummary,
     LogsListResponse,
     LogListEntry,
 )
-from src.models.orm.ai_usage import AIUsage
 
 from bifrost._logging import read_logs_from_stream
-from shared.pending_execution import get_pending_execution_fallback
-from src.core.auth import Context, RequirePlatformAdmin
+from shared.sdk_execution_reads import decode_history_cursor
+from src.core.auth import Context
 from src.core.principal import UserPrincipal
 from src.core.log_safety import log_safe
-from src.core.org_filter import resolve_org_filter, OrgFilterType
 from src.core.pubsub import publish_execution_update, publish_history_update
 from src.core.redis_client import get_redis_client
 from src.models import Execution as ExecutionModel
 from src.models import ExecutionLog as ExecutionLogORM
-from src.repositories.execution_logs import ExecutionLogRepository
+from src.repositories.execution_logs import (
+    ExecutionLogRepository,
+    decode_execution_log_cursor,
+)
+from src.services.operation_catalog import operation_route
+from src.services.run_retention.settings import run_not_found_suffix
+from src.services.authorization.enforce import (
+    load_caller,
+    operation_reach,
+    require_operation,
+    user_reach,
+)
+from src.services.authorization.evaluator import GLOBAL
+from src.services.authorization.execution_access import (
+    execution_cancel_allowed,
+    current_execution_read_access,
+    execution_read_access,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/executions", tags=["Executions"])
 
+_EXECUTION_QUERY_PARAM_ALIASES: dict[str, tuple[str, ...]] = {
+    "workflowName": ("workflow_name",),
+    "workflowId": ("workflow_id",),
+    "startDate": ("start_date",),
+    "endDate": ("end_date",),
+    "continuationToken": ("continuation_token",),
+}
 
-# =============================================================================
-# History pagination cursor
-# =============================================================================
-#
-# History pagination is keyset-based: the continuation token names the last
-# row the client saw — (started_at, id) — and the next page is "rows strictly
-# older than that". An offset token ("give me rows 26–50") re-serves the
-# previous page's tail whenever new executions land between page loads, which
-# on a busy instance is every pagination: users stepping into the past see
-# today's rows (and a "Today" day header) at the top of every page.
-
-
-def _encode_history_cursor(started_at: datetime | None, row_id: UUID) -> str:
-    """Encode the last-served row's position as an opaque token."""
-    payload = {
-        "v": 1,
-        "s": started_at.isoformat() if started_at else None,
-        "i": str(row_id),
-    }
-    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+_EXECUTION_QUERY_PARAM_NAMES = {
+    "scope",
+    "workflowName",
+    "workflowId",
+    "status",
+    "startDate",
+    "endDate",
+    "limit",
+    "continuationToken",
+    *{alias for aliases in _EXECUTION_QUERY_PARAM_ALIASES.values() for alias in aliases},
+}
 
 
-def _decode_history_cursor(token: str) -> tuple[datetime | None, UUID] | None:
-    """Decode a keyset cursor; None for legacy offsets or malformed tokens."""
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(token.encode()))
-        if not isinstance(payload, dict) or payload.get("v") != 1:
-            return None
-        raw_started = payload.get("s")
-        started_at = datetime.fromisoformat(raw_started) if raw_started else None
-        return started_at, UUID(payload["i"])
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-        # Not a keyset cursor (legacy numeric offset, or garbage) — the caller
-        # falls back to legacy offset parsing / first page.
+def _query_param(request: Request, name: str) -> str | None:
+    for key in (name, *_EXECUTION_QUERY_PARAM_ALIASES.get(name, ())):
+        value = request.query_params.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _reject_unknown_query_params(request: Request) -> None:
+    unknown = sorted(set(request.query_params.keys()) - _EXECUTION_QUERY_PARAM_NAMES)
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unsupported query parameter(s): {', '.join(unknown)}",
+        )
+
+
+def _validate_iso_date_filter(value: str | None, name: str) -> str | None:
+    if value is None:
         return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{name} must be an ISO 8601 date-time",
+        ) from exc
+    return value
 
 
 # =============================================================================
@@ -94,323 +117,11 @@ def _decode_history_cursor(token: str) -> tuple[datetime | None, UUID] | None:
 # =============================================================================
 
 
-class ExecutionRepository:
-    """PostgreSQL-based execution repository."""
+class ExecutionReadAdapter:
+    """HTTP-specific execution detail and cancellation reads."""
 
     def __init__(self, db: AsyncSession):
         self.db = db
-
-    async def list_executions(
-        self,
-        user: UserPrincipal,
-        org_id: UUID | None,
-        workflow_name: str | None = None,
-        workflow_id: UUID | None = None,
-        status_filter: str | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-        exclude_local: bool = True,
-        limit: int = 25,
-        offset: int = 0,
-        cursor: tuple[datetime | None, UUID] | None = None,
-    ) -> tuple[list[ExecutionSummary], str | None]:
-        """List executions with filtering.
-
-        `cursor` is the keyset position (last row's started_at + id); `offset`
-        is only honored for legacy numeric tokens still in flight from before
-        the keyset change. New continuation tokens are always keyset.
-        """
-        query = select(ExecutionModel).options(
-            selectinload(ExecutionModel.organization),
-            selectinload(ExecutionModel.executed_by_user),
-            defer(ExecutionModel.parameters, raiseload=True),
-            defer(ExecutionModel.result, raiseload=True),
-            defer(ExecutionModel.variables, raiseload=True),
-            defer(ExecutionModel.execution_context, raiseload=True),
-        )
-
-        # Organization scoping
-        if org_id:
-            query = query.where(ExecutionModel.organization_id == org_id)
-
-        # Non-superusers can only see their own executions
-        if not user.is_superuser:
-            query = query.where(ExecutionModel.executed_by == user.user_id)
-
-        # Filters
-        if workflow_id:
-            query = query.where(ExecutionModel.workflow_id == workflow_id)
-        elif workflow_name:
-            query = query.where(ExecutionModel.workflow_name == workflow_name)
-
-        if status_filter:
-            # Comma-separated values match any of the listed statuses, so the
-            # UI's Failed tab can ask for the whole failure group
-            # (Failed,Timeout,Stuck,CompletedWithErrors) in one server-side
-            # filter. A single value behaves exactly as before.
-            statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
-            query = query.where(ExecutionModel.status.in_(statuses))
-
-        if start_date:
-            try:
-                start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-                # Strip timezone for naive datetime comparison (DB stores UTC without tz)
-                if start_dt.tzinfo is not None:
-                    start_dt = start_dt.replace(tzinfo=None)
-                query = query.where(ExecutionModel.started_at >= start_dt)
-            except ValueError as e:
-                # Caller passed an invalid ISO date — silently ignore the filter
-                logger.debug(f"invalid start_date {log_safe(start_date)!r}, ignoring filter: {log_safe(e)}")
-
-        if end_date:
-            try:
-                end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                # Strip timezone for naive datetime comparison (DB stores UTC without tz)
-                if end_dt.tzinfo is not None:
-                    end_dt = end_dt.replace(tzinfo=None)
-                query = query.where(ExecutionModel.started_at <= end_dt)
-            except ValueError as e:
-                # Caller passed an invalid ISO date — silently ignore the filter
-                logger.debug(f"invalid end_date {log_safe(end_date)!r}, ignoring filter: {log_safe(e)}")
-
-        # Exclude local runner executions by default
-        if exclude_local:
-            query = query.where(ExecutionModel.is_local_execution == False)  # noqa: E712
-
-        # Order newest first with an id tiebreaker so the order is total:
-        # never-started rows (Scheduled/Pending, NULL started_at) sort first
-        # deterministically instead of "arbitrarily on the server" per page.
-        query = query.order_by(
-            desc(ExecutionModel.started_at).nulls_first(),
-            desc(ExecutionModel.id),
-        )
-
-        # Pagination: keyset when the caller has a cursor, legacy offset
-        # otherwise (first page, or an old numeric token still in flight).
-        if cursor is not None:
-            cursor_started, cursor_id = cursor
-            if cursor_started is None:
-                # Last row served was in the leading NULL block: continue
-                # through older NULL rows, then everything started.
-                query = query.where(
-                    or_(
-                        and_(
-                            ExecutionModel.started_at.is_(None),
-                            ExecutionModel.id < cursor_id,
-                        ),
-                        ExecutionModel.started_at.is_not(None),
-                    )
-                )
-            else:
-                # Strictly older than the cursor row. Excludes the NULL block
-                # (already served on page one) — new Scheduled rows don't
-                # inject themselves into the middle of a pagination either.
-                query = query.where(
-                    and_(
-                        ExecutionModel.started_at.is_not(None),
-                        or_(
-                            ExecutionModel.started_at < cursor_started,
-                            and_(
-                                ExecutionModel.started_at == cursor_started,
-                                ExecutionModel.id < cursor_id,
-                            ),
-                        ),
-                    )
-                )
-        elif offset:
-            query = query.offset(offset)
-
-        query = query.limit(limit + 1)  # +1 to check for more
-
-        result = await self.db.execute(query)
-        executions = list(result.scalars().all())
-
-        # Check if there are more results
-        has_more = len(executions) > limit
-        if has_more:
-            executions = executions[:limit]
-
-        # Continuation token: keyset position of the last row served.
-        next_token = None
-        if has_more and executions:
-            last = executions[-1]
-            next_token = _encode_history_cursor(last.started_at, last.id)
-
-        return [ExecutionRepository._to_summary(e) for e in executions], next_token
-
-    async def get_execution(
-        self,
-        execution_id: UUID,
-        user: UserPrincipal,
-    ) -> tuple[WorkflowExecution | None, str | None]:
-        """
-        Get execution by ID with authorization.
-
-        Returns all execution details including logs (with DEBUG filtered for non-admins),
-        and admin-only fields (variables, resource metrics).
-
-        Returns:
-            Tuple of (execution, error_code) where error_code is None on success
-        """
-        # 1. Fetch base execution with organization for effective scope display
-        result = await self.db.execute(
-            select(ExecutionModel)
-            .options(selectinload(ExecutionModel.organization), selectinload(ExecutionModel.executed_by_user))
-            .where(ExecutionModel.id == execution_id)
-        )
-        execution = result.scalar_one_or_none()
-
-        if not execution:
-            return None, "NotFound"
-
-        # Check authorization - non-superusers can only see their own
-        if not user.is_superuser and execution.executed_by != user.user_id:
-            return None, "Forbidden"
-
-        # 2. Fetch logs — dual-read: Redis Stream when in-progress, DB when complete
-        is_in_progress = execution.status in (
-            ExecutionStatus.PENDING, ExecutionStatus.RUNNING, ExecutionStatus.CANCELLING,
-        )
-        logs: list[ExecutionLogPublic] = []
-
-        if is_in_progress:
-            # Read from Redis Stream (logs haven't been flushed to DB yet)
-            try:
-                stream_logs = await read_logs_from_stream(str(execution_id), count=10000)
-                hidden_levels = set() if user.is_superuser else {"DEBUG", "TRACEBACK"}
-                for seq, slog in enumerate(stream_logs):
-                    level = (slog.level or "INFO").upper()
-                    if level in hidden_levels:
-                        continue
-                    logs.append(ExecutionLogPublic(
-                        id=seq,
-                        timestamp=slog.timestamp or "",
-                        level=level.lower(),
-                        message=slog.message or "",
-                        data=slog.metadata if isinstance(slog.metadata, dict) else None,
-                        sequence=seq,
-                    ))
-            except Exception:
-                logger.warning(f"Failed to read logs from Redis for execution {log_safe(execution_id)}, falling back to DB")
-                is_in_progress = False  # Fall through to DB read below
-
-        if not is_in_progress:
-            # Completed — read from Postgres
-            logs_query = (
-                select(ExecutionLogORM)
-                .where(ExecutionLogORM.execution_id == execution_id)
-                .order_by(ExecutionLogORM.sequence)
-            )
-            if not user.is_superuser:
-                logs_query = logs_query.where(
-                    ExecutionLogORM.level.notin_(["DEBUG", "TRACEBACK"])
-                )
-            logs_result = await self.db.execute(logs_query)
-            log_entries = logs_result.scalars().all()
-
-            logs = [
-                ExecutionLogPublic(
-                    id=log.id,
-                    timestamp=log.timestamp.isoformat() if log.timestamp else "",
-                    level=log.level or "info",
-                    message=log.message or "",
-                    data=log.log_metadata,
-                    sequence=log.sequence,
-                )
-                for log in log_entries
-            ]
-
-        # 3. Fetch AI usage data
-        ai_usage_query = (
-            select(AIUsage)
-            .where(AIUsage.execution_id == execution_id)
-            .order_by(AIUsage.sequence)
-        )
-        ai_usage_result = await self.db.execute(ai_usage_query)
-        ai_usage_entries = ai_usage_result.scalars().all()
-
-        ai_usage_list = [
-            AIUsagePublicSimple(
-                provider=entry.provider,
-                model=entry.model,
-                input_tokens=entry.input_tokens,
-                output_tokens=entry.output_tokens,
-                cache_read_tokens=entry.cache_read_tokens,
-                cache_write_tokens=entry.cache_write_tokens,
-                provider_cost=(str(entry.provider_cost) if entry.provider_cost is not None else None),
-                cost=str(entry.cost) if entry.cost else None,
-                duration_ms=entry.duration_ms,
-                timestamp=entry.timestamp.isoformat() if entry.timestamp else "",
-                sequence=entry.sequence,
-            )
-            for entry in ai_usage_entries
-        ]
-
-        # 4. Calculate AI usage totals
-        ai_totals = None
-        if ai_usage_entries:
-            totals_query = select(
-                func.coalesce(func.sum(AIUsage.input_tokens), 0).label("total_input"),
-                func.coalesce(func.sum(AIUsage.output_tokens), 0).label("total_output"),
-                func.coalesce(func.sum(AIUsage.cache_read_tokens), 0).label("total_cache_read"),
-                func.coalesce(func.sum(AIUsage.cache_write_tokens), 0).label("total_cache_write"),
-                func.coalesce(func.sum(AIUsage.provider_cost), Decimal("0")).label("total_provider_cost"),
-                func.coalesce(func.sum(AIUsage.cost), Decimal("0")).label("total_cost"),
-                func.coalesce(func.sum(AIUsage.duration_ms), 0).label("total_duration"),
-                func.count(AIUsage.id).label("call_count"),
-            ).where(AIUsage.execution_id == execution_id)
-
-            totals_result = await self.db.execute(totals_query)
-            totals_row = totals_result.one()
-
-            ai_totals = AIUsageTotalsSimple(
-                total_input_tokens=int(totals_row.total_input or 0),
-                total_output_tokens=int(totals_row.total_output or 0),
-                total_cache_read_tokens=int(totals_row.total_cache_read or 0),
-                total_cache_write_tokens=int(totals_row.total_cache_write or 0),
-                total_provider_cost=str(totals_row.total_provider_cost or Decimal("0")),
-                total_cost=str(totals_row.total_cost or Decimal("0")),
-                total_duration_ms=int(totals_row.total_duration or 0),
-                call_count=int(totals_row.call_count or 0),
-            )
-
-        # 5. Build response with conditional admin-only fields
-        # Determine org_name for effective scope display
-        if execution.organization_id:
-            org_name = execution.organization.name if execution.organization else None
-        else:
-            org_name = "Global"
-
-        return WorkflowExecution(
-            execution_id=str(execution.id),
-            workflow_name=execution.workflow_name,
-            workflow_id=str(execution.workflow_id) if execution.workflow_id else None,
-            org_id=str(execution.organization_id) if execution.organization_id else None,
-            org_name=org_name,
-            form_id=str(execution.form_id) if execution.form_id else None,
-            executed_by=str(execution.executed_by),
-            executed_by_name=execution.executed_by_name or str(execution.executed_by),
-            executed_by_email=execution.executed_by_user.email if execution.executed_by_user else None,
-            status=ExecutionStatus(execution.status),
-            input_data=execution.parameters or {},
-            result=execution.result,
-            result_type=execution.result_type,
-            error_message=execution.error_message,
-            duration_ms=execution.duration_ms,
-            started_at=execution.started_at,
-            completed_at=execution.completed_at,
-            scheduled_at=execution.scheduled_at,
-            logs=[log.model_dump() for log in logs],
-            # Admin-only fields (null for non-admins)
-            variables=execution.variables if user.is_superuser else None,
-            execution_context=execution.execution_context if user.is_superuser else None,
-            peak_memory_bytes=execution.peak_memory_bytes if user.is_superuser else None,
-            process_rss_bytes=execution.process_rss_bytes if user.is_superuser else None,
-            cpu_total_seconds=execution.cpu_total_seconds if user.is_superuser else None,
-            # AI usage tracking (available to all users)
-            ai_usage=ai_usage_list if ai_usage_list else None,
-            ai_totals=ai_totals,
-        ), None
 
     async def get_execution_result(
         self,
@@ -423,6 +134,9 @@ class ExecutionRepository:
                 ExecutionModel.result,
                 ExecutionModel.result_type,
                 ExecutionModel.executed_by,
+                ExecutionModel.started_by_user_id,
+                ExecutionModel.root_execution_id,
+                ExecutionModel.organization_id,
             ).where(ExecutionModel.id == execution_id)
         )
         row = result.one_or_none()
@@ -430,7 +144,15 @@ class ExecutionRepository:
         if not row:
             return None, "NotFound"
 
-        if not user.is_superuser and row.executed_by != user.user_id:
+        caller = await load_caller(self.db, user)
+        subject = SimpleNamespace(
+            id=execution_id,
+            executed_by=row.executed_by,
+            started_by_user_id=row.started_by_user_id,
+            root_execution_id=row.root_execution_id,
+            organization_id=row.organization_id,
+        )
+        if not (await current_execution_read_access(caller, subject)).visible:
             return None, "Forbidden"
 
         return {"result": row.result, "result_type": row.result_type}, None
@@ -443,7 +165,13 @@ class ExecutionRepository:
         """Get execution logs — dual-read from Redis Stream when in-progress, DB when complete."""
         # Check if execution exists, user has access, and get status
         result = await self.db.execute(
-            select(ExecutionModel.executed_by, ExecutionModel.status)
+            select(
+                ExecutionModel.executed_by,
+                ExecutionModel.started_by_user_id,
+                ExecutionModel.root_execution_id,
+                ExecutionModel.status,
+                ExecutionModel.organization_id,
+            )
             .where(ExecutionModel.id == execution_id)
         )
         row = result.one_or_none()
@@ -451,7 +179,16 @@ class ExecutionRepository:
         if not row:
             return None, "NotFound"
 
-        if not user.is_superuser and row.executed_by != user.user_id:
+        caller = await load_caller(self.db, user)
+        subject = SimpleNamespace(
+            id=execution_id,
+            executed_by=row.executed_by,
+            started_by_user_id=row.started_by_user_id,
+            root_execution_id=row.root_execution_id,
+            organization_id=row.organization_id,
+        )
+        access = await current_execution_read_access(caller, subject)
+        if not access.visible:
             return None, "Forbidden"
 
         is_in_progress = row.status in (
@@ -462,7 +199,7 @@ class ExecutionRepository:
             # Read from Redis Stream
             try:
                 stream_logs = await read_logs_from_stream(str(execution_id), count=10000)
-                hidden_levels = set() if user.is_superuser else {"DEBUG", "TRACEBACK"}
+                hidden_levels = set() if access.diagnostics else {"DEBUG", "TRACEBACK"}
                 logs: list[ExecutionLogPublic] = []
                 for seq, slog in enumerate(stream_logs):
                     level = (slog.level or "INFO").upper()
@@ -484,9 +221,9 @@ class ExecutionRepository:
         logs_query = (
             select(ExecutionLogORM)
             .where(ExecutionLogORM.execution_id == execution_id)
-            .order_by(ExecutionLogORM.sequence)
+            .order_by(ExecutionLogORM.sequence, ExecutionLogORM.id)
         )
-        if not user.is_superuser:
+        if not access.diagnostics:
             logs_query = logs_query.where(ExecutionLogORM.level.notin_(["DEBUG", "TRACEBACK"]))
 
         logs_result = await self.db.execute(logs_query)
@@ -511,22 +248,28 @@ class ExecutionRepository:
         execution_id: UUID,
         user: UserPrincipal,
     ) -> tuple[dict | None, str | None]:
-        """Get execution variables (platform admin only)."""
-        if not user.is_superuser:
-            return None, "Forbidden"
-
-        # Select id and variables to distinguish "not found" from "null variables"
+        """Get execution variables when the caller has diagnostic access."""
+        # Select lineage and org to distinguish "not found" from "null variables"
         result = await self.db.execute(
-            select(ExecutionModel.id, ExecutionModel.variables)
+            select(
+                ExecutionModel.id,
+                ExecutionModel.variables,
+                ExecutionModel.executed_by,
+                ExecutionModel.started_by_user_id,
+                ExecutionModel.root_execution_id,
+                ExecutionModel.organization_id,
+            )
             .where(ExecutionModel.id == execution_id)
         )
         row = result.one_or_none()
 
         if row is None:
             return None, "NotFound"
+        caller = await load_caller(self.db, user)
+        if not (await current_execution_read_access(caller, row)).diagnostics:
+            return None, "Forbidden"
 
-        # row is a tuple of (id, variables)
-        return row[1] or {}, None
+        return row.variables or {}, None
 
     async def cancel_execution(
         self,
@@ -538,18 +281,20 @@ class ExecutionRepository:
             select(ExecutionModel)
             .options(selectinload(ExecutionModel.organization), selectinload(ExecutionModel.executed_by_user))
             .where(ExecutionModel.id == execution_id)
+            .with_for_update()
         )
         execution = result.scalar_one_or_none()
 
         if not execution:
             return None, "NotFound"
 
-        if not user.is_superuser and execution.executed_by != user.user_id:
+        caller = await load_caller(self.db, user)
+        if not execution_cancel_allowed(caller, execution):
             return None, "Forbidden"
 
         # Already cancelled or cancelling - idempotent success
         if execution.status in [ExecutionStatus.CANCELLING.value, ExecutionStatus.CANCELLED.value]:
-            return self._to_pydantic(execution, user), None
+            return self._to_pydantic(execution, execution_read_access(caller, execution).diagnostics), None
 
         # Can only cancel pending or running executions
         if execution.status not in [ExecutionStatus.PENDING.value, ExecutionStatus.RUNNING.value]:
@@ -565,9 +310,20 @@ class ExecutionRepository:
         execution.status = new_status  # type: ignore[assignment]
 
         await self.db.flush()
-        await self.db.refresh(execution)
+        # Persist the status before readers receive a canonical queue snapshot.
+        await self.db.commit()
 
-        # Publish update
+        if new_status == ExecutionStatus.CANCELLED.value:
+            from src.services.execution.queue_tracker import publish_queue_positions
+
+            try:
+                await publish_queue_positions()
+            except Exception:
+                logger.warning(
+                    "Could not publish queue positions after cancellation",
+                    exc_info=True,
+                )
+
         await publish_execution_update(
             execution_id=execution_id,
             status=new_status,
@@ -582,7 +338,7 @@ class ExecutionRepository:
             started_at=execution.started_at,
         )
 
-        return self._to_pydantic(execution, user), None
+        return self._to_pydantic(execution, execution_read_access(caller, execution).diagnostics), None
 
     @staticmethod
     def _org_name(execution: ExecutionModel) -> str | None:
@@ -593,36 +349,8 @@ class ExecutionRepository:
             return None  # Will be populated by caller if needed
         return "Global"  # No org_id means global scope
 
-    @staticmethod
-    def _to_summary(execution: ExecutionModel) -> ExecutionSummary:
-        """Convert SQLAlchemy model to the payload-free list model.
-
-        Must only touch columns the list query loads — the payload columns
-        (parameters/result/variables/execution_context) are deferred with
-        raiseload=True so History never selects or serializes them.
-        """
-        return ExecutionSummary(
-            execution_id=str(execution.id),
-            workflow_name=execution.workflow_name,
-            workflow_id=str(execution.workflow_id) if execution.workflow_id else None,
-            org_id=str(execution.organization_id) if execution.organization_id else None,
-            org_name=ExecutionRepository._org_name(execution),
-            form_id=str(execution.form_id) if execution.form_id else None,
-            executed_by=str(execution.executed_by),
-            executed_by_name=execution.executed_by_name or str(execution.executed_by),
-            executed_by_email=execution.executed_by_user.email if hasattr(execution, 'executed_by_user') and execution.executed_by_user else None,
-            status=ExecutionStatus(execution.status),
-            result_type=execution.result_type,
-            error_message=execution.error_message,
-            duration_ms=execution.duration_ms,
-            started_at=execution.started_at,
-            completed_at=execution.completed_at,
-            scheduled_at=execution.scheduled_at,
-            session_id=str(execution.session_id) if execution.session_id else None,
-        )
-
     def _to_pydantic(
-        self, execution: ExecutionModel, user: UserPrincipal | None = None
+        self, execution: ExecutionModel, diagnostics: bool = False
     ) -> WorkflowExecution:
         """Convert SQLAlchemy model to Pydantic model.
 
@@ -631,11 +359,8 @@ class ExecutionRepository:
 
         Args:
             execution: The SQLAlchemy execution model
-            user: Optional user for permission checks. If provided, admin-only
-                  fields (variables) are gated based on is_superuser.
+            diagnostics: Whether the caller may receive diagnostic-only fields.
         """
-        is_admin = user.is_superuser if user else False
-
         return WorkflowExecution(
             execution_id=str(execution.id),
             workflow_name=execution.workflow_name,
@@ -655,10 +380,10 @@ class ExecutionRepository:
             started_at=execution.started_at,
             completed_at=execution.completed_at,
             scheduled_at=execution.scheduled_at,
+            created_at=execution.created_at,
             logs=None,  # Fetched separately via /logs endpoint
-            variables=execution.variables if is_admin else None,
-            execution_context=execution.execution_context if is_admin else None,
-            session_id=str(execution.session_id) if execution.session_id else None,
+            variables=execution.variables if diagnostics else None,
+            execution_context=execution.execution_context if diagnostics else None,
         )
 
 
@@ -672,77 +397,92 @@ class ExecutionRepository:
     response_model=ExecutionsListResponse,
     summary="List workflow executions",
     description="List workflow executions with filtering and pagination",
-)
+**operation_route("executions.list"))
 async def list_executions(
     ctx: Context,
+    request: Request,
     scope: str | None = Query(
         None,
-        description="Filter scope: omit for all (superusers), 'global' for global only, "
-        "or org UUID for specific org + global."
+        description="Filter scope: omit for all reachable executions, 'global' for global only, "
+        "or an organization UUID for that organization only."
     ),
     workflowName: str | None = Query(None, description="Filter by workflow name"),
     workflowId: str | None = Query(None, description="Filter by workflow UUID"),
     status_filter: str | None = Query(None, alias="status", description="Filter by execution status (comma-separated values match any)"),
     startDate: str | None = Query(None, description="Filter by start date (ISO format)"),
     endDate: str | None = Query(None, description="Filter by end date (ISO format)"),
-    excludeLocal: bool = Query(True, description="Exclude local runner executions"),
     limit: int = Query(25, ge=1, le=1000, description="Maximum number of results"),
     continuationToken: str | None = Query(None, description="Continuation token"),
 ) -> ExecutionsListResponse:
     """List workflow executions.
 
-    Superusers can filter by scope or see all executions.
-    Org users see only their organization's executions.
+    The original user sees own reachable executions. Read All Executions adds
+    reachable others' executions; explicit scope only narrows that set.
     """
-    # Resolve organization filter based on user permissions
-    try:
-        filter_type, filter_org = resolve_org_filter(ctx.user, scope)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
-        )
+    from shared.sdk_execution_reads import SdkExecutionReadError, list_sdk_executions
 
-    # For executions, we only use filter_org (global executions don't really make sense)
-    # If filter_type is ALL, filter_org will be None (show all)
-    # If filter_type is GLOBAL_ONLY, we still use None (executions always have an org)
-    # If filter_type is ORG_ONLY or ORG_PLUS_GLOBAL, we filter to that org
-    if filter_type in (OrgFilterType.ORG_ONLY, OrgFilterType.ORG_PLUS_GLOBAL):
-        org_filter = filter_org
-    else:
-        org_filter = None  # Show all (no org filter)
-
-    repo = ExecutionRepository(ctx.db)
+    _reject_unknown_query_params(request)
 
     # Parse continuation token: keyset cursor, with legacy numeric-offset
     # fallback for tokens minted before the keyset change.
     offset = 0
     cursor = None
-    if continuationToken:
-        cursor = _decode_history_cursor(continuationToken)
+    continuation_token = _query_param(request, "continuationToken") or continuationToken
+    if continuation_token:
+        cursor = decode_history_cursor(continuation_token)
         if cursor is None:
             try:
-                offset = int(continuationToken)
-            except ValueError as e:
-                # Malformed continuation token — start from beginning
-                logger.debug(f"invalid continuationToken {log_safe(continuationToken)!r}, starting from offset 0: {log_safe(e)}")
+                offset = int(continuation_token)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="continuationToken is invalid",
+                ) from exc
+            if offset < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="continuationToken is invalid",
+                )
 
     # Parse workflowId to UUID if provided
-    parsed_workflow_id = UUID(workflowId) if workflowId else None
+    workflow_id_value = _query_param(request, "workflowId") or workflowId
+    try:
+        parsed_workflow_id = UUID(workflow_id_value) if workflow_id_value else None
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="workflowId must be a UUID",
+        ) from exc
 
-    executions, next_token = await repo.list_executions(
-        user=ctx.user,
-        org_id=org_filter,
-        workflow_name=workflowName,
-        workflow_id=parsed_workflow_id,
-        status_filter=status_filter,
-        start_date=startDate,
-        end_date=endDate,
-        exclude_local=excludeLocal,
-        limit=limit,
-        offset=offset,
-        cursor=cursor,
+    start_date_value = _validate_iso_date_filter(
+        _query_param(request, "startDate") or startDate,
+        "startDate",
     )
+    end_date_value = _validate_iso_date_filter(
+        _query_param(request, "endDate") or endDate,
+        "endDate",
+    )
+    workflow_name_value = _query_param(request, "workflowName") or workflowName
+
+    try:
+        executions, next_token = await list_sdk_executions(
+            ctx.db,
+            ctx.user,
+            scope=scope,
+            workflow_name=workflow_name_value,
+            workflow_id=parsed_workflow_id,
+            status_filter=status_filter,
+            start_date=start_date_value,
+            end_date=end_date_value,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+    except SdkExecutionReadError as e:
+        raise HTTPException(
+            status_code=e.status_code,
+            detail=e.detail,
+        )
 
     return ExecutionsListResponse(
         executions=executions,
@@ -753,13 +493,14 @@ async def list_executions(
 @router.get(
     "/logs",
     response_model=LogsListResponse,
-    summary="List execution logs (admin only)",
-    description="List logs across all executions with filtering and pagination. Admin only.",
-    dependencies=[RequirePlatformAdmin],
+    summary="List execution logs",
+    description="List reachable execution logs with filtering and pagination.",
 )
 async def list_logs(
     ctx: Context,
     organization_id: UUID | None = Query(None, description="Filter by organization"),
+    global_only: bool = Query(False, description="Include only global executions"),
+    workflow_id: UUID | None = Query(None, description="Filter by exact workflow ID"),
     workflow_name: str | None = Query(None, description="Filter by workflow name (partial match)"),
     levels: str | None = Query(None, description="Comma-separated log levels (e.g., ERROR,WARNING)"),
     message_search: str | None = Query(None, description="Search in log message content"),
@@ -768,15 +509,33 @@ async def list_logs(
     limit: int = Query(50, ge=1, le=500, description="Number of logs per page"),
     continuation_token: str | None = Query(None, description="Pagination token"),
 ) -> LogsListResponse:
-    """List logs across all executions (admin only)."""
-    # Parse continuation token as offset
+    """List diagnostic logs where the caller holds scoped Read All."""
+    caller = await load_caller(ctx.db, ctx.user)
+    read_all_reach = operation_reach(caller, "GET /api/executions/logs")
+    if read_all_reach.is_empty:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to view execution logs",
+        )
+    # Parse continuation token: keyset cursor, with legacy numeric-offset
+    # fallback for tokens minted before the keyset change.
     offset = 0
+    cursor = None
     if continuation_token:
-        try:
-            offset = int(continuation_token)
-        except ValueError as e:
-            # Malformed continuation token — start from beginning
-            logger.debug(f"invalid continuation_token {log_safe(continuation_token)!r}, starting from offset 0: {log_safe(e)}")
+        cursor = decode_execution_log_cursor(continuation_token)
+        if cursor is None:
+            try:
+                offset = int(continuation_token)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="continuation_token is invalid",
+                ) from exc
+            if offset < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="continuation_token is invalid",
+                )
 
     # Parse levels
     level_list = None
@@ -796,12 +555,16 @@ async def list_logs(
     logs, next_token = await logs_repo.list_logs(
         organization_id=organization_id,
         workflow_name=workflow_name,
+        workflow_id=workflow_id,
+        global_only=global_only,
         levels=level_list,
         message_search=message_search,
         start_date=parsed_start,
         end_date=parsed_end,
         limit=limit,
         offset=offset,
+        cursor=cursor,
+        organization_reaches=(user_reach(caller), read_all_reach),
     )
 
     return LogsListResponse(
@@ -815,34 +578,28 @@ async def list_logs(
     response_model=WorkflowExecution,
     summary="Get execution details",
     description="Get detailed information about a specific execution",
-)
+**operation_route("executions.get"))
 async def get_execution(
     execution_id: UUID,
     ctx: Context,
 ) -> WorkflowExecution:
     """Get execution details."""
-    repo = ExecutionRepository(ctx.db)
-    execution, error = await repo.get_execution(execution_id, ctx.user)
+    from shared.sdk_execution_reads import SdkExecutionReadError, get_sdk_execution
 
-    if error == "NotFound":
-        execution, error = await get_pending_execution_fallback(
-            execution_id,
-            ctx.user,
-            ctx.db,
-        )
-
-    if error == "Forbidden":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You do not have permission to view this execution",
-        )
-
-    if execution is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Execution {execution_id} not found",
-        )
-    return execution
+    try:
+        return await get_sdk_execution(ctx.db, ctx.user, execution_id)
+    except SdkExecutionReadError as e:
+        if e.status_code == 403:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to view this execution",
+            )
+        if e.status_code == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Execution {execution_id} not found." + await run_not_found_suffix(ctx.db),
+            )
+        raise
 
 
 @router.get(
@@ -855,13 +612,13 @@ async def get_execution_result(
     ctx: Context,
 ) -> Any:
     """Get execution result."""
-    repo = ExecutionRepository(ctx.db)
+    repo = ExecutionReadAdapter(ctx.db)
     result, error = await repo.get_execution_result(execution_id, ctx.user)
 
     if error == "NotFound":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Execution {execution_id} not found",
+            detail=f"Execution {execution_id} not found." + await run_not_found_suffix(ctx.db),
         )
     elif error == "Forbidden":
         raise HTTPException(
@@ -883,13 +640,13 @@ async def get_execution_logs(
     ctx: Context,
 ) -> list[ExecutionLogPublic]:
     """Get execution logs."""
-    repo = ExecutionRepository(ctx.db)
+    repo = ExecutionReadAdapter(ctx.db)
     logs, error = await repo.get_execution_logs(execution_id, ctx.user)
 
     if error == "NotFound":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Execution {execution_id} not found",
+            detail=f"Execution {execution_id} not found." + await run_not_found_suffix(ctx.db),
         )
     elif error == "Forbidden":
         raise HTTPException(
@@ -903,25 +660,25 @@ async def get_execution_logs(
 @router.get(
     "/{execution_id}/variables",
     summary="Get execution variables only",
-    description="Get only the variables of a specific execution (platform admin only)",
+    description="Get only the variables of a specific execution (requires Read Executions)",
 )
 async def get_execution_variables(
     execution_id: UUID,
     ctx: Context,
 ) -> dict:
     """Get execution variables."""
-    repo = ExecutionRepository(ctx.db)
+    repo = ExecutionReadAdapter(ctx.db)
     variables, error = await repo.get_execution_variables(execution_id, ctx.user)
 
     if error == "NotFound":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Execution {execution_id} not found",
+            detail=f"Execution {execution_id} not found." + await run_not_found_suffix(ctx.db),
         )
     elif error == "Forbidden":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Platform admin privileges required",
+            detail="You do not have permission to view execution diagnostics",
         )
 
     return variables or {}
@@ -929,29 +686,23 @@ async def get_execution_variables(
 
 @router.post(
     "/{execution_id}/cancel",
-    response_model=WorkflowExecution | dict,
+    response_model=WorkflowExecution,
     summary="Cancel execution",
     description="Cancel a pending or running execution",
 )
 async def cancel_execution(
     execution_id: UUID,
     ctx: Context,
-) -> WorkflowExecution | dict:
+) -> WorkflowExecution:
     """
     Cancel an execution.
 
-    With Redis-first architecture, the execution may be in one of three states:
-    1. In Redis pending only (worker hasn't picked it up yet)
-    2. In PostgreSQL as Running (worker is executing)
-    3. In PostgreSQL as completed (already done - return error)
-
-    We handle all cases by:
-    1. First check PostgreSQL for authorization and status
-    2. If found and Running/Pending, set Redis cancel flag for pool
-    3. If not in PostgreSQL yet, try to cancel Redis pending record
+    A pending run is cancelled in PostgreSQL directly; nothing has claimed it.
+    A running run becomes Cancelling, and the Redis cancel flag and event tell
+    the executor's pool to terminate it.
     """
     redis_client = get_redis_client()
-    repo = ExecutionRepository(ctx.db)
+    repo = ExecutionReadAdapter(ctx.db)
 
     # First, try to find in PostgreSQL to check authorization
     execution, error = await repo.cancel_execution(execution_id, ctx.user)
@@ -980,21 +731,6 @@ async def cancel_execution(
             logger.info(f"Execution {log_safe(execution_id)} was PENDING, cancelled directly in DB")
         return execution
 
-    # Not found in PostgreSQL - check if it's still pending in Redis
-    # (worker hasn't created the PostgreSQL record yet)
-    pending_cancelled = await redis_client.set_pending_cancelled(str(execution_id))
-
-    if pending_cancelled:
-        # Execution was in Redis pending, now marked as cancelled
-        # Worker will see this flag and skip execution
-        logger.info(f"Cancelled pending execution in Redis: {log_safe(execution_id)}")
-        return {
-            "execution_id": str(execution_id),
-            "status": "Cancelled",
-            "message": "Execution cancelled before it started",
-        }
-
-    # Not found anywhere
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"Execution {execution_id} not found",
@@ -1010,14 +746,20 @@ async def cancel_execution(
     "/cleanup/stuck",
     response_model=StuckExecutionsResponse,
     summary="Get stuck executions",
-    description="Get executions that have been running, pending, or cancelling too long (Platform admin only)",
-    dependencies=[RequirePlatformAdmin],
+    description="Get reachable executions that have been pending, running, or cancelling too long",
 )
 async def get_stuck_executions(
     ctx: Context,
     hours: int = Query(24, description="Hours since start to consider stuck"),
 ) -> StuckExecutionsResponse:
     """Get stuck executions that may need cleanup."""
+    caller = await load_caller(ctx.db, ctx.user)
+    read_all_reach = operation_reach(caller, "GET /api/executions/cleanup/stuck")
+    if read_all_reach.is_empty:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to view executions",
+        )
 
     # Find executions that have been pending/running/cancelling for too long
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -1035,12 +777,19 @@ async def get_stuck_executions(
             ExecutionModel.started_at < cutoff,
         )
     ).order_by(desc(ExecutionModel.started_at))
+    for reach in (user_reach(caller), read_all_reach):
+        reach_filter = reach.where(ExecutionModel.organization_id)
+        if reach_filter is not None:
+            query = query.where(reach_filter)
 
     result = await ctx.db.execute(query)
     executions = result.scalars().all()
 
-    repo = ExecutionRepository(ctx.db)
-    stuck_executions = [repo._to_pydantic(e, ctx.user) for e in executions]
+    repo = ExecutionReadAdapter(ctx.db)
+    stuck_executions = [
+        repo._to_pydantic(e, execution_read_access(caller, e).diagnostics)
+        for e in executions
+    ]
 
     return StuckExecutionsResponse(
         executions=stuck_executions,
@@ -1052,14 +801,15 @@ async def get_stuck_executions(
     "/cleanup/trigger",
     response_model=CleanupTriggeredResponse,
     summary="Trigger execution cleanup",
-    description="Clean up stuck executions by marking them as timed out or cancelled (Platform admin only)",
-    dependencies=[RequirePlatformAdmin],
+    description="Clean up stuck executions by marking them as timed out or cancelled",
 )
 async def trigger_cleanup(
     ctx: Context,
     hours: int = Query(24, description="Hours since start to consider stuck"),
 ) -> CleanupTriggeredResponse:
     """Trigger cleanup of stuck executions."""
+    caller = await load_caller(ctx.db, ctx.user)
+    require_operation(caller, "POST /api/executions/cleanup/trigger", GLOBAL)
     # Find stuck executions
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
@@ -1138,8 +888,7 @@ async def trigger_cleanup(
 @router.post(
     "/cleanup/redis-orphans",
     summary="Cleanup orphaned Redis pending executions",
-    description="Clean up Redis pending executions that are too old (Platform admin only)",
-    dependencies=[RequirePlatformAdmin],
+    description="Clean up Redis pending executions that are too old",
 )
 async def cleanup_redis_orphans(
     ctx: Context,
@@ -1158,6 +907,9 @@ async def cleanup_redis_orphans(
     3. If not in PostgreSQL, creates a FAILED record
     4. Deletes the Redis pending entry
     """
+    caller = await load_caller(ctx.db, ctx.user)
+    require_operation(caller, "POST /api/executions/cleanup/redis-orphans", GLOBAL)
+
     # For now, Redis pending entries have 1 hour TTL and will auto-expire
     # This endpoint is a placeholder for more sophisticated cleanup
     # A full implementation would:

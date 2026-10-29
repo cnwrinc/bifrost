@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import pytest
+import pytest_asyncio
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosedError
 
@@ -169,7 +170,6 @@ from bifrost import workflow
 @workflow(
     name="e2e_ws_exec_workflow",
     description="Workflow for WebSocket execution tests",
-    execution_mode="sync"
 )
 async def e2e_ws_exec_workflow(message: str = "test"):
     """Simple test workflow."""
@@ -457,3 +457,160 @@ class TestWebSocketEdgeCases:
                 f"Expected 'pong', got: {data}"
 
             logger.info("Unknown message type handled gracefully")
+
+
+@pytest_asyncio.fixture
+async def visible_service(async_session_factory, platform_admin):
+    """A durable stopped service whose scope the admin can inspect."""
+    from uuid import uuid4
+
+    from src.models.orm.services import ServiceDefinition
+    from src.models.orm.workflows import Workflow
+
+    workflow = Workflow(
+        id=uuid4(),
+        name=f"Contoso Service {uuid4().hex}",
+        function_name="contoso_service",
+        path=f"contoso_services/{uuid4().hex}.py",
+        type="service",
+        organization_id=platform_admin.organization_id,
+    )
+    definition = ServiceDefinition(
+        id=uuid4(),
+        workflow_id=workflow.id,
+        organization_id=platform_admin.organization_id,
+        created_by=platform_admin.email,
+        desired_state="stopped",
+    )
+    async with async_session_factory() as session:
+        session.add_all([workflow, definition])
+        await session.commit()
+    try:
+        yield str(definition.id)
+    finally:
+        async with async_session_factory() as session:
+            stored = await session.get(ServiceDefinition, definition.id)
+            assert stored is not None
+            await session.delete(stored)
+            await session.flush()
+            stored_workflow = await session.get(Workflow, workflow.id)
+            assert stored_workflow is not None
+            await session.delete(stored_workflow)
+            await session.commit()
+
+
+@pytest.mark.e2e
+class TestServiceLogStreaming:
+    """Supervised service log streaming over the standard WebSocket (2.4).
+
+    Children publish attempt-scoped lines to Redis pubsub
+    ``bifrost:service-logs:{attempt_id}``; the API bridges them to the
+    service-wide ``service:{service_id}`` channel (platform admins only).
+    """
+
+    @pytest.mark.asyncio
+    async def test_admin_receives_bridged_service_logs(
+        self,
+        e2e_ws_url,
+        platform_admin,
+        visible_service,
+    ):
+        """Subscribe service:{id} → published attempt lines arrive live."""
+        from uuid import uuid4
+
+        from src.core.cache import get_redis
+
+        service_id = visible_service
+        attempt_id = str(uuid4())
+        ws_url = f"{e2e_ws_url}/ws/connect"
+        extra_headers = {"Authorization": f"Bearer {platform_admin.access_token}"}
+
+        async with connect(ws_url, additional_headers=extra_headers) as ws:
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            assert json.loads(msg)["type"] == "connected"
+
+            await ws.send(json.dumps({
+                "type": "subscribe",
+                "channels": [f"service:{service_id}"],
+            }))
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            data = json.loads(msg)
+            assert data.get("type") == "subscribed", f"subscribe failed: {data}"
+            assert data.get("channel") == f"service:{service_id}"
+
+            async with get_redis() as r:
+                for text in ("bridge line one", "bridge line two"):
+                    await r.publish(
+                        f"bifrost:service-logs:{attempt_id}",
+                        json.dumps({
+                            "type": "service_log",
+                            "service_id": service_id,
+                            "attempt_id": attempt_id,
+                            "level": "INFO",
+                            "message": text,
+                            "timestamp": "2026-09-21T12:00:00+00:00",
+                        }),
+                    )
+
+            received = []
+            deadline = asyncio.get_event_loop().time() + 15.0
+            while len(received) < 2:
+                timeout = deadline - asyncio.get_event_loop().time()
+                assert timeout > 0, f"bridged logs never arrived: {received}"
+                msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                data = json.loads(msg)
+                if data.get("type") == "service_log":
+                    received.append(data)
+            assert [m["message"] for m in received] == [
+                "bridge line one",
+                "bridge line two",
+            ]
+            assert all(m["service_id"] == service_id for m in received)
+            assert all(m["attempt_id"] == attempt_id for m in received)
+
+    @pytest.mark.asyncio
+    async def test_admin_rejected_for_malformed_service_channel(
+        self,
+        e2e_ws_url,
+        platform_admin,
+    ):
+        """Malformed service ids are rejected, not silently held."""
+        ws_url = f"{e2e_ws_url}/ws/connect"
+        extra_headers = {"Authorization": f"Bearer {platform_admin.access_token}"}
+
+        async with connect(ws_url, additional_headers=extra_headers) as ws:
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            assert json.loads(msg)["type"] == "connected"
+
+            await ws.send(json.dumps({
+                "type": "subscribe",
+                "channels": ["service:not-a-uuid"],
+            }))
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            data = json.loads(msg)
+            assert data.get("type") == "error", f"expected denial: {data}"
+            assert data.get("channel") == "service:not-a-uuid"
+
+    @pytest.mark.asyncio
+    async def test_org_user_denied_service_channel(
+        self,
+        e2e_ws_url,
+        org1_user,
+        visible_service,
+    ):
+        """A person outside the service's scope cannot subscribe."""
+
+        ws_url = f"{e2e_ws_url}/ws/connect"
+        extra_headers = {"Authorization": f"Bearer {org1_user.access_token}"}
+
+        async with connect(ws_url, additional_headers=extra_headers) as ws:
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            assert json.loads(msg)["type"] == "connected"
+
+            await ws.send(json.dumps({
+                "type": "subscribe",
+                "channels": [f"service:{visible_service}"],
+            }))
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            data = json.loads(msg)
+            assert data.get("type") == "error", f"expected denial: {data}"

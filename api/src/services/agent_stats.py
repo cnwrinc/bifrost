@@ -3,37 +3,74 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, false, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.contracts.agent_stats import AgentStatsResponse, FleetStatsResponse
 from src.models.orm.agent_runs import AgentRun
 from src.models.orm.agents import Agent, Conversation
 from src.models.orm.ai_usage import AIUsage
+from src.services.agent_write_policy import (
+    agent_query_in_reach,
+    caller_user_id,
+    can_read_agent,
+)
+from src.services.authorization.enforce import Caller, permitted_organizations, user_reach
+from src.services.execution.agent_run_access import agent_run_visibility_conditions
+
+
+def _intersect_org_reach(caller: Caller, permission: str, column):
+    """SQL for named permission reach bounded by the original user's reach."""
+    original = user_reach(caller).where(column)
+    permitted = permitted_organizations(caller, permission).where(column)
+    return and_(
+        true() if original is None else original,
+        true() if permitted is None else permitted,
+    )
+
+
+def _conversation_visibility(caller: Caller):
+    """Original caller's own conversations plus permitted all-user activity."""
+    original_user_id = caller_user_id(caller)
+    if original_user_id is None:
+        return false()
+    return or_(
+        Conversation.user_id == original_user_id,
+        _intersect_org_reach(caller, "agentruns.read.all", Agent.organization_id),
+    )
 
 
 async def get_agent_stats_batch(
     agent_ids: list[UUID],
     db: AsyncSession,
+    caller: Caller,
     *,
     window_days: int = 7,
 ) -> dict[UUID, AgentStatsResponse]:
-    """Compute the list-card stats for many agents in four bounded queries."""
+    """Compute the list-card stats for many agents in four bounded queries.
+
+    Agent-run rows use the shared history policy. Chat activity follows the
+    same original-user rule, joining the Agent so ``agentruns.read.all`` is
+    evaluated at that Agent's actual organization and never outside original
+    reach.
+    """
     if not agent_ids:
         return {}
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
     now = datetime.now(timezone.utc)
     unique_agent_ids = list(dict.fromkeys(agent_ids))
+    readable_agent_ids = await _readable_agent_ids(db, caller, unique_agent_ids)
+
+    run_conditions = [
+        AgentRun.agent_id.in_(readable_agent_ids),
+        AgentRun.created_at >= cutoff,
+        *agent_run_visibility_conditions(caller),
+    ]
 
     runs = (
         (
-            await db.execute(
-                select(AgentRun).where(
-                    AgentRun.agent_id.in_(unique_agent_ids),
-                    AgentRun.created_at >= cutoff,
-                )
-            )
+            await db.execute(select(AgentRun).where(*run_conditions))
         )
         .scalars()
         .all()
@@ -58,6 +95,11 @@ async def get_agent_stats_batch(
             for agent_id, cost in cost_rows
         }
 
+    chat_conditions = [
+        Conversation.agent_id.in_(readable_agent_ids),
+        Conversation.updated_at >= cutoff,
+        _conversation_visibility(caller),
+    ]
     chat_rows = (
         await db.execute(
             select(
@@ -65,10 +107,8 @@ async def get_agent_stats_batch(
                 func.count(Conversation.id),
                 func.max(Conversation.updated_at),
             )
-            .where(
-                Conversation.agent_id.in_(unique_agent_ids),
-                Conversation.updated_at >= cutoff,
-            )
+            .join(Agent, Agent.id == Conversation.agent_id)
+            .where(*chat_conditions)
             .group_by(Conversation.agent_id)
         )
     ).all()
@@ -76,6 +116,11 @@ async def get_agent_stats_batch(
         agent_id: (count, last_at) for agent_id, count, last_at in chat_rows
     }
 
+    chat_cost_conditions = [
+        Conversation.agent_id.in_(readable_agent_ids),
+        AIUsage.timestamp >= cutoff,
+        _conversation_visibility(caller),
+    ]
     chat_cost_rows = (
         await db.execute(
             select(
@@ -83,10 +128,8 @@ async def get_agent_stats_batch(
                 func.coalesce(func.sum(AIUsage.cost), 0),
             )
             .join(AIUsage, AIUsage.conversation_id == Conversation.id)
-            .where(
-                Conversation.agent_id.in_(unique_agent_ids),
-                AIUsage.timestamp >= cutoff,
-            )
+            .join(Agent, Agent.id == Conversation.agent_id)
+            .where(*chat_cost_conditions)
             .group_by(Conversation.agent_id)
         )
     ).all()
@@ -151,9 +194,34 @@ async def get_agent_stats_batch(
     return result
 
 
+async def _readable_agent_ids(
+    db: AsyncSession,
+    caller: Caller,
+    agent_ids: list[UUID] | None = None,
+) -> list[UUID]:
+    """Resolve aggregate candidates through the canonical Agent read policy.
+
+    Run-history permission controls whose activity may contribute to a visible
+    Agent. It does not itself disclose the Agent or bypass its ACL/private
+    ownership policy.
+    """
+    query = agent_query_in_reach(caller)
+    if agent_ids is not None:
+        if not agent_ids:
+            return []
+        query = query.where(Agent.id.in_(agent_ids))
+    candidates = (await db.execute(query)).scalars().all()
+    return [
+        agent.id
+        for agent in candidates
+        if await can_read_agent(db, caller, agent)
+    ]
+
+
 async def get_agent_stats(
     agent_id: UUID,
     db: AsyncSession,
+    caller: Caller,
     *,
     window_days: int = 7,
 ) -> AgentStatsResponse:
@@ -180,6 +248,7 @@ async def get_agent_stats(
         await get_agent_stats_batch(
             [agent_id],
             db,
+            caller,
             window_days=window_days,
         )
     )[agent_id]
@@ -187,14 +256,15 @@ async def get_agent_stats(
 
 async def get_fleet_stats(
     db: AsyncSession,
+    caller: Caller,
     *,
-    org_id: UUID | None,
     window_days: int = 7,
 ) -> FleetStatsResponse:
     """Fleet-wide stats over the last ``window_days``.
 
-    Optionally scoped to a single organization (org_id=None means
-    cross-org, only allowed for superusers — the router enforces that).
+    All aggregation is limited to the original user's reach. Other users'
+    run and chat activity is visible only where the caller holds
+    ``agentruns.read.all`` at the actual Agent organization.
 
     Chat-channel rollup mirrors :func:`get_agent_stats`: each
     ``Conversation`` updated in window counts as one run, and chat
@@ -204,13 +274,20 @@ async def get_fleet_stats(
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
 
-    agent_filter = []
-    if org_id is not None:
-        agent_filter.append(Agent.organization_id == org_id)
+    readable_agent_ids = await _readable_agent_ids(db, caller)
+    agent_filter = [
+        Agent.id.in_(readable_agent_ids)
+        if readable_agent_ids
+        else false()
+    ]
 
-    run_filter = [AgentRun.created_at >= cutoff]
-    if org_id is not None:
-        run_filter.append(AgentRun.org_id == org_id)
+    run_filter = [
+        AgentRun.agent_id.in_(readable_agent_ids)
+        if readable_agent_ids
+        else false(),
+        AgentRun.created_at >= cutoff,
+        *agent_run_visibility_conditions(caller),
+    ]
 
     total_runs = (
         await db.execute(select(func.count(AgentRun.id)).where(*run_filter))
@@ -250,20 +327,24 @@ async def get_fleet_stats(
     chat_conv_q = (
         select(func.count(Conversation.id))
         .join(Agent, Agent.id == Conversation.agent_id)
-        .where(Conversation.updated_at >= cutoff)
+        .where(
+            Conversation.updated_at >= cutoff,
+            _conversation_visibility(caller),
+            *agent_filter,
+        )
     )
-    if org_id is not None:
-        chat_conv_q = chat_conv_q.where(Agent.organization_id == org_id)
     chat_runs = (await db.execute(chat_conv_q)).scalar() or 0
 
     chat_cost_q = (
         select(func.coalesce(func.sum(AIUsage.cost), 0))
         .join(Conversation, Conversation.id == AIUsage.conversation_id)
         .join(Agent, Agent.id == Conversation.agent_id)
-        .where(AIUsage.timestamp >= cutoff)
+        .where(
+            AIUsage.timestamp >= cutoff,
+            _conversation_visibility(caller),
+            *agent_filter,
+        )
     )
-    if org_id is not None:
-        chat_cost_q = chat_cost_q.where(Agent.organization_id == org_id)
     chat_cost = (await db.execute(chat_cost_q)).scalar() or Decimal("0")
     chat_cost_decimal = (
         chat_cost if isinstance(chat_cost, Decimal) else Decimal(chat_cost)

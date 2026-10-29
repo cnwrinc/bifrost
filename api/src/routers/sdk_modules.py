@@ -2,7 +2,10 @@
 SDK Module-Fetch Router
 
 Provides authenticated HTTP endpoints that worker child processes use to
-fetch workspace module source code and requirements.txt content.
+fetch workspace module source code.
+
+Also retains the administrative requirements read endpoint for external
+callers. Worker requirements setup reads Redis/S3 directly.
 
 This eliminates the need for BIFROST_S3_* credentials in child processes
 (Phase 2 of the execution sandbox hardening).  The child authenticates with
@@ -13,22 +16,20 @@ Endpoints:
     GET /api/sdk/modules/{path:path}
         Fetch a single module's source (JSON: {content, path, hash}).
 
-    GET /api/sdk/requirements
-        Fetch requirements.txt content (JSON: {content}).
 """
 
-import logging
-from typing import Annotated
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import JSONResponse
 
-from src.core.auth import get_current_superuser
-from src.core.module_cache import get_all_module_paths, get_module
+from shared.sdk_modules import (
+    ModuleSourceError,
+    fetch_module_source,
+    resolve_module_name,
+    module_scope_for_principal,
+)
+from src.core.auth import CurrentActiveUser
+from src.core.db_deps import DbSession
 from src.core.requirements_cache import get_requirements
-from src.services.solutions.storage import SOLUTIONS_ROOT, SolutionStorage
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sdk", tags=["SDK Internals"])
 
@@ -36,7 +37,8 @@ router = APIRouter(prefix="/api/sdk", tags=["SDK Internals"])
 @router.get("/modules/{path:path}")
 async def fetch_module(
     path: str,
-    _user: Annotated[object, Depends(get_current_superuser)],
+    user: CurrentActiveUser,
+    db: DbSession,
 ) -> JSONResponse:
     """
     Fetch a workspace module by path.
@@ -53,62 +55,71 @@ async def fetch_module(
     """
     # Validate path — reject any attempt to escape the workspace prefix
     # (Redis key is always "bifrost:module:<path>"; the S3 key is "_repo/<path>")
-    if ".." in path or path.startswith("/"):
+    try:
+        from src.services.solutions.storage import SOLUTIONS_ROOT
+
+        solution_id = path.split("/", 2)[1] if path.startswith(f"{SOLUTIONS_ROOT}/") else None
+        scope = await module_scope_for_principal(db, user, solution_id=solution_id)
+        module = await fetch_module_source(path, scope=scope)
+    except ModuleSourceError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid module path",
-        )
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from exc
 
-    module = await get_module(path)
-    if module is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Module not found: {path}",
-        )
-
-    return JSONResponse(content=dict(module))
+    return JSONResponse(content=module)
 
 
-@router.get("/modules-index")
-async def fetch_module_index(
-    _user: Annotated[object, Depends(get_current_superuser)],
+@router.get("/modules-resolve")
+async def resolve_module(
+    user: CurrentActiveUser,
+    db: DbSession,
+    name: str,
     solution_id: str | None = None,
+    global_repo_access: bool = False,
 ) -> JSONResponse:
     """
-    Fetch the set of all known workspace module paths.
+    Resolve one logical Python import name or module path.
 
-    Returns JSON: {"paths": ["features/api.py", ...]}.
-    Used by the child's VirtualModuleFinder to rebuild the module index when
-    the Redis SET is cold.
+    Returns one of:
+    - {"kind": "module", "content": ..., "hash": ...}
+    - {"kind": "package", "content": ..., "hash": ...}
+    - {"kind": "namespace"}
+    - {"kind": "not_found"}
+
+    The API performs concrete module/package lookup through get_module(), so it
+    keeps the existing Redis→S3 self-healing cache behavior. Namespace detection
+    uses a bounded prefix existence check instead of listing the whole module
+    index.
     """
-    paths = await get_all_module_paths()
-    if solution_id:
-        storage = SolutionStorage(solution_id)
-        solution_paths = await storage.list("")
-        solution_prefix = f"{SOLUTIONS_ROOT}/{solution_id}/"
-        paths.update(
-            f"{solution_prefix}{path}"
-            for path in solution_paths
-            if path.endswith(".py")
+    try:
+        scope = await module_scope_for_principal(
+            db, user, solution_id=solution_id, global_repo_access=global_repo_access,
         )
-    return JSONResponse(content={"paths": sorted(paths)})
+        result = await resolve_module_name(name, scope=scope)
+    except ModuleSourceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from exc
+
+    return JSONResponse(content=result)
 
 
 @router.get("/requirements")
 async def fetch_requirements(
-    _user: Annotated[object, Depends(get_current_superuser)],
+    user: CurrentActiveUser,
+    db: DbSession,
 ) -> JSONResponse:
-    """
-    Fetch requirements.txt content.
+    """Return the existing requirements.txt HTTP contract for external callers."""
+    from src.services.authorization.enforce import authorize_operation
+    from src.services.authorization.evaluator import GLOBAL
 
-    Returns JSON: {"content": "...", "hash": "..."} or 404 if none exists.
-    Used by the child's install_requirements() when Redis is cold.
-    """
+    await authorize_operation(db, user, "GET /api/sdk/requirements", GLOBAL)
     cached = await get_requirements()
     if cached is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="requirements.txt not found",
         )
-
     return JSONResponse(content=dict(cached))

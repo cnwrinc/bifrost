@@ -30,6 +30,7 @@ TOP_LEVEL_COMMANDS = {
     "push",
     "pull",
     "solution",
+    "app",
     "deploy",
     "watch",
     "api",
@@ -173,6 +174,18 @@ EXPECTED_CRUD_COMMANDS: dict[str, set[str]] = {
         "get-subscription",
         "subscribe",
         "update-subscription",
+    },
+    "services": {
+        "list",
+        "get",
+        "update",
+        "start",
+        "stop",
+        "restart",
+        "enable",
+        "disable",
+        "attempts",
+        "logs",
     },
 }
 

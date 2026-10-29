@@ -20,10 +20,9 @@ import type { ConfigSchemaItem } from "@/services/integrations";
 const mockMutateAsync = vi.fn();
 
 vi.mock("@/services/integrations", async () => {
-	const actual =
-		await vi.importActual<typeof import("@/services/integrations")>(
-			"@/services/integrations",
-		);
+	const actual = await vi.importActual<
+		typeof import("@/services/integrations")
+	>("@/services/integrations");
 	return {
 		...actual,
 		useUpdateMapping: () => ({
@@ -81,6 +80,7 @@ describe("ConfigOverridesTab — empty states", () => {
 				orgsWithMappings={[makeOrg()]}
 				configSchema={[]}
 				integrationId="int-1"
+				canManageMapping={() => true}
 			/>,
 		);
 		expect(
@@ -101,6 +101,7 @@ describe("ConfigOverridesTab — empty states", () => {
 				]}
 				configSchema={makeSchema()}
 				integrationId="int-1"
+				canManageMapping={() => true}
 			/>,
 		);
 		expect(
@@ -116,6 +117,7 @@ describe("ConfigOverridesTab — rendering", () => {
 				orgsWithMappings={[makeOrg()]}
 				configSchema={makeSchema()}
 				integrationId="int-1"
+				canManageMapping={() => true}
 			/>,
 		);
 		expect(screen.getByText("Acme")).toBeInTheDocument();
@@ -132,6 +134,7 @@ describe("ConfigOverridesTab — inline edit save", () => {
 				orgsWithMappings={[makeOrg()]}
 				configSchema={makeSchema()}
 				integrationId="int-1"
+				canManageMapping={() => true}
 			/>,
 		);
 
@@ -166,19 +169,19 @@ describe("ConfigOverridesTab — delete flow", () => {
 				orgsWithMappings={[makeOrg()]}
 				configSchema={makeSchema()}
 				integrationId="int-1"
+				canManageMapping={() => true}
 			/>,
 		);
 
-		// Icon-only delete button carries a title.
-		const deleteBtn = screen
-			.getAllByRole("button")
-			.find(
-				(b) =>
-					b.getAttribute("title") ===
-					"Delete override (revert to default)",
-			);
-		expect(deleteBtn).toBeDefined();
-		await user.click(deleteBtn!);
+		await user.click(
+			screen.getByRole("button", {
+				name: "More actions for Acme tenant_id",
+			}),
+		);
+
+		await user.click(
+			screen.getByRole("menuitem", { name: "Delete override" }),
+		);
 
 		// Confirm the destructive action
 		await user.click(screen.getByRole("button", { name: /^delete$/i }));

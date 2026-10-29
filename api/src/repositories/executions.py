@@ -17,8 +17,9 @@ from sqlalchemy import desc, func, select, update
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.principal import UserPrincipal
+from shared.run_lineage import lineage_columns
 from src.core.log_safety import log_safe
+from src.core.principal import UserPrincipal
 from src.models import (
     AIUsage,
     AIUsagePublicSimple,
@@ -30,6 +31,7 @@ from src.models import (
 )
 from src.models.enums import ExecutionStatus
 from src.repositories.base import BaseRepository
+from src.services.durable_impersonation import pending_durable_impersonation
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +75,12 @@ class ExecutionRepository(BaseRepository[Execution]):
         form_id: str | None = None,
         api_key_id: str | None = None,
         status: ExecutionStatus = ExecutionStatus.RUNNING,
-        is_local_execution: bool = False,
         execution_model: str | None = None,
         workflow_id: str | None = None,
+        check_existing: bool = True,
+        *,
+        lineage: dict[str, str] | None,
+        impersonation_provenance: dict[str, str] | None = None,
     ) -> Execution:
         """
         Create a new execution record.
@@ -93,8 +98,9 @@ class ExecutionRepository(BaseRepository[Execution]):
             form_id: Optional form ID if triggered by form
             api_key_id: Optional workflow ID whose API key triggered this execution
             status: Initial status (default RUNNING)
-            is_local_execution: Whether this is a local CLI execution
             execution_model: Which system ran the execution ('process' or 'thread')
+            lineage: Run lineage from the pending record (RunLineage.bound).
+                None leaves a pre-existing row's lineage as it is.
 
         Returns:
             Created Execution record
@@ -122,7 +128,11 @@ class ExecutionRepository(BaseRepository[Execution]):
         # A scheduled execution has a pre-existing row (inserted at schedule
         # time as SCHEDULED, promoted to PENDING by the scheduler). In that
         # case update-in-place instead of inserting a duplicate PK.
-        existing = await self.session.get(Execution, UUID(execution_id))
+        existing = (
+            await self.session.get(Execution, UUID(execution_id))
+            if check_existing
+            else None
+        )
         if existing is not None:
             existing.workflow_name = workflow_name
             existing.workflow_id = parsed_workflow_id
@@ -133,9 +143,14 @@ class ExecutionRepository(BaseRepository[Execution]):
             existing.organization_id = parsed_org_id
             existing.form_id = parsed_form_id
             existing.api_key_id = parsed_api_key_id
-            existing.is_local_execution = is_local_execution
             existing.execution_model = execution_model
             existing.started_at = datetime.now(timezone.utc)
+            if lineage is not None:
+                for column, value in lineage_columns(lineage).items():
+                    setattr(existing, column, value)
+            if impersonation_provenance is not None:
+                for column, value in pending_durable_impersonation(impersonation_provenance).columns().items():
+                    setattr(existing, column, value)
             await self.session.flush()
             await self.session.refresh(existing)
             logger.info(
@@ -155,14 +170,20 @@ class ExecutionRepository(BaseRepository[Execution]):
             organization_id=parsed_org_id,
             form_id=parsed_form_id,
             api_key_id=parsed_api_key_id,
-            is_local_execution=is_local_execution,
             execution_model=execution_model,
             started_at=datetime.now(timezone.utc),
+            **lineage_columns(lineage),
+            **pending_durable_impersonation(impersonation_provenance).columns(),
         )
 
         self.session.add(execution)
         await self.session.flush()
-        await self.session.refresh(execution)
+        if check_existing:
+            # Preserve the historical repository contract for callers that do
+            # not know whether the row already exists. Immediate workflow
+            # dispatches pass check_existing=False and do not need DB-generated
+            # values before committing the known-new row.
+            await self.session.refresh(execution)
 
         logger.info(f"Created execution record: {execution_id} (status={status.value})")
         return execution
@@ -181,9 +202,16 @@ class ExecutionRepository(BaseRepository[Execution]):
         metrics: dict | None = None,
         time_saved: int | None = None,
         value: float | None = None,
-    ) -> None:
+        owner_worker_id: UUID | None = None,
+    ) -> bool:
         """
         Update an execution record with results.
+
+        An executor passes its incarnation as ``owner_worker_id``: its result
+        is written only while the run is still running and that executor
+        still holds its claim, so the late result of an executor declared
+        lost never overwrites how the run ended. Returns whether the row
+        was written.
 
         Args:
             execution_id: Execution ID
@@ -201,6 +229,16 @@ class ExecutionRepository(BaseRepository[Execution]):
         """
         # Get status value if it's an enum
         status_value = status.value if hasattr(status, "value") else status
+
+        # A remote launcher's API control owner may have been replaced while
+        # its child was finishing. The fence holds the worker row's shared
+        # lock through this session's transaction, so the replacement either
+        # happens before this check (and refuses the result) or after this
+        # write commits.
+        from src.worker.remote.fencing import fence_remote_owner
+
+        if not await fence_remote_owner(self.session):
+            return False
 
         # Build update values
         update_values: dict[str, Any] = {
@@ -247,6 +285,12 @@ class ExecutionRepository(BaseRepository[Execution]):
                 update_values["cpu_system_seconds"] = metrics["cpu_system_seconds"]
             if "cpu_total_seconds" in metrics:
                 update_values["cpu_total_seconds"] = metrics["cpu_total_seconds"]
+            if "peak_cpu_cores" in metrics:
+                update_values["peak_cpu_cores"] = metrics["peak_cpu_cores"]
+            if "peak_process_rss_bytes" in metrics:
+                update_values["peak_process_rss_bytes"] = metrics["peak_process_rss_bytes"]
+            if "peak_memory_growth_bytes" in metrics:
+                update_values["peak_memory_growth_bytes"] = metrics["peak_memory_growth_bytes"]
 
         # Economics
         if time_saved is not None:
@@ -255,11 +299,37 @@ class ExecutionRepository(BaseRepository[Execution]):
             update_values["value"] = value
 
         # Execute update
-        await self.session.execute(
-            update(Execution)
-            .where(Execution.id == UUID(execution_id))
-            .values(**update_values)
-        )
+        statement = update(Execution).where(Execution.id == UUID(execution_id))
+        if owner_worker_id is not None:
+            from src.models.orm.execution_workers import ExecutionWorker, ExecutionWorkerClaim
+
+            statement = statement.where(
+                Execution.status.in_((ExecutionStatus.RUNNING, ExecutionStatus.CANCELLING)),
+                select(ExecutionWorkerClaim.worker_id)
+                .join(ExecutionWorker, ExecutionWorker.id == ExecutionWorkerClaim.worker_id)
+                .where(
+                    ExecutionWorkerClaim.worker_id == owner_worker_id,
+                    ExecutionWorkerClaim.family == "workflow_execution",
+                    ExecutionWorkerClaim.subject_id == Execution.id,
+                    ExecutionWorker.state.in_(("ready", "draining")),
+                )
+                .exists(),
+            )
+        written = (
+            await self.session.execute(
+                statement.values(**update_values).returning(Execution.workflow_id)
+            )
+        ).one_or_none()
+        if written is None:
+            return False
+        workflow_id = written.workflow_id
+        growth = (metrics or {}).get("peak_memory_growth_bytes")
+        if workflow_id is not None and growth is not None:
+            from src.services.memory_requests import record_peak_growth
+
+            await record_peak_growth(
+                self.session, workflow_id, growth, (metrics or {}).get("code_hash")
+            )
 
         # Store logs in ExecutionLog table
         if logs:
@@ -276,6 +346,7 @@ class ExecutionRepository(BaseRepository[Execution]):
 
         await self.session.flush()
         logger.debug(f"Updated execution {log_safe(execution_id)} to status {log_safe(status_value)}")
+        return True
 
     # =========================================================================
     # Read Operations (used by API endpoints)
@@ -378,7 +449,7 @@ class ExecutionRepository(BaseRepository[Execution]):
         logs_query = (
             select(ExecutionLog)
             .where(ExecutionLog.execution_id == execution_id)
-            .order_by(ExecutionLog.sequence)
+            .order_by(ExecutionLog.sequence, ExecutionLog.id)
         )
         if not user.is_superuser:
             logs_query = logs_query.where(
@@ -416,6 +487,7 @@ class ExecutionRepository(BaseRepository[Execution]):
                 output_tokens=entry.output_tokens,
                 cache_read_tokens=entry.cache_read_tokens,
                 cache_write_tokens=entry.cache_write_tokens,
+                reasoning_tokens=entry.reasoning_tokens,
                 provider_cost=(str(entry.provider_cost) if entry.provider_cost is not None else None),
                 cost=str(entry.cost) if entry.cost else None,
                 duration_ms=entry.duration_ms,
@@ -433,6 +505,7 @@ class ExecutionRepository(BaseRepository[Execution]):
                 func.coalesce(func.sum(AIUsage.output_tokens), 0).label("total_output"),
                 func.coalesce(func.sum(AIUsage.cache_read_tokens), 0).label("total_cache_read"),
                 func.coalesce(func.sum(AIUsage.cache_write_tokens), 0).label("total_cache_write"),
+                func.coalesce(func.sum(AIUsage.reasoning_tokens), 0).label("total_reasoning"),
                 func.coalesce(func.sum(AIUsage.provider_cost), Decimal("0")).label("total_provider_cost"),
                 func.coalesce(func.sum(AIUsage.cost), Decimal("0")).label("total_cost"),
                 func.coalesce(func.sum(AIUsage.duration_ms), 0).label("total_duration"),
@@ -447,6 +520,7 @@ class ExecutionRepository(BaseRepository[Execution]):
                 total_output_tokens=int(totals_row.total_output or 0),
                 total_cache_read_tokens=int(totals_row.total_cache_read or 0),
                 total_cache_write_tokens=int(totals_row.total_cache_write or 0),
+                total_reasoning_tokens=int(totals_row.total_reasoning or 0),
                 total_provider_cost=str(totals_row.total_provider_cost or Decimal("0")),
                 total_cost=str(totals_row.total_cost or Decimal("0")),
                 total_duration_ms=int(totals_row.total_duration or 0),
@@ -471,7 +545,6 @@ class ExecutionRepository(BaseRepository[Execution]):
             started_at=execution.started_at,
             completed_at=execution.completed_at,
             logs=[log.model_dump() for log in logs],
-            session_id=str(execution.session_id) if execution.session_id else None,
             # Admin-only fields (null for non-admins)
             variables=execution.variables if user.is_superuser else None,
             execution_context=execution.execution_context if user.is_superuser else None,
@@ -530,7 +603,7 @@ class ExecutionRepository(BaseRepository[Execution]):
         logs_query = (
             select(ExecutionLog)
             .where(ExecutionLog.execution_id == execution_id)
-            .order_by(ExecutionLog.sequence)
+            .order_by(ExecutionLog.sequence, ExecutionLog.id)
         )
 
         # Filter debug logs for non-superusers
@@ -650,7 +723,6 @@ class ExecutionRepository(BaseRepository[Execution]):
             completed_at=execution.completed_at,
             logs=None,  # Fetched separately via /logs endpoint
             variables=execution.variables if is_admin else None,
-            session_id=str(execution.session_id) if execution.session_id else None,
             # ROI economics
             time_saved=execution.time_saved or 0,
             value=float(execution.value or 0),
@@ -672,10 +744,13 @@ async def create_execution(
     form_id: str | None = None,
     api_key_id: str | None = None,
     status: ExecutionStatus = ExecutionStatus.RUNNING,
-    is_local_execution: bool = False,
     execution_model: str | None = None,
     workflow_id: str | None = None,
     session: "AsyncSession | None" = None,
+    check_existing: bool = True,
+    *,
+    lineage: dict[str, str] | None,
+    impersonation_provenance: dict[str, str] | None = None,
 ) -> None:
     """
     Create a new execution record in PostgreSQL.
@@ -703,9 +778,11 @@ async def create_execution(
             form_id=form_id,
             api_key_id=api_key_id,
             status=status,
-            is_local_execution=is_local_execution,
             execution_model=execution_model,
             workflow_id=workflow_id,
+            check_existing=check_existing,
+            lineage=lineage,
+            impersonation_provenance=impersonation_provenance,
         )
 
     if session is not None:
@@ -733,23 +810,26 @@ async def update_execution(
     time_saved: int | None = None,
     value: float | None = None,
     session: "AsyncSession | None" = None,
-) -> None:
+    owner_worker_id: UUID | None = None,
+) -> bool:
     """
-    Update an execution record with results.
+    Update an execution record with results; whether it was written.
 
     Standalone function for workers/consumers that manage their own DB sessions.
 
     Args:
         session: Optional database session. If provided, uses it and
                  caller is responsible for commit. If None, creates own session.
+        owner_worker_id: The writing executor (see
+                 ``ExecutionRepository.update_execution``).
     """
     from sqlalchemy.ext.asyncio import AsyncSession as AsyncSessionType
 
     from src.core.database import get_session_factory
 
-    async def _do_update(db: AsyncSessionType) -> None:
+    async def _do_update(db: AsyncSessionType) -> bool:
         repo = ExecutionRepository(db)
-        await repo.update_execution(
+        return await repo.update_execution(
             execution_id=execution_id,
             status=status,
             result=result,
@@ -762,14 +842,15 @@ async def update_execution(
             metrics=metrics,
             time_saved=time_saved,
             value=value,
+            owner_worker_id=owner_worker_id,
         )
 
     if session is not None:
         # Use provided session (caller manages commit)
-        await _do_update(session)
-    else:
-        # Backward compatible: create own session
-        session_factory = get_session_factory()
-        async with session_factory() as db:
-            await _do_update(db)
-            await db.commit()
+        return await _do_update(session)
+    # Backward compatible: create own session
+    session_factory = get_session_factory()
+    async with session_factory() as db:
+        written = await _do_update(db)
+        await db.commit()
+    return written

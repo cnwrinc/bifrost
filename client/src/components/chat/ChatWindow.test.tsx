@@ -26,8 +26,6 @@ const messagesRef: {
 const streamRef = {
 	sendMessage: vi.fn(),
 	isStreaming: false,
-	pendingQuestion: null as unknown,
-	answerQuestion: vi.fn(),
 	stopStreaming: vi.fn(),
 };
 
@@ -36,30 +34,46 @@ const createConversationRef = {
 	isPending: false,
 };
 
+const modelProfileDataRef = {
+	data: {
+		profiles: [
+			{
+				id: "profile-balanced",
+				name: "Balanced",
+				label: "Balanced",
+				capabilities: {
+					image_input: false,
+					pdf_input: false,
+					tool_calling: true,
+					source: "verified",
+					fingerprint: "test",
+				},
+			},
+		],
+		default_profile_id: "profile-balanced",
+	},
+};
+
+const chatInputFilesRef: { current: File[] } = { current: [] };
+const attachmentServiceRef = {
+	upload: vi.fn(),
+	deleteUnbound: vi.fn(),
+};
+
+vi.mock("@/services/chatAttachments", () => ({
+	uploadChatAttachments: (...args: unknown[]) =>
+		attachmentServiceRef.upload(...args),
+	deleteUnboundChatAttachment: (...args: unknown[]) =>
+		attachmentServiceRef.deleteUnbound(...args),
+}));
+
 vi.mock("@/hooks/useChat", () => ({
 	useMessages: () => ({
 		data: messagesRef.data,
 		isLoading: messagesRef.isLoading,
 	}),
 	useCreateConversation: () => createConversationRef,
-	useChatModelTiers: () => ({
-		data: {
-			tiers: [
-				{
-					id: "balanced",
-					label: "Balanced",
-					capabilities: {
-						image_input: false,
-						pdf_input: false,
-						tool_calling: true,
-						source: "verified",
-						fingerprint: "test",
-					},
-				},
-			],
-			default_tier: "balanced",
-		},
-	}),
+	useChatModelProfiles: () => modelProfileDataRef,
 }));
 
 vi.mock("@/hooks/useChatStream", () => ({
@@ -73,13 +87,20 @@ const storeSelectors = {
 	messagesByConversation: {} as Record<string, unknown[]>,
 	systemEventsByConversation: {} as Record<string, unknown[]>,
 	streamingMessageIds: {} as Record<string, string | null>,
+	projectionsByConversation: {} as Record<string, unknown>,
 	todos: [] as unknown[],
 	getToolExecution: vi.fn(() => undefined),
 };
 
 vi.mock("@/stores/chatStore", () => ({
 	useChatStore: <T,>(selector: (s: typeof storeSelectors) => T) =>
-		selector(storeSelectors),
+		selector({
+			...storeSelectors,
+			messagesByConversation:
+				messagesRef.data && messagesRef.data.length > 0
+					? { "c-1": messagesRef.data }
+					: storeSelectors.messagesByConversation,
+		}),
 	useTodos: () => storeSelectors.todos,
 }));
 
@@ -103,11 +124,21 @@ vi.mock("./ChatInput", () => ({
 	ChatInput: ({
 		onSend,
 		placeholder,
+		modelProfileId,
+		contextUsage,
+		onModelProfileChange,
 	}: {
-		onSend: (m: string, files: File[], tier: "balanced") => void;
+		onSend: (m: string, files: File[], profileId: string | null) => void;
 		placeholder?: string;
+		modelProfileId?: string | null;
+		contextUsage?: { model_profile_id: string } | null;
+		onModelProfileChange?: (profileId: string) => void;
 	}) => (
 		<div>
+			<p>{`${modelProfileId ?? "none"}|${contextUsage?.model_profile_id ?? "none"}`}</p>
+			<button type="button" onClick={() => onModelProfileChange?.("profile-pro")}>
+				Choose pro
+			</button>
 			<input
 				aria-label="chat input"
 				placeholder={placeholder}
@@ -115,8 +146,8 @@ vi.mock("./ChatInput", () => ({
 					if (e.key === "Enter") {
 						onSend(
 							(e.target as HTMLInputElement).value,
-							[],
-							"balanced",
+							chatInputFilesRef.current,
+							modelProfileId ?? null,
 						);
 					}
 				}}
@@ -125,8 +156,12 @@ vi.mock("./ChatInput", () => ({
 	),
 }));
 
+const toolCardProps = vi.hoisted(() => vi.fn());
 vi.mock("./ToolExecutionCard", () => ({
-	ToolExecutionCard: () => <div data-marker="tool-card" />,
+	ToolExecutionCard: (props: Record<string, unknown>) => {
+		toolCardProps(props);
+		return <div data-marker="tool-card" />;
+	},
 }));
 vi.mock("./ToolExecutionBadge", () => ({
 	ToolExecutionBadge: () => <div data-marker="tool-badge" />,
@@ -139,39 +174,50 @@ vi.mock("./ToolExecutionGroup", () => ({
 vi.mock("./ChatSystemEvent", () => ({
 	ChatSystemEvent: () => <div data-marker="sys-event" />,
 }));
-vi.mock("./AskUserQuestionCard", () => ({
-	AskUserQuestionCard: () => <div data-marker="ask-user" />,
-}));
 vi.mock("./TodoList", () => ({
 	TodoList: () => <div data-marker="todo-list" />,
 }));
 
-// integrateMessages: ChatWindow delegates API+local merge to this util.
-// Pass through a concat to keep tests predictable.
 vi.mock("@/lib/chat-utils", () => ({
-	integrateMessages: (
-		a: Array<Record<string, unknown>>,
-		b: Array<Record<string, unknown>>,
-	) => [...(a || []), ...(b || [])],
 	generateMessageId: () => "test-id",
 }));
 
 import { ChatWindow } from "./ChatWindow";
 
 beforeEach(() => {
+	modelProfileDataRef.data = {
+		profiles: [
+			{
+				id: "profile-balanced",
+				name: "Balanced",
+				label: "Balanced",
+				capabilities: {
+					image_input: false,
+					pdf_input: false,
+					tool_calling: true,
+					source: "verified",
+					fingerprint: "test",
+				},
+			},
+		],
+		default_profile_id: "profile-balanced",
+	};
 	messagesRef.data = [];
 	messagesRef.isLoading = false;
 	streamRef.sendMessage = vi.fn();
 	streamRef.isStreaming = false;
-	streamRef.pendingQuestion = null;
 	streamRef.stopStreaming = vi.fn();
 	createConversationRef.mutateAsync = vi.fn();
 	createConversationRef.isPending = false;
+	chatInputFilesRef.current = [];
+	attachmentServiceRef.upload.mockReset();
+	attachmentServiceRef.deleteUnbound.mockReset();
 	storeSelectors.setActiveConversation.mockReset();
 	storeSelectors.setActiveAgent.mockReset();
 	storeSelectors.messagesByConversation = {};
 	storeSelectors.systemEventsByConversation = {};
 	storeSelectors.streamingMessageIds = {};
+	storeSelectors.projectionsByConversation = {};
 	storeSelectors.todos = [];
 	mockNavigate.mockReset();
 });
@@ -179,6 +225,61 @@ beforeEach(() => {
 // --- tests --------------------------------------------------------------
 
 describe("ChatWindow — empty states", () => {
+	it("restores the context model after switching conversations", async () => {
+		modelProfileDataRef.data = {
+			profiles: [
+				...modelProfileDataRef.data.profiles,
+				{
+					id: "profile-pro",
+					name: "Pro",
+					label: "Pro",
+					capabilities: {
+						image_input: false,
+						pdf_input: false,
+						tool_calling: true,
+						source: "verified",
+						fingerprint: "test-pro",
+					},
+				},
+			],
+			default_profile_id: "profile-pro",
+		};
+		storeSelectors.projectionsByConversation = {
+			"c-1": {
+				context_usage: {
+					input_tokens: 1_000,
+					context_window: 10_000,
+					cache_read_tokens: 0,
+					model_profile_id: "profile-balanced",
+				},
+			},
+			"c-2": {
+				context_usage: {
+					input_tokens: 2_000,
+					context_window: 10_000,
+					cache_read_tokens: 0,
+					model_profile_id: "profile-balanced",
+				},
+			},
+		};
+		const { rerender, user } = renderWithProviders(
+			<ChatWindow conversationId="c-1" />,
+		);
+
+		expect(screen.getByText("profile-balanced|profile-balanced")).toBeInTheDocument();
+		await user.click(screen.getByRole("button", { name: "Choose pro" }));
+		expect(screen.getByText("profile-pro|profile-balanced")).toBeInTheDocument();
+
+		rerender(<ChatWindow conversationId={undefined} />);
+		rerender(<ChatWindow conversationId="c-2" />);
+
+		await waitFor(() =>
+			expect(
+				screen.getByText("profile-balanced|profile-balanced"),
+			).toBeInTheDocument(),
+		);
+	});
+
 	it("shows 'Start a conversation' CTA when no conversationId is set", () => {
 		renderWithProviders(<ChatWindow conversationId={undefined} />);
 		expect(
@@ -207,6 +308,16 @@ describe("ChatWindow — loading state", () => {
 			container.querySelectorAll(".animate-pulse").length,
 		).toBeGreaterThan(0);
 	});
+
+	it("does not cover an active optimistic turn with history skeletons", () => {
+		messagesRef.isLoading = true;
+		streamRef.isStreaming = true;
+		const { container } = renderWithProviders(
+			<ChatWindow conversationId="c-1" />,
+		);
+
+		expect(container.querySelectorAll(".animate-pulse")).toHaveLength(0);
+	});
 });
 
 describe("ChatWindow — messages render & send", () => {
@@ -223,7 +334,9 @@ describe("ChatWindow — messages render & send", () => {
 
 		renderWithProviders(<ChatWindow conversationId="c-1" />);
 
-		expect(screen.getByText("Thinking…")).toHaveClass("chat-activity-shimmer");
+		expect(screen.getByText("Thinking…")).toHaveClass(
+			"chat-activity-shimmer",
+		);
 	});
 
 	it("collapses tool activity when the final response starts streaming", () => {
@@ -245,7 +358,7 @@ describe("ChatWindow — messages render & send", () => {
 				id: "assistant-final",
 				role: "assistant",
 				content: "I created the report.",
-				isStreaming: true,
+				is_streaming: true,
 				created_at: "2026-04-20T00:00:02Z",
 			},
 		];
@@ -259,10 +372,9 @@ describe("ChatWindow — messages render & send", () => {
 		);
 
 		expect(screen.getByText("Responding…")).toBeInTheDocument();
-		expect(screen.getByRole("button", { name: /Responding/i })).toHaveAttribute(
-			"aria-expanded",
-			"false",
-		);
+		expect(
+			screen.getByRole("button", { name: /Responding/i }),
+		).toHaveAttribute("aria-expanded", "false");
 		expect(container.querySelector(".grid-rows-\\[0fr\\]")).not.toBeNull();
 	});
 
@@ -287,6 +399,104 @@ describe("ChatWindow — messages render & send", () => {
 		// Stubbed ChatMessage emits a data-marker for each message.
 		expect(screen.getByText("ping")).toBeInTheDocument();
 		expect(screen.getByText("pong")).toBeInTheDocument();
+	});
+
+	it("hands a workflow tool card its tool call message", async () => {
+		const toolCallMessage = {
+			id: "m-3",
+			role: "tool_call",
+			tool_call_id: "tc-1",
+			tool_name: "run_task",
+			tool_state: "completed",
+			tool_result: { answer: 42 },
+			execution_id: "exec-1",
+			created_at: "2026-04-20T00:00:02Z",
+		};
+		messagesRef.data = [
+			{
+				id: "m-1",
+				role: "user",
+				content: "ping",
+				created_at: "2026-04-20T00:00:00Z",
+			},
+			{
+				id: "m-2",
+				role: "assistant",
+				content: "",
+				tool_calls: [{ id: "tc-1", name: "run_task", arguments: {} }],
+				created_at: "2026-04-20T00:00:01Z",
+			},
+			toolCallMessage,
+			{
+				id: "m-4",
+				role: "tool",
+				content: "{}",
+				tool_call_id: "tc-1",
+				execution_id: "exec-1",
+				created_at: "2026-04-20T00:00:03Z",
+			},
+			{
+				id: "m-5",
+				role: "assistant",
+				content: "Done.",
+				duration_ms: 1000,
+				created_at: "2026-04-20T00:00:04Z",
+			},
+		];
+		toolCardProps.mockClear();
+
+		const { user } = renderWithProviders(
+			<ChatWindow conversationId="c-1" />,
+		);
+		await user.click(screen.getByRole("button", { expanded: false }));
+
+		expect(toolCardProps).toHaveBeenCalledWith(
+			expect.objectContaining({
+				executionId: "exec-1",
+				toolCallMessage,
+			}),
+		);
+	});
+
+	it("keeps routed activity after its user message despite clock skew", () => {
+		messagesRef.data = [
+			{
+				id: "user-1",
+				role: "user",
+				content: "Route this",
+				created_at: "2026-04-20T00:00:20Z",
+			},
+			{
+				id: "assistant-1",
+				role: "assistant",
+				content: "Done",
+				duration_ms: 1_000,
+				created_at: "2026-04-20T00:00:10Z",
+			},
+		];
+		storeSelectors.systemEventsByConversation = {
+			"c-1": [
+				{
+					id: "route-1",
+					type: "agent_switch",
+					turnId: "user-1",
+					timestamp: "2026-04-20T00:00:05Z",
+				},
+			],
+		};
+
+		const { container } = renderWithProviders(
+			<ChatWindow conversationId="c-1" />,
+		);
+		const renderedItems = Array.from(
+			container.querySelectorAll("[data-marker]"),
+		).map((element) => element.getAttribute("data-marker"));
+
+		expect(renderedItems).toEqual([
+			"chat-message",
+			"sys-event",
+			"chat-message",
+		]);
 	});
 
 	it("uses the persisted run summary duration even when its content is empty", () => {
@@ -317,6 +527,34 @@ describe("ChatWindow — messages render & send", () => {
 		expect(screen.getByText("Worked for 9s")).toBeInTheDocument();
 	});
 
+	it("does not mark agent-switch activity complete before the run summary arrives", () => {
+		messagesRef.data = [
+			{
+				id: "m-1",
+				role: "user",
+				content: "Check my tickets",
+				created_at: "2026-04-20T00:00:00Z",
+			},
+		];
+		storeSelectors.systemEventsByConversation = {
+			"c-1": [
+				{
+					id: "event-1",
+					type: "agent_switch",
+					timestamp: "2026-04-20T00:00:01Z",
+					agentName: "Work Tracking Agent",
+					agentId: "agent-work",
+					reason: "automatic",
+				},
+			],
+		};
+		streamRef.isStreaming = false;
+
+		renderWithProviders(<ChatWindow conversationId="c-1" />);
+
+		expect(screen.queryByText(/Worked for/i)).not.toBeInTheDocument();
+	});
+
 	it("forwards a typed message to the stream's sendMessage", async () => {
 		messagesRef.data = [
 			{
@@ -338,38 +576,74 @@ describe("ChatWindow — messages render & send", () => {
 				"hello",
 				"c-1",
 				[],
-				"balanced",
+				"profile-balanced",
 			),
 		);
 	});
 
-	it("creates a conversation from the blank draft and sends the first message", async () => {
-		createConversationRef.mutateAsync.mockResolvedValue({
-			id: "new-conversation-id",
-			agent_id: null,
-		});
-
+	it("stages a blank-draft conversation ID without waiting for a create request", async () => {
 		renderWithProviders(<ChatWindow conversationId={undefined} />);
 
 		const input = screen.getByLabelText(/chat input/i) as HTMLInputElement;
 		fireEvent.change(input, { target: { value: "hello from draft" } });
 		fireEvent.keyDown(input, { key: "Enter" });
 
-		await waitFor(() =>
-			expect(createConversationRef.mutateAsync).toHaveBeenCalledWith({
-				body: { channel: "chat" },
-			}),
-		);
+		await waitFor(() => expect(streamRef.sendMessage).toHaveBeenCalled());
+		expect(createConversationRef.mutateAsync).not.toHaveBeenCalled();
 		expect(storeSelectors.setActiveConversation).toHaveBeenCalledWith(
-			"new-conversation-id",
+			"test-id",
 		);
 		expect(storeSelectors.setActiveAgent).toHaveBeenCalledWith(null);
-		expect(mockNavigate).toHaveBeenCalledWith("/chat/new-conversation-id");
+		expect(mockNavigate).toHaveBeenCalledWith("/chat/test-id", { state: { preserveChatDraft: true } });
 		expect(streamRef.sendMessage).toHaveBeenCalledWith(
 			"hello from draft",
-			"new-conversation-id",
+			"test-id",
 			[],
-			"balanced",
+			"profile-balanced",
 		);
+		expect(streamRef.sendMessage.mock.invocationCallOrder[0]).toBeLessThan(
+			storeSelectors.setActiveConversation.mock.invocationCallOrder[0],
+		);
+	});
+
+	it("stages an attachment turn before activating its new conversation", async () => {
+		const file = new File(["contents"], "notes.txt", {
+			type: "text/plain",
+		});
+		const attachment = {
+			id: "attachment-1",
+			filename: "notes.txt",
+			content_type: "text/plain",
+			size_bytes: 8,
+		};
+		chatInputFilesRef.current = [file];
+		createConversationRef.mutateAsync.mockResolvedValue({
+			id: "new-conversation",
+			agent_id: null,
+		});
+		attachmentServiceRef.upload.mockResolvedValue({
+			attachments: [attachment],
+		});
+		renderWithProviders(<ChatWindow conversationId={undefined} />);
+
+		const input = screen.getByLabelText(/chat input/i) as HTMLInputElement;
+		fireEvent.change(input, { target: { value: "summarize this file" } });
+		fireEvent.keyDown(input, { key: "Enter" });
+
+		await waitFor(() => expect(streamRef.sendMessage).toHaveBeenCalled());
+		expect(attachmentServiceRef.upload).toHaveBeenCalledWith(
+			"new-conversation",
+			[file],
+		);
+		expect(streamRef.sendMessage).toHaveBeenCalledWith(
+			"summarize this file",
+			"new-conversation",
+			[attachment],
+			"profile-balanced",
+		);
+		expect(streamRef.sendMessage.mock.invocationCallOrder[0]).toBeLessThan(
+			storeSelectors.setActiveConversation.mock.invocationCallOrder[0],
+		);
+		expect(mockNavigate).toHaveBeenCalledWith("/chat/new-conversation", { state: { preserveChatDraft: true } });
 	});
 });

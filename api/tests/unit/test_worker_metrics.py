@@ -14,7 +14,7 @@ class TestHeartbeatCgroupData:
         pool = ProcessPoolManager.__new__(ProcessPoolManager)
         pool.worker_id = "test-worker"
         pool.processes = {}
-        pool.max_workers = 10
+        pool.service_processes = {}
         pool._started_at = datetime.now(timezone.utc)
         pool._requirements_installed = 0
         pool._requirements_total = 0
@@ -36,7 +36,7 @@ class TestHeartbeatCgroupData:
         pool = ProcessPoolManager.__new__(ProcessPoolManager)
         pool.worker_id = "test-worker"
         pool.processes = {}
-        pool.max_workers = 10
+        pool.service_processes = {}
         pool._started_at = datetime.now(timezone.utc)
         pool._requirements_installed = 0
         pool._requirements_total = 0
@@ -58,7 +58,7 @@ class TestHeartbeatCgroupData:
         pool = ProcessPoolManager.__new__(ProcessPoolManager)
         pool.worker_id = "test-worker"
         pool.processes = {}
-        pool.max_workers = 10
+        pool.service_processes = {}
         pool._started_at = datetime.now(timezone.utc)
         pool._requirements_installed = 0
         pool._requirements_total = 0
@@ -97,6 +97,7 @@ class TestHeartbeatCgroupData:
             },
         )()
         pool.processes = {"p1": fake_proc}
+        pool.service_processes = {}
 
         with (
             patch(
@@ -137,6 +138,7 @@ class TestHeartbeatCgroupData:
             },
         )()
         pool.processes = {"p1": fake_proc}
+        pool.service_processes = {}
 
         with (
             patch(

@@ -5,7 +5,8 @@
  * Handles form state, validation, and API mutations.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -60,10 +61,12 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { Combobox } from "@/components/ui/combobox";
+import { AccessLevelSelect } from "@/components/access/AccessLevelSelect";
 import { term, useTerminology } from "@/lib/terminology";
 import { useRoles } from "@/hooks/useRoles";
 import { useAuth } from "@/contexts/AuthContext";
+import { useAuthorization } from "@/services/authorization";
+import { orgTarget } from "@/lib/authorization";
 import { OrganizationSelect } from "@/components/forms/OrganizationSelect";
 import {
 	useApplication,
@@ -86,24 +89,6 @@ import { useNavigate } from "react-router-dom";
 import type { components } from "@/lib/v1";
 
 type RolePublic = components["schemas"]["RolePublic"];
-
-const ACCESS_LEVELS = [
-	{
-		value: "role_based",
-		label: "Role-Based",
-		description: "Only users with assigned roles can access",
-	},
-	{
-		value: "authenticated",
-		label: "Everyone except external users",
-		description: "Any signed-in user except external users",
-	},
-	{
-		value: "everyone",
-		label: "Everyone",
-		description: "Any signed-in user, including external users",
-	},
-];
 
 const formSchema = z.object({
 	name: z
@@ -141,17 +126,36 @@ export function AppInfoDialog({
 	onCreated,
 }: AppInfoDialogProps) {
 	const isEditing = !!appSlug;
+	const savingRef = useRef(false);
+	const deletingRef = useRef(false);
+	const [deleting, setDeleting] = useState(false);
+	const [deleteError, setDeleteError] = useState(false);
+	const initializedSession = useRef<string | null>(null);
+	const rolesTriggerRef = useRef<HTMLButtonElement>(null);
+	const [saving, setSaving] = useState(false);
+	const [saveError, setSaveError] = useState(false);
 	const terminology = useTerminology();
-	const { isPlatformAdmin, user } = useAuth();
+	const { user } = useAuth();
+	const authorization = useAuthorization();
+	const queryClient = useQueryClient();
 
-	const { data: existingApp, isLoading: isLoadingApp } = useApplication(
-		isEditing ? appSlug : undefined,
-	);
+	const {
+		data: existingApp,
+		isLoading: isLoadingApp,
+		isFetching: isFetchingApp,
+		refetch: refetchApp,
+	} = useApplication(isEditing && open ? appSlug : undefined);
 
-	const { data: roles, isLoading: rolesLoading } = useRoles();
-	const createApplication = useCreateApplication();
-	const updateApplication = useUpdateApplication();
-	const deleteApplication = useDeleteApplication();
+	const {
+		data: roles,
+		isLoading: rolesLoading,
+		isError: rolesError,
+		isFetching: rolesFetching,
+		refetch: refetchRoles,
+	} = useRoles();
+	const createApplication = useCreateApplication({ errorToast: false });
+	const updateApplication = useUpdateApplication({ errorToast: false });
+	const deleteApplication = useDeleteApplication({ errorToast: false });
 	const navigate = useNavigate();
 
 	const [rolesPopoverOpen, setRolesPopoverOpen] = useState(false);
@@ -160,10 +164,7 @@ export function AppInfoDialog({
 	const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
 	const [replacePathOpen, setReplacePathOpen] = useState(false);
 
-	// Default organization_id for org users is their org, for platform admins it's null (global)
-	const defaultOrgId = isPlatformAdmin
-		? null
-		: (user?.organizationId ?? null);
+	const defaultOrgId = user?.organizationId ?? null;
 
 	const form = useForm<FormValues>({
 		resolver: zodResolver(formSchema),
@@ -177,10 +178,50 @@ export function AppInfoDialog({
 		},
 	});
 
-	const accessLevel = useWatch({ control: form.control, name: "access_level" });
+	const accessLevel = useWatch({
+		control: form.control,
+		name: "access_level",
+	});
+	const selectedOrganizationId = useWatch({
+		control: form.control,
+		name: "organization_id",
+	});
+	const currentOrganizationId = existingApp
+		? existingApp.organization_id
+		: defaultOrgId;
+	const canManageCurrentScope = authorization.canAt(
+		"apps.readwrite",
+		orgTarget(currentOrganizationId),
+	);
+	const canManageSelectedScope = authorization.canAt(
+		"apps.readwrite",
+		orgTarget(selectedOrganizationId),
+	);
+	const canChooseScope = authorization.canAnywhere("apps.readwrite");
+	const knownOrganizations = [
+		...(defaultOrgId
+			? [{ id: defaultOrgId, name: "Your organization" }]
+			: []),
+		...(existingApp?.organization_id
+			? [
+					{
+						id: existingApp.organization_id,
+						name: "Application organization",
+					},
+				]
+			: []),
+	];
 
-	// Load existing app data when editing
+	// Initialize each dialog session once; background refreshes must not replace the draft.
 	useEffect(() => {
+		if (!open) {
+			initializedSession.current = null;
+			return;
+		}
+		const sessionKey = isEditing ? `edit:${appSlug}` : "create";
+		if (initializedSession.current === sessionKey) return;
+		if (isEditing && !existingApp) return;
+		initializedSession.current = sessionKey;
 		if (existingApp && isEditing) {
 			form.reset({
 				name: existingApp.name,
@@ -188,21 +229,22 @@ export function AppInfoDialog({
 				description: existingApp.description ?? "",
 				organization_id: existingApp.organization_id ?? null,
 				access_level:
-					(existingApp.access_level as "authenticated" | "everyone" | "role_based") ||
+					(existingApp.access_level as
+						"authenticated" | "everyone" | "role_based") ||
 					"authenticated",
 				role_ids: existingApp.role_ids ?? [],
 			});
-		} else if (!isEditing && open) {
+		} else if (!isEditing) {
 			form.reset({
 				name: "",
 				slug: "",
 				description: "",
-					organization_id: defaultOrgId,
+				organization_id: defaultOrgId,
 				access_level: "role_based",
 				role_ids: [],
 			});
 		}
-	}, [existingApp, isEditing, form, open, defaultOrgId]);
+	}, [existingApp, isEditing, appSlug, form, open, defaultOrgId]);
 
 	// Auto-generate slug from name (only when creating and not manually edited)
 	const handleNameChange = (newName: string) => {
@@ -222,6 +264,8 @@ export function AppInfoDialog({
 	};
 
 	const handleClose = () => {
+		if (savingRef.current || deletingRef.current) return;
+		setSaveError(false);
 		form.reset();
 		setSlugManuallyEdited(false);
 		setAdvancedOpen(false);
@@ -229,6 +273,17 @@ export function AppInfoDialog({
 	};
 
 	const onSubmit = async (values: FormValues) => {
+		if (
+			savingRef.current ||
+			deletingRef.current ||
+			(isEditing && !existingApp) ||
+			!canManageCurrentScope ||
+			!canManageSelectedScope
+		)
+			return;
+		savingRef.current = true;
+		setSaving(true);
+		setSaveError(false);
 		try {
 			if (isEditing && existingApp) {
 				// Check if slug changed - we'll need to update the URL
@@ -244,12 +299,10 @@ export function AppInfoDialog({
 						description: values.description || null,
 						access_level: values.access_level,
 						role_ids: values.role_ids,
-						// scope is passed in body for platform admins
-						scope: isPlatformAdmin
-							? (values.organization_id ?? "global")
-							: undefined,
+						scope: values.organization_id ?? "global",
 					},
 				});
+				savingRef.current = false;
 				handleClose();
 
 				// If slug changed, trigger navigation callback with new slug
@@ -268,11 +321,15 @@ export function AppInfoDialog({
 						organization_id: values.organization_id || null,
 					},
 				});
+				savingRef.current = false;
 				handleClose();
 				onCreated?.(result.slug);
 			}
 		} catch {
-			// Error handling is done by the mutation hooks via toast
+			setSaveError(true);
+		} finally {
+			savingRef.current = false;
+			setSaving(false);
 		}
 	};
 
@@ -296,25 +353,48 @@ export function AppInfoDialog({
 		);
 	};
 
-	const isPending = createApplication.isPending || updateApplication.isPending;
-	const selectedRoleIds = useWatch({ control: form.control, name: "role_ids" });
+	const refreshLogoMetadata = () => {
+		if (!existingApp) return;
+		bumpEntityLogo("app", existingApp.id);
+		void queryClient.invalidateQueries({
+			queryKey: ["get", "/api/applications"],
+		});
+		void queryClient.invalidateQueries({
+			queryKey: [
+				"get",
+				"/api/applications/{slug}",
+				{ params: { path: { slug: existingApp.slug } } },
+			],
+		});
+		void queryClient.invalidateQueries({ queryKey: ["get", "/api/home"] });
+	};
+
+	const isPending =
+		saving ||
+		deleting ||
+		createApplication.isPending ||
+		updateApplication.isPending;
+	const selectedRoleIds = useWatch({
+		control: form.control,
+		name: "role_ids",
+	});
 
 	return (
 		<Dialog open={open} onOpenChange={handleClose}>
-			<DialogContent className="sm:max-w-[500px]">
-				<DialogHeader>
+			<DialogContent className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-[500px]">
+				<DialogHeader className="shrink-0 border-b p-4 pr-16!">
 					<div className="flex items-start gap-4">
 						{isEditing && existingApp ? (
-							<LogoDropZone
-								uploadUrl={`/api/applications/${existingApp.id}/logo`}
-								deleteUrl={`/api/applications/${existingApp.id}/logo`}
-								previewUrl={`/api/applications/${existingApp.id}/logo`}
-								fallback={<AppWindow className="h-6 w-6" />}
-								size={64}
-								onChange={() =>
-									bumpEntityLogo("app", existingApp.id)
-								}
-							/>
+							<div inert={isPending}>
+								<LogoDropZone
+									uploadUrl={`/api/applications/${existingApp.id}/logo`}
+									deleteUrl={`/api/applications/${existingApp.id}/logo`}
+									previewUrl={`/api/applications/${existingApp.id}/logo`}
+									fallback={<AppWindow className="h-6 w-6" />}
+									size={40}
+									onChange={refreshLogoMetadata}
+								/>
+							</div>
 						) : null}
 						<div className="min-w-0 flex-1">
 							<DialogTitle>
@@ -332,289 +412,456 @@ export function AppInfoDialog({
 				</DialogHeader>
 
 				{isEditing && isLoadingApp ? (
-					<div className="flex items-center justify-center py-8">
-						<Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+					<div
+						role="status"
+						className="flex items-center justify-center gap-3 py-8 text-sm text-muted-foreground"
+					>
+						<Loader2
+							aria-hidden="true"
+							className="h-6 w-6 animate-spin motion-reduce:animate-none"
+						/>
+						Loading application settings…
+					</div>
+				) : isEditing && !existingApp ? (
+					<div
+						role="alert"
+						className="space-y-3 rounded-[var(--bf-radius-surface)] border border-destructive/30 p-4"
+					>
+						<p className="text-sm text-destructive">
+							Couldn't load the application settings.
+						</p>
+						<Button
+							type="button"
+							variant="outline"
+							className="min-h-11"
+							disabled={isFetchingApp}
+							onClick={() => void refetchApp()}
+						>
+							{isFetchingApp
+								? "Loading…"
+								: "Retry loading settings"}
+						</Button>
 					</div>
 				) : (
 					<Form {...form}>
 						<form
-							onSubmit={form.handleSubmit(onSubmit)}
-							className="space-y-4"
+							onSubmit={(event) => {
+								void form.handleSubmit(onSubmit)(event);
+							}}
+							className="flex min-h-0 flex-1 flex-col overflow-hidden"
 						>
-							{/* Organization Scope - Only show for platform admins */}
-							{isPlatformAdmin && (
-								<FormField
-									control={form.control}
-									name="organization_id"
-									render={({ field }) => (
-										<FormItem>
-											<FormLabel>Organization</FormLabel>
-											<FormControl>
-												<OrganizationSelect
-													value={field.value}
-													onChange={field.onChange}
-													showGlobal={true}
-												/>
-											</FormControl>
-											<FormDescription>
-												{isEditing
-													? "Warning: Changing the organization will move the app to a different scope"
-													: "Global apps are available to all organizations"}
-											</FormDescription>
-											<FormMessage />
-										</FormItem>
-									)}
-								/>
-							)}
-
-							{/* Name */}
-							<FormField
-								control={form.control}
-								name="name"
-								render={({ field }) => (
-									<FormItem>
-										<FormLabel>Name</FormLabel>
-										<FormControl>
-											<Input
-												placeholder={`My ${term(terminology, "app", "formalSingular")}`}
-												{...field}
-												onChange={(e) =>
-													handleNameChange(e.target.value)
-												}
-											/>
-										</FormControl>
-										<FormMessage />
-									</FormItem>
-								)}
-							/>
-
-							{/* Slug */}
-							<FormField
-								control={form.control}
-								name="slug"
-								render={({ field }) => (
-									<FormItem>
-										<FormLabel>URL Slug</FormLabel>
-										<FormControl>
-											<Input
-												placeholder="my-application"
-												{...field}
-												onChange={(e) =>
-													handleSlugChange(e.target.value)
-												}
-											/>
-										</FormControl>
-										<FormDescription>
-											{isEditing
-												? "Warning: Changing the slug will change the app's URL"
-												: `Your app will be accessible at /apps/${field.value || "..."}`}
-										</FormDescription>
-										<FormMessage />
-									</FormItem>
-								)}
-							/>
-
-							{/* Description */}
-							<FormField
-								control={form.control}
-								name="description"
-								render={({ field }) => (
-									<FormItem>
-										<FormLabel>Description</FormLabel>
-										<FormControl>
-											<Textarea
-												placeholder="A brief description of your application..."
-												rows={3}
-												{...field}
-											/>
-										</FormControl>
-										<FormMessage />
-									</FormItem>
-								)}
-							/>
-
-							{/* Access Level */}
-							<FormField
-								control={form.control}
-								name="access_level"
-								render={({ field }) => (
-									<FormItem>
-										<FormLabel>Access Level</FormLabel>
-										<FormControl>
-											<Combobox
-												value={field.value}
-												onValueChange={field.onChange}
-												options={ACCESS_LEVELS}
-												placeholder="Select access level"
-											/>
-										</FormControl>
-										<FormDescription>
-											Controls who can view and use this application
-										</FormDescription>
-										<FormMessage />
-									</FormItem>
-								)}
-							/>
-
-							{/* Role Selection - Only show when role_based */}
-							{accessLevel === "role_based" && (
-								<FormField
-									control={form.control}
-									name="role_ids"
-									render={({ field }) => (
-										<FormItem>
-											<FormLabel>
-												Assigned Roles{" "}
-												{field.value.length > 0 &&
-													`(${field.value.length})`}
-											</FormLabel>
-											<Popover
-												open={rolesPopoverOpen}
-												onOpenChange={setRolesPopoverOpen}
-											>
-												<PopoverTrigger asChild>
-													<FormControl>
-														<Button
-															variant="outline"
-															role="combobox"
-															aria-expanded={rolesPopoverOpen}
-															className="w-full justify-between font-normal"
-															disabled={rolesLoading}
-														>
-															<span className="text-muted-foreground">
-																{rolesLoading
-																	? "Loading roles..."
-																	: "Select roles..."}
-															</span>
-															<ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-														</Button>
-													</FormControl>
-												</PopoverTrigger>
-												<PopoverContent
-													className="w-[var(--radix-popover-trigger-width)] p-0"
-													align="start"
-												>
-													<Command>
-														<CommandInput placeholder="Search roles..." />
-														<CommandList>
-															<CommandEmpty>
-																No roles found.
-															</CommandEmpty>
-															<CommandGroup>
-																{roles?.map((role: RolePublic) => (
-																	<CommandItem
-																		key={role.id}
-																		value={role.name || ""}
-																		data-checked={field.value.includes(
-																			role.id,
-																		)}
-																		onSelect={() =>
-																			toggleRole(role.id)
-																		}
-																	>
-																		<div className="flex flex-col flex-1">
-																			<span className="font-medium">
-																				{role.name}
-																			</span>
-																			{role.description && (
-																				<span className="text-xs text-muted-foreground">
-																					{role.description}
-																				</span>
-																			)}
-																		</div>
-																	</CommandItem>
-																))}
-															</CommandGroup>
-														</CommandList>
-													</Command>
-												</PopoverContent>
-											</Popover>
-											{selectedRoleIds.length > 0 && (
-												<div className="flex flex-wrap gap-2 p-2 rounded-md bg-muted/50 ring-1 ring-foreground/5">
-													{selectedRoleIds.map((roleId) => {
-														const role = roles?.find(
-															(r: RolePublic) => r.id === roleId,
-														);
-														return (
-															<Badge
-																key={roleId}
-																variant="secondary"
-																className="gap-1"
-															>
-																{role?.name || roleId}
-																<X
-																	className="h-3 w-3 cursor-pointer"
-																	onClick={() => removeRole(roleId)}
-																/>
-															</Badge>
-														);
-													})}
-												</div>
-											)}
-											<FormDescription>
-												Users must have at least one of these roles to
-												access the application
-											</FormDescription>
-											<FormMessage />
-										</FormItem>
-									)}
-								/>
-							)}
-
-							{isEditing && existingApp && (
-								<Collapsible
-									open={advancedOpen}
-									onOpenChange={setAdvancedOpen}
-									className="border-t pt-4"
+							<div className="min-h-0 flex-1 overflow-y-auto p-4">
+								<fieldset
+									disabled={isPending}
+									inert={isPending}
+									className="min-w-0 space-y-4 border-0 p-0"
 								>
-									<CollapsibleTrigger asChild>
-										<button
-											type="button"
-											className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-										>
-											{advancedOpen ? (
-												<ChevronDown className="h-3 w-3" />
-											) : (
-												<ChevronRight className="h-3 w-3" />
+									{canChooseScope && (
+										<FormField
+											control={form.control}
+											name="organization_id"
+											render={({ field }) => (
+												<FormItem>
+													<FormLabel>
+														Organization
+													</FormLabel>
+													<FormControl>
+														<OrganizationSelect
+															value={field.value}
+															onChange={
+																field.onChange
+															}
+															showGlobal={true}
+															loadOrganizations={authorization.canAnywhere(
+																"organizations.read",
+															)}
+															knownOrganizations={
+																knownOrganizations
+															}
+														/>
+													</FormControl>
+													<FormDescription>
+														{isEditing
+															? "Warning: Changing the organization will move the app to a different scope"
+															: "Global apps are available to all organizations"}
+													</FormDescription>
+													<FormMessage />
+												</FormItem>
 											)}
-											Advanced
-										</button>
-									</CollapsibleTrigger>
-									<CollapsibleContent className="pt-3 space-y-2">
-										<label className="text-sm font-medium">
-											Source path
-										</label>
-										<div className="flex items-center gap-2">
-											<code className="flex-1 bg-muted px-2 py-1.5 rounded text-xs font-mono truncate">
-												{existingApp.repo_path}
-											</code>
-											<Button
-												type="button"
-												variant="outline"
-												size="sm"
-												onClick={() => setReplacePathOpen(true)}
-											>
-												<ArrowRightLeft className="h-3 w-3 mr-1" />
-												Replace…
-											</Button>
-										</div>
-										<p className="text-xs text-muted-foreground">
-											Repoint this app at a different source
-											directory. Only do this after moving or renaming
-											files.
-										</p>
-									</CollapsibleContent>
-								</Collapsible>
-							)}
+										/>
+									)}
 
-							<DialogFooter className="pt-4 sm:justify-between">
+									{/* Name */}
+									<FormField
+										control={form.control}
+										name="name"
+										render={({ field }) => (
+											<FormItem>
+												<FormLabel>Name</FormLabel>
+												<FormControl>
+													<Input
+														placeholder={`My ${term(terminology, "app", "formalSingular")}`}
+														{...field}
+														onChange={(e) =>
+															handleNameChange(
+																e.target.value,
+															)
+														}
+													/>
+												</FormControl>
+												<FormMessage />
+											</FormItem>
+										)}
+									/>
+
+									{/* Slug */}
+									<FormField
+										control={form.control}
+										name="slug"
+										render={({ field }) => (
+											<FormItem>
+												<FormLabel>URL Slug</FormLabel>
+												<FormControl>
+													<Input
+														placeholder="my-application"
+														{...field}
+														onChange={(e) =>
+															handleSlugChange(
+																e.target.value,
+															)
+														}
+													/>
+												</FormControl>
+												<FormDescription>
+													{isEditing
+														? "Warning: Changing the slug will change the app's URL"
+														: `Your app will be accessible at /apps/${field.value || "..."}`}
+												</FormDescription>
+												<FormMessage />
+											</FormItem>
+										)}
+									/>
+
+									{/* Description */}
+									<FormField
+										control={form.control}
+										name="description"
+										render={({ field }) => (
+											<FormItem>
+												<FormLabel>
+													Description
+												</FormLabel>
+												<FormControl>
+													<Textarea
+														placeholder="A brief description of your application..."
+														rows={3}
+														{...field}
+													/>
+												</FormControl>
+												<FormMessage />
+											</FormItem>
+										)}
+									/>
+
+									{/* Access Level */}
+									<FormField
+										control={form.control}
+										name="access_level"
+										render={({ field }) => (
+											<FormItem>
+												<FormLabel>
+													Access Level
+												</FormLabel>
+												<FormControl>
+													<AccessLevelSelect
+														value={field.value}
+														onValueChange={
+															field.onChange
+														}
+													/>
+												</FormControl>
+												<FormDescription>
+													Controls who can view and
+													use this application
+												</FormDescription>
+												<FormMessage />
+											</FormItem>
+										)}
+									/>
+
+									{/* Role Selection - Only show when role_based */}
+									{accessLevel === "role_based" && (
+										<FormField
+											control={form.control}
+											name="role_ids"
+											render={({ field }) => (
+												<FormItem>
+													<FormLabel>
+														Assigned Roles{" "}
+														{field.value.length >
+															0 &&
+															`(${field.value.length})`}
+													</FormLabel>
+													{rolesError && (
+														<div
+															role="alert"
+															className="space-y-2 text-sm"
+														>
+															<p className="text-destructive">
+																Couldn't load
+																roles. Existing
+																assignments are
+																retained.
+															</p>
+															<Button
+																type="button"
+																variant="outline"
+																className="min-h-11"
+																disabled={
+																	rolesFetching
+																}
+																onClick={() =>
+																	void refetchRoles()
+																}
+															>
+																{rolesFetching
+																	? "Loading roles…"
+																	: "Retry loading roles"}
+															</Button>
+														</div>
+													)}
+													<Popover
+														open={rolesPopoverOpen}
+														onOpenChange={
+															setRolesPopoverOpen
+														}
+													>
+														<PopoverTrigger asChild>
+															<FormControl>
+																<Button
+																	variant="outline"
+																	role="combobox"
+																	aria-expanded={
+																		rolesPopoverOpen
+																	}
+																	ref={
+																		rolesTriggerRef
+																	}
+																	className="min-h-11 w-full justify-between font-normal"
+																	disabled={
+																		rolesLoading ||
+																		(rolesError &&
+																			!roles)
+																	}
+																>
+																	<span className="text-muted-foreground">
+																		{rolesLoading
+																			? "Loading roles..."
+																			: "Select roles..."}
+																	</span>
+																	<ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+																</Button>
+															</FormControl>
+														</PopoverTrigger>
+														<PopoverContent
+															variant="picker"
+															className="p-0"
+															align="start"
+														>
+															<Command>
+																<CommandInput placeholder="Search roles..." />
+																<CommandList>
+																	<CommandEmpty>
+																		No roles
+																		found.
+																	</CommandEmpty>
+																	<CommandGroup>
+																		{roles?.map(
+																			(
+																				role: RolePublic,
+																			) => (
+																				<CommandItem
+																					key={
+																						role.id
+																					}
+																					value={
+																						role.id
+																					}
+																					keywords={[
+																						role.name ||
+																							"",
+																						role.description ||
+																							"",
+																					]}
+																					className="min-h-11"
+																					data-checked={field.value.includes(
+																						role.id,
+																					)}
+																					onSelect={() =>
+																						toggleRole(
+																							role.id,
+																						)
+																					}
+																				>
+																					<div className="flex min-w-0 flex-1 flex-col [overflow-wrap:anywhere]">
+																						<span className="font-medium">
+																							{
+																								role.name
+																							}
+																						</span>
+																						{role.description && (
+																							<span className="text-xs text-muted-foreground">
+																								{
+																									role.description
+																								}
+																							</span>
+																						)}
+																					</div>
+																				</CommandItem>
+																			),
+																		)}
+																	</CommandGroup>
+																</CommandList>
+															</Command>
+														</PopoverContent>
+													</Popover>
+													{selectedRoleIds.length >
+														0 && (
+														<div className="flex flex-wrap gap-2 rounded-[var(--bf-radius-surface)] border p-2">
+															{selectedRoleIds.map(
+																(roleId) => {
+																	const role =
+																		roles?.find(
+																			(
+																				r: RolePublic,
+																			) =>
+																				r.id ===
+																				roleId,
+																		);
+																	return (
+																		<Badge
+																			key={
+																				roleId
+																			}
+																			variant="secondary"
+																			className="h-auto max-w-full gap-1 whitespace-normal [overflow-wrap:anywhere]"
+																		>
+																			{role?.name ||
+																				roleId}
+																			<Button
+																				type="button"
+																				variant="ghost"
+																				size="icon-lg"
+																				aria-label={`Remove ${role?.name || roleId}`}
+																				onClick={() => {
+																					removeRole(
+																						roleId,
+																					);
+																					rolesTriggerRef.current?.focus();
+																				}}
+																			>
+																				<X
+																					aria-hidden="true"
+																					className="h-4 w-4"
+																				/>
+																			</Button>
+																		</Badge>
+																	);
+																},
+															)}
+														</div>
+													)}
+													<FormDescription>
+														Users must have at least
+														one of these roles to
+														access the application
+													</FormDescription>
+													<FormMessage />
+												</FormItem>
+											)}
+										/>
+									)}
+
+									{isEditing && existingApp && (
+										<Collapsible
+											open={advancedOpen}
+											onOpenChange={setAdvancedOpen}
+											className="border-t pt-4"
+										>
+											<CollapsibleTrigger asChild>
+												<button
+													type="button"
+													className="flex min-h-11 items-center gap-2 text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+												>
+													{advancedOpen ? (
+														<ChevronDown className="h-3 w-3" />
+													) : (
+														<ChevronRight className="h-3 w-3" />
+													)}
+													Advanced
+												</button>
+											</CollapsibleTrigger>
+											<CollapsibleContent className="pt-3 space-y-2">
+												<label className="text-sm font-medium">
+													Source path
+												</label>
+												<div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center">
+													<code className="min-w-0 flex-1 bg-muted px-2 py-1.5 rounded-[var(--bf-radius-control)] text-xs font-mono [overflow-wrap:anywhere]">
+														{existingApp.repo_path}
+													</code>
+													<Button
+														type="button"
+														variant="outline"
+														size="sm"
+														className="min-h-11"
+														onClick={() =>
+															setReplacePathOpen(
+																true,
+															)
+														}
+													>
+														<ArrowRightLeft className="h-3 w-3 mr-1" />
+														Replace…
+													</Button>
+												</div>
+												<p className="text-xs text-muted-foreground">
+													Repoint this app at a
+													different source directory.
+													Only do this after moving or
+													renaming files.
+												</p>
+											</CollapsibleContent>
+										</Collapsible>
+									)}
+								</fieldset>
+							</div>
+							{saveError && (
+								<p
+									role="alert"
+									className="shrink-0 border-t px-4 py-3 text-sm text-destructive"
+								>
+									Couldn't save your changes. Please retry.
+								</p>
+							)}
+							{isPending && (
+								<p role="status" className="sr-only">
+									Saving application settings…
+								</p>
+							)}
+							<DialogFooter className="shrink-0 border-t p-4 sm:justify-between">
 								{isEditing && existingApp ? (
 									<Button
 										type="button"
 										variant="ghost"
-										className="text-destructive hover:text-destructive hover:bg-destructive/10"
-										onClick={() => setConfirmDeleteOpen(true)}
-										disabled={deleteApplication.isPending}
+										className="min-h-11 text-destructive hover:text-destructive hover:bg-destructive/10"
+										onClick={() => {
+											setDeleteError(false);
+											setConfirmDeleteOpen(true);
+										}}
+										disabled={
+											isPending ||
+											deleteApplication.isPending
+										}
 									>
 										<Trash2 className="mr-2 h-4 w-4" />
 										Delete
@@ -622,23 +869,34 @@ export function AppInfoDialog({
 								) : (
 									<span />
 								)}
-								<div className="flex gap-2">
+								<div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto">
 									<Button
 										type="button"
 										variant="outline"
+										className="min-h-11"
+										disabled={isPending}
 										onClick={handleClose}
 									>
 										Cancel
 									</Button>
-									<Button type="submit" disabled={isPending}>
+									<Button
+										type="submit"
+										className="min-h-11"
+										disabled={isPending}
+									>
 										{isPending && (
-											<Loader2 className="mr-2 h-4 w-4 animate-spin" />
+											<Loader2
+												aria-hidden="true"
+												className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+											/>
 										)}
 										{isPending
 											? "Saving..."
-											: isEditing
-												? "Save Changes"
-												: `Create ${term(terminology, "app", "formalSingular")}`}
+											: saveError
+												? "Retry save"
+												: isEditing
+													? "Save Changes"
+													: `Create ${term(terminology, "app", "formalSingular")}`}
 									</Button>
 								</div>
 							</DialogFooter>
@@ -656,12 +914,15 @@ export function AppInfoDialog({
 			{isEditing && existingApp && (
 				<AlertDialog
 					open={confirmDeleteOpen}
-					onOpenChange={setConfirmDeleteOpen}
+					onOpenChange={(next) => {
+						if (!deletingRef.current) setConfirmDeleteOpen(next);
+					}}
 				>
 					<AlertDialogContent>
 						<AlertDialogHeader>
 							<AlertDialogTitle>
-								Delete {term(terminology, "app", "formalSingular")}?
+								Delete{" "}
+								{term(terminology, "app", "formalSingular")}?
 							</AlertDialogTitle>
 							<AlertDialogDescription>
 								This will permanently delete{" "}
@@ -669,30 +930,64 @@ export function AppInfoDialog({
 								its files. This action cannot be undone.
 							</AlertDialogDescription>
 						</AlertDialogHeader>
+						{deleteError && (
+							<p
+								role="alert"
+								className="text-sm text-destructive"
+							>
+								Couldn't delete this application. Please retry.
+							</p>
+						)}
+						{deleting && (
+							<p role="status" className="sr-only">
+								Deleting application…
+							</p>
+						)}
 						<AlertDialogFooter>
-							<AlertDialogCancel>Cancel</AlertDialogCancel>
+							<AlertDialogCancel disabled={deleting}>
+								Cancel
+							</AlertDialogCancel>
 							<AlertDialogAction
 								className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-								onClick={async () => {
-									await deleteApplication.mutateAsync({
-										params: {
-											path: { app_id: existingApp.id },
-										},
-									});
-									setConfirmDeleteOpen(false);
-									onOpenChange(false);
-									// If the user was on the code editor for this
-									// app, drop them back to the apps list.
-									if (
-										window.location.pathname.startsWith(
-											`/apps/${existingApp.slug}`,
-										)
-									) {
-										navigate("/apps");
+								disabled={deleting}
+								onClick={async (event) => {
+									event.preventDefault();
+									if (deletingRef.current) return;
+									deletingRef.current = true;
+									setDeleting(true);
+									setDeleteError(false);
+									try {
+										await deleteApplication.mutateAsync({
+											params: {
+												path: {
+													app_id: existingApp.id,
+												},
+											},
+										});
+										setConfirmDeleteOpen(false);
+										onOpenChange(false);
+										// If the user was on the code editor for this
+										// app, drop them back to the apps list.
+										if (
+											window.location.pathname.startsWith(
+												`/apps/${existingApp.slug}`,
+											)
+										) {
+											navigate("/apps");
+										}
+									} catch {
+										setDeleteError(true);
+									} finally {
+										deletingRef.current = false;
+										setDeleting(false);
 									}
 								}}
 							>
-								Delete
+								{deleting
+									? "Deleting…"
+									: deleteError
+										? "Retry delete"
+										: "Delete"}
 							</AlertDialogAction>
 						</AlertDialogFooter>
 					</AlertDialogContent>

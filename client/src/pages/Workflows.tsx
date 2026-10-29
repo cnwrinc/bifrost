@@ -1,6 +1,11 @@
 import { useState, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
-import { RefreshCw, LayoutGrid, Table as TableIcon, PanelLeft } from "lucide-react";
+import {
+	RefreshCw,
+	LayoutGrid,
+	Table as TableIcon,
+	PanelLeft,
+} from "lucide-react";
 import { useIsDesktop } from "@/hooks/useMediaQuery";
 import type { CategoryCount } from "@/components/workflows/WorkflowSidebar";
 import {
@@ -9,10 +14,13 @@ import {
 } from "@/components/workflows/WorkflowListSurface";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { useWorkflowsFiltered, useWorkflowsMetadata } from "@/hooks/useWorkflows";
+import {
+	useWorkflowsFiltered,
+	useWorkflowsMetadata,
+} from "@/hooks/useWorkflows";
 import { useWorkflowKeys } from "@/hooks/useWorkflowKeys";
-import { useAuth } from "@/contexts/AuthContext";
 import { useOrganizations } from "@/hooks/useOrganizations";
+import { useOrganizationName } from "@/hooks/useOrganizationName";
 import { OrphanedWorkflowDialog } from "@/components/workflows/OrphanedWorkflowDialog";
 import { WorkflowEditDialog } from "@/components/workflows/WorkflowEditDialog";
 import { WorkflowSidebar } from "@/components/workflows/WorkflowSidebar";
@@ -21,8 +29,19 @@ import { useSearch } from "@/hooks/useSearch";
 import { OrganizationSelect } from "@/components/forms/OrganizationSelect";
 import { useEditorStore } from "@/stores/editorStore";
 import { fileService } from "@/services/fileService";
+import { useServicesList } from "@/components/services/useServiceQueries";
+import { serviceDetailHref } from "@/pages/ServiceDetail";
+import { ListPageHeader } from "@/components/layout/ListPageHeader";
+import { ListLoadError } from "@/components/layout/ListLoadError";
+import { ListToolbar } from "@/components/layout/ListToolbar";
+import {
+	PageScrollArea,
+	PageWorkspace,
+} from "@/components/layout/PageWorkspace";
 import { toast } from "sonner";
 import type { components } from "@/lib/v1";
+import { GLOBAL_TARGET, orgTarget } from "@/lib/authorization";
+import { useAuthorization } from "@/services/authorization";
 
 // Extend WorkflowMetadata with fields that may not be in generated types yet
 type BaseWorkflow = components["schemas"]["WorkflowMetadata"];
@@ -30,11 +49,14 @@ type Workflow = BaseWorkflow & {
 	is_orphaned?: boolean;
 	access_level?: "authenticated" | "everyone" | "role_based";
 };
-type Organization = components["schemas"]["OrganizationPublic"];
-
 export function Workflows() {
 	const navigate = useNavigate();
-	const { isPlatformAdmin } = useAuth();
+	const authorization = useAuthorization();
+	const canManageWorkflows = authorization.canAnywhere("workflows.readwrite");
+	const canEditWorkspace = authorization.canAt(
+		"repository.readwrite",
+		GLOBAL_TARGET,
+	);
 	const { data: apiKeys } = useWorkflowKeys({ includeRevoked: false });
 	const isDesktop = useIsDesktop();
 
@@ -58,23 +80,56 @@ export function Workflows() {
 
 	// Edit workflow dialog state
 	const [editDialogOpen, setEditDialogOpen] = useState(false);
-	const [editingWorkflow, setEditingWorkflow] = useState<Workflow | null>(null);
-	const [editDialogInitialTab, setEditDialogInitialTab] = useState<string | undefined>(undefined);
+	const [editingWorkflow, setEditingWorkflow] = useState<Workflow | null>(
+		null,
+	);
+	const [editDialogInitialTab, setEditDialogInitialTab] = useState<
+		string | undefined
+	>(undefined);
 
 	// Orphaned workflow dialog state
 	const [orphanedDialogOpen, setOrphanedDialogOpen] = useState(false);
-	const [orphanedWorkflow, setOrphanedWorkflow] = useState<Workflow | null>(null);
+	const [orphanedWorkflow, setOrphanedWorkflow] = useState<Workflow | null>(
+		null,
+	);
 
 	// Entity filter state
-	const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+	const [selectedCategory, setSelectedCategory] = useState<string | null>(
+		null,
+	);
 	const [selectedFormId, setSelectedFormId] = useState<string | null>(null);
 	const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
 	const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
 	const [endpointFilter, setEndpointFilter] = useState(false);
 	const [orphanedFilter, setOrphanedFilter] = useState(false);
 
+	const activeFilterCount = [
+		searchTerm.trim(),
+		filterOrgId !== undefined,
+		typeFilter !== "all",
+		selectedCategory,
+		selectedFormId,
+		selectedAppId,
+		selectedAgentId,
+		endpointFilter,
+		orphanedFilter,
+	].filter(Boolean).length;
+	const clearFilters = () => {
+		setSearchTerm("");
+		setFilterOrgId(undefined);
+		setTypeFilter("all");
+		setSelectedCategory(null);
+		setSelectedFormId(null);
+		setSelectedAppId(null);
+		setSelectedAgentId(null);
+		setEndpointFilter(false);
+		setOrphanedFilter(false);
+	};
+
 	// Open in editor state
-	const [openingWorkflowId, setOpeningWorkflowId] = useState<string | null>(null);
+	const [openingWorkflowId, setOpeningWorkflowId] = useState<string | null>(
+		null,
+	);
 	const openFileInTab = useEditorStore((state) => state.openFileInTab);
 	const openEditor = useEditorStore((state) => state.openEditor);
 	const setSidebarPanel = useEditorStore((state) => state.setSidebarPanel);
@@ -85,24 +140,20 @@ export function Workflows() {
 
 	// Fetch organizations for org name lookup (platform admins only)
 	const { data: organizations } = useOrganizations({
-		enabled: isPlatformAdmin,
+		enabled: authorization.canAnywhere("organizations.read"),
 	});
 
-	// Helper to get organization name from ID
-	const getOrgName = (orgId: string | null | undefined): string => {
-		if (!orgId) return "Global";
-		const org = organizations?.find((o: Organization) => o.id === orgId);
-		return org?.name || orgId;
-	};
+	const getOrgName = useOrganizationName(organizations);
 
 	// Fetch workflows with entity filters and org scope
-	const { data, isLoading, refetch } = useWorkflowsFiltered({
-		scope: isPlatformAdmin ? filterOrgId : undefined,
-		type: typeFilter === "all" ? undefined : typeFilter,
-		filterByForm: selectedFormId ?? undefined,
-		filterByApp: selectedAppId ?? undefined,
-		filterByAgent: selectedAgentId ?? undefined,
-	});
+	const { data, isLoading, isError, isFetching, refetch } =
+		useWorkflowsFiltered({
+			scope: filterOrgId,
+			type: typeFilter === "all" ? undefined : typeFilter,
+			filterByForm: selectedFormId ?? undefined,
+			filterByApp: selectedAppId ?? undefined,
+			filterByAgent: selectedAgentId ?? undefined,
+		});
 
 	// Cast to Workflow type which includes is_orphaned (may not be in generated types yet)
 	const workflows = useMemo(() => (data || []) as Workflow[], [data]);
@@ -112,7 +163,10 @@ export function Workflows() {
 		const categoryMap = new Map<string, number>();
 		workflows.forEach((w) => {
 			if (w.category) {
-				categoryMap.set(w.category, (categoryMap.get(w.category) || 0) + 1);
+				categoryMap.set(
+					w.category,
+					(categoryMap.get(w.category) || 0) + 1,
+				);
 			}
 		});
 		return Array.from(categoryMap.entries())
@@ -138,6 +192,7 @@ export function Workflows() {
 	// Apply search filter (type filtering is now done server-side)
 	const filteredWorkflows = useSearch(categoryFilteredWorkflows, searchTerm, [
 		"name",
+		"display_name",
 		"description",
 		"category",
 		(w) => w.parameters?.map((p) => p.name).join(" ") || "",
@@ -162,7 +217,7 @@ export function Workflows() {
 	}, [apiKeys]);
 
 	const handleExecute = (workflowName: string) => {
-		navigate(`/workflows/${workflowName}/execute`);
+		navigate(`/workflows/${encodeURIComponent(workflowName)}/execute`);
 	};
 
 	const handleEditWorkflow = (workflow: Workflow, tab?: string) => {
@@ -177,8 +232,8 @@ export function Workflows() {
 	};
 
 	const handleOpenInEditor = async (workflow: Workflow) => {
-		const workflowMeta = metadata?.workflows?.find(
-			(w) => w.name === workflow.name,
+		const workflowMeta = metadata?.workflows?.find((w) =>
+			workflow.id ? w.id === workflow.id : w.name === workflow.name,
 		);
 		const relativeFilePath = workflowMeta?.relative_file_path;
 
@@ -190,8 +245,11 @@ export function Workflows() {
 		setOpeningWorkflowId(workflow.id ?? workflow.name ?? null);
 		try {
 			const fileResponse = await fileService.readFile(relativeFilePath);
-			const fileName = relativeFilePath.split("/").pop() || relativeFilePath;
-			const extension = fileName.includes(".") ? fileName.split(".").pop()! : null;
+			const fileName =
+				relativeFilePath.split("/").pop() || relativeFilePath;
+			const extension = fileName.includes(".")
+				? fileName.split(".").pop()!
+				: null;
 
 			const fileMetadata = {
 				name: fileName,
@@ -221,62 +279,138 @@ export function Workflows() {
 		}
 	};
 
-	return (
-		<div className="h-full flex flex-col space-y-6 max-w-7xl mx-auto">
-			<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-				<div>
-					<h1 className="text-3xl font-extrabold tracking-tight sm:text-4xl">
-						Workflows
-					</h1>
-					<p className="mt-2 text-muted-foreground">
-						Execute workflows directly with custom parameters
-					</p>
-				</div>
-				<div className="flex flex-wrap gap-2">
-					<ToggleGroup
-						type="single"
-						value={viewMode}
-						onValueChange={(value: string) =>
-							value && setViewMode(value as "grid" | "table")
-						}
-					>
-						<ToggleGroupItem
-							value="grid"
-							aria-label="Grid view"
-							size="sm"
-						>
-							<LayoutGrid className="h-4 w-4" />
-						</ToggleGroupItem>
-						<ToggleGroupItem
-							value="table"
-							aria-label="Table view"
-							size="sm"
-						>
-							<TableIcon className="h-4 w-4" />
-						</ToggleGroupItem>
-					</ToggleGroup>
-					<Button
-						variant="outline"
-						size="icon"
-						onClick={() => refetch()}
-						aria-label="Refresh"
-					>
-						<RefreshCw className="h-4 w-4" />
-					</Button>
-				</div>
-			</div>
+	// Service rows deep-link to the Services detail route, resolved
+	// against the live services list (admin-only endpoint — disabled
+	// for non-admins, who get no service links).
+	const { data: servicesData } = useServicesList({
+		enabled: authorization.isPlatformAdmin,
+	});
+	const getServiceHref = (workflow: WorkflowListItem) => {
+		const match = servicesData?.items.find(
+			(s) => s.workflow_id === workflow.id,
+		);
+		return match ? serviceDetailHref(match) : undefined;
+	};
 
-			{/* Search Box, Org Filter, and Type Filter */}
-			<div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center">
+	const workflowList = (
+		<PageScrollArea
+			aria-label="Workflow list"
+			className={
+				viewMode === "table"
+					? "space-y-4 xl:flex xl:flex-col xl:overflow-hidden"
+					: "space-y-4"
+			}
+		>
+			{isError && (
+				<ListLoadError
+					resource="workflows"
+					hasCachedData={data !== undefined}
+					isRetrying={isFetching}
+					onRetry={() => void refetch()}
+				/>
+			)}
+			{isLoading && (
+				<p role="status" className="sr-only">
+					Loading workflows…
+				</p>
+			)}
+			{(!isError || data !== undefined) && (
+				<WorkflowListSurface
+					workflows={filteredWorkflows as WorkflowListItem[]}
+					viewMode={isDesktop ? viewMode : "grid"}
+					isLoading={isLoading}
+					isPlatformAdmin={authorization.canAnywhere(
+						"organizations.read",
+					)}
+					canManageWorkflows={canManageWorkflows}
+					canManageWorkflow={(workflow) =>
+						authorization.canAt(
+							"workflows.readwrite",
+							orgTarget(workflow.organization_id),
+						)
+					}
+					getOrgName={getOrgName}
+					hasGlobalKey={hasGlobalKey}
+					workflowsWithKeys={workflowsWithKeys}
+					openingWorkflowId={openingWorkflowId}
+					onOpenCode={
+						canEditWorkspace ? handleOpenInEditor : undefined
+					}
+					onEditScope={(workflow) => handleEditWorkflow(workflow)}
+					onEditEndpoint={(workflow) =>
+						handleEditWorkflow(workflow, "endpoint")
+					}
+					onResolveOrphaned={handleOpenOrphanedDialog}
+					onExecute={(workflow) => handleExecute(workflow.name ?? "")}
+					getServiceHref={getServiceHref}
+					onOpenEmpty={() => openEditor()}
+					emptySearchActive={activeFilterCount > 0}
+				/>
+			)}
+		</PageScrollArea>
+	);
+
+	return (
+		<PageWorkspace className="mx-auto w-full max-w-7xl pb-1 xl:h-full xl:min-h-0">
+			<ListPageHeader
+				title="Workflows"
+				description="Execute workflows directly with custom parameters"
+				className="flex-row flex-nowrap sm:flex-wrap"
+				actionsClassName="shrink-0 self-start"
+				actions={
+					<>
+						{isDesktop && (
+							<ToggleGroup
+								aria-label="Workflow layout"
+								type="single"
+								value={viewMode}
+								onValueChange={(value: string) =>
+									value &&
+									setViewMode(value as "grid" | "table")
+								}
+							>
+								<ToggleGroupItem
+									value="grid"
+									aria-label="Grid view"
+									size="lg"
+								>
+									<LayoutGrid className="h-4 w-4" />
+								</ToggleGroupItem>
+								<ToggleGroupItem
+									value="table"
+									aria-label="Table view"
+									size="lg"
+								>
+									<TableIcon className="h-4 w-4" />
+								</ToggleGroupItem>
+							</ToggleGroup>
+						)}
+						<Button
+							variant="outline"
+							size="icon-lg"
+							onClick={() => refetch()}
+							aria-label="Refresh"
+							disabled={isFetching}
+						>
+							<RefreshCw
+								className={`h-4 w-4 ${isFetching ? "animate-spin motion-reduce:animate-none" : ""}`}
+							/>
+						</Button>
+					</>
+				}
+			/>
+
+			<ListToolbar className="items-stretch">
 				<SearchBox
 					value={searchTerm}
 					onChange={setSearchTerm}
 					placeholder="Search by name, description, or category..."
-					className="flex-1"
+					className="w-full min-w-0 sm:flex-1"
 				/>
-				{isPlatformAdmin && (
-					<div className="w-full sm:w-64">
+				{authorization.canAnywhere("organizations.read") && (
+					<div className="w-full min-w-0 sm:w-64">
 						<OrganizationSelect
+							aria-label="Organization scope"
 							value={filterOrgId}
 							onChange={setFilterOrgId}
 							showAll={true}
@@ -285,90 +419,134 @@ export function Workflows() {
 						/>
 					</div>
 				)}
-				<ToggleGroup
-					type="single"
-					value={typeFilter}
-					onValueChange={(value: string) =>
-						value && setTypeFilter(value)
-					}
-				>
-					<ToggleGroupItem value="all" size="sm">
-						All
-					</ToggleGroupItem>
-					<ToggleGroupItem value="workflow" size="sm">
-						Workflows
-					</ToggleGroupItem>
-					<ToggleGroupItem value="tool" size="sm">
-						Tools
-					</ToggleGroupItem>
-					<ToggleGroupItem value="data_provider" size="sm">
-						Data Providers
-					</ToggleGroupItem>
-				</ToggleGroup>
-			</div>
+				<div className="flex min-w-0 flex-wrap gap-2">
+					<ToggleGroup
+						aria-label="Workflow type"
+						className="grid w-full grid-cols-2 justify-start sm:flex sm:w-auto"
+						type="single"
+						value={typeFilter}
+						onValueChange={(value: string) =>
+							value && setTypeFilter(value)
+						}
+					>
+						<ToggleGroupItem value="all" size="lg">
+							All
+						</ToggleGroupItem>
+						<ToggleGroupItem value="workflow" size="lg">
+							Workflows
+						</ToggleGroupItem>
+						<ToggleGroupItem value="tool" size="lg">
+							Tools
+						</ToggleGroupItem>
+						<ToggleGroupItem value="data_provider" size="lg">
+							Data Providers
+						</ToggleGroupItem>
+					</ToggleGroup>
+				</div>
+				{activeFilterCount > 0 && (
+					<div className="flex w-full items-center justify-between gap-3">
+						<p
+							className="text-sm text-muted-foreground"
+							role="status"
+						>
+							{activeFilterCount}{" "}
+							{activeFilterCount === 1 ? "filter" : "filters"}{" "}
+							applied
+						</p>
+						<Button
+							type="button"
+							variant="ghost"
+							className="min-h-11"
+							onClick={clearFilters}
+						>
+							Clear filters
+						</Button>
+					</div>
+				)}
+			</ListToolbar>
 
 			{/* Main Content with Sidebar */}
-			<div className="flex-1 flex gap-6 min-h-0">
-				{/* Sidebar */}
-				{sidebarOpen ? (
-					<WorkflowSidebar
-						categories={categories}
-						categoriesLoading={isLoading}
-						selectedCategory={selectedCategory}
-						onCategorySelect={setSelectedCategory}
-						selectedFormId={selectedFormId}
-						selectedAppId={selectedAppId}
-						selectedAgentId={selectedAgentId}
-						onFormSelect={setSelectedFormId}
-						onAppSelect={setSelectedAppId}
-						onAgentSelect={setSelectedAgentId}
-						endpointFilter={endpointFilter}
-						onEndpointFilterChange={setEndpointFilter}
-						orphanedFilter={orphanedFilter}
-						onOrphanedFilterChange={setOrphanedFilter}
-						scope={isPlatformAdmin ? filterOrgId ?? undefined : undefined}
-						onClose={() => setSidebarOpen(false)}
-						className="w-64 shrink-0"
-					/>
-				) : (
-					<Button
-						variant="outline"
-						size="icon"
-						onClick={() => setSidebarOpen(true)}
-						className="shrink-0 h-9 w-9"
-						title="Show filters"
-					>
-						<PanelLeft className="h-4 w-4" />
-					</Button>
-				)}
-
-				{/* Content Area */}
-				<div className="flex-1 min-w-0 min-h-0 overflow-auto">
-					<WorkflowListSurface
-						workflows={filteredWorkflows as WorkflowListItem[]}
-						viewMode={viewMode}
-						isLoading={isLoading}
-						isPlatformAdmin={isPlatformAdmin}
-						canManageWorkflows={isPlatformAdmin}
-						getOrgName={getOrgName}
-						hasGlobalKey={hasGlobalKey}
-						workflowsWithKeys={workflowsWithKeys}
-						openingWorkflowId={openingWorkflowId}
-						onViewHistory={(workflow) =>
-							navigate(`/history?workflow=${workflow.id ?? ""}`)
-						}
-						onOpenCode={handleOpenInEditor}
-						onEditScope={(workflow) => handleEditWorkflow(workflow)}
-						onEditEndpoint={(workflow) =>
-							handleEditWorkflow(workflow, "endpoint")
-						}
-						onResolveOrphaned={handleOpenOrphanedDialog}
-						onExecute={(workflow) => handleExecute(workflow.name ?? "")}
-						onOpenEmpty={() => openEditor()}
-						emptySearchActive={Boolean(searchTerm)}
-					/>
+			{isDesktop ? (
+				<div className="flex min-h-0 flex-1 gap-6">
+					{sidebarOpen ? (
+						<WorkflowSidebar
+							categories={categories}
+							categoriesLoading={isLoading}
+							selectedCategory={selectedCategory}
+							onCategorySelect={setSelectedCategory}
+							selectedFormId={selectedFormId}
+							selectedAppId={selectedAppId}
+							selectedAgentId={selectedAgentId}
+							onFormSelect={setSelectedFormId}
+							onAppSelect={setSelectedAppId}
+							onAgentSelect={setSelectedAgentId}
+							endpointFilter={endpointFilter}
+							onEndpointFilterChange={setEndpointFilter}
+							orphanedFilter={orphanedFilter}
+							onOrphanedFilterChange={setOrphanedFilter}
+							scope={
+								authorization.canAnywhere("organizations.read")
+									? (filterOrgId ?? undefined)
+									: undefined
+							}
+							onClose={() => setSidebarOpen(false)}
+							className="w-64 shrink-0"
+						/>
+					) : (
+						<Button
+							variant="outline"
+							size="icon-lg"
+							onClick={() => setSidebarOpen(true)}
+							className="shrink-0"
+							title="Show filters"
+							aria-expanded={sidebarOpen}
+						>
+							<PanelLeft className="h-4 w-4" />
+						</Button>
+					)}
+					{workflowList}
 				</div>
-			</div>
+			) : (
+				<div className="flex flex-col gap-4 lg:min-h-0 lg:flex-1 lg:flex-row">
+					{sidebarOpen ? (
+						<WorkflowSidebar
+							categories={categories}
+							categoriesLoading={isLoading}
+							selectedCategory={selectedCategory}
+							onCategorySelect={setSelectedCategory}
+							selectedFormId={selectedFormId}
+							selectedAppId={selectedAppId}
+							selectedAgentId={selectedAgentId}
+							onFormSelect={setSelectedFormId}
+							onAppSelect={setSelectedAppId}
+							onAgentSelect={setSelectedAgentId}
+							endpointFilter={endpointFilter}
+							onEndpointFilterChange={setEndpointFilter}
+							orphanedFilter={orphanedFilter}
+							onOrphanedFilterChange={setOrphanedFilter}
+							scope={
+								authorization.canAnywhere("organizations.read")
+									? (filterOrgId ?? undefined)
+									: undefined
+							}
+							onClose={() => setSidebarOpen(false)}
+							className="w-full lg:max-h-full lg:w-64 lg:shrink-0 lg:overflow-auto"
+						/>
+					) : (
+						<Button
+							variant="outline"
+							onClick={() => setSidebarOpen(true)}
+							className="h-11 w-full justify-start gap-2 lg:w-auto lg:shrink-0"
+							title="Show filters"
+							aria-expanded={sidebarOpen}
+						>
+							<PanelLeft className="h-4 w-4" />
+							<span>Show filters</span>
+						</Button>
+					)}
+					{workflowList}
+				</div>
+			)}
 
 			{/* Orphaned Workflow Dialog */}
 			{orphanedWorkflow && (
@@ -388,6 +566,6 @@ export function Workflows() {
 				onSuccess={() => refetch()}
 				initialTab={editDialogInitialTab}
 			/>
-		</div>
+		</PageWorkspace>
 	);
 }

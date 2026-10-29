@@ -12,6 +12,7 @@ import asyncio
 import base64
 import logging
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
@@ -22,7 +23,9 @@ from sqlalchemy.orm import selectinload
 from src.core.auth import CurrentActiveUser
 from src.core.db_deps import DbSession
 from src.core.log_safety import log_safe
-from src.core.org_filter import resolve_org_filter
+from src.core.org_filter import OrgFilterType
+from shared.scope_resolver import UNSET
+from shared.resource_access import ResourceAccessResolver, ResourceKind
 from src.models.contracts.agent_stats import AgentStatsResponse, FleetStatsResponse
 from src.models.contracts.agents import (
     AgentAccessLevel,
@@ -31,7 +34,6 @@ from src.models.contracts.agents import (
     AgentPublic,
     AgentSummary,
     AgentUpdate,
-    AccessibleKnowledgeSource,
     AccessibleTool,
 )
 from src.models.orm import (
@@ -40,7 +42,7 @@ from src.models.orm import (
     AgentMCPConnection,
     AgentRole,
     AgentTool,
-    MCPConnection,
+    AIModelProfile,
     Role,
     Workflow,
 )
@@ -50,155 +52,80 @@ from shared.logo_processing import (
     process_logo,
 )
 from src.repositories.agents import AgentRepository
+from src.services.agent_write_policy import (
+    can_configure_agent,
+    can_read_agent,
+    can_write_agent,
+    caller_user_id,
+    enforce_personal_agent_create,
+    enforce_personal_agent_update,
+    validate_agent_references,
+    validate_user_tool_access,
+)
+from src.services.authorization.enforce import allows_permission, load_caller, user_reach
 from src.services.solutions.guard import assert_not_solution_managed
 from src.routers.tools import get_system_tool_ids
 from src.services.agent_stats import get_agent_stats, get_agent_stats_batch, get_fleet_stats
 from src.services.workflow_role_service import sync_agent_roles_to_workflows
+from src.services.operation_catalog import operation_route
+
+if TYPE_CHECKING:
+    from src.services.authorization.enforce import Caller
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agents", tags=["Agents"])
 
-async def _validate_agent_references(
+
+async def _validate_llm_profile_id(
     db: DbSession,
-    tool_ids: list[str] | None,
-    delegated_agent_ids: list[str] | None,
-    agent_id: UUID | None = None,  # For self-delegation check
+    llm_profile_id: UUID | None,
 ) -> None:
-    """
-    Validate that all referenced tools and agents exist and are valid.
-
-    Args:
-        db: Database session
-        tool_ids: List of tool IDs to validate (must be type='tool')
-        delegated_agent_ids: List of agent IDs to delegate to
-        agent_id: The agent being created/updated (for self-delegation check)
-
-    Raises:
-        HTTPException: 422 if any reference is invalid
-    """
-    errors: list[str] = []
-
-    # Validate tool_ids
-    if tool_ids:
-        for tool_id in tool_ids:
-            try:
-                workflow_uuid = UUID(tool_id)
-                result = await db.execute(
-                    select(Workflow).where(Workflow.id == workflow_uuid)
-                )
-                workflow = result.scalar_one_or_none()
-                if workflow is None:
-                    errors.append(f"tool_id '{tool_id}' does not reference an existing workflow")
-                elif not workflow.is_active:
-                    errors.append(f"tool_id '{tool_id}' references an inactive workflow")
-                elif workflow.type != "tool":
-                    errors.append(
-                        f"tool_id '{tool_id}' references a {workflow.type}, not a tool"
-                    )
-            except ValueError:
-                errors.append(f"tool_id '{tool_id}' is not a valid UUID")
-
-    # Validate delegated_agent_ids
-    if delegated_agent_ids:
-        for delegate_id in delegated_agent_ids:
-            try:
-                delegate_uuid = UUID(delegate_id)
-
-                # Check for self-delegation
-                if agent_id and delegate_uuid == agent_id:
-                    errors.append(f"Agent cannot delegate to itself ('{delegate_id}')")
-                    continue
-
-                result = await db.execute(
-                    select(Agent).where(Agent.id == delegate_uuid)
-                )
-                delegate = result.scalar_one_or_none()
-                if delegate is None:
-                    errors.append(f"delegated_agent_id '{delegate_id}' does not reference an existing agent")
-                elif not delegate.is_active:
-                    errors.append(f"delegated_agent_id '{delegate_id}' references an inactive agent")
-            except ValueError:
-                errors.append(f"delegated_agent_id '{delegate_id}' is not a valid UUID")
-
-    if errors:
+    """Validate that a referenced model profile exists."""
+    if llm_profile_id is None:
+        return
+    exists = await db.scalar(
+        select(AIModelProfile.id).where(AIModelProfile.id == llm_profile_id)
+    )
+    if exists is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"errors": errors, "message": "Invalid agent references"},
+            detail=f"llm_profile_id '{llm_profile_id}' does not reference an existing model profile",
         )
 
 
-async def _validate_user_tool_access(
-    db: DbSession,
-    user_id: UUID,
-    tool_ids: list[str],
-    is_external: bool = False,
-) -> None:
-    """Validate user can access all specified tools via their roles.
+def _may_promote_agent(caller: "Caller", agent: Agent) -> bool:
+    """Whether caller holds agent write permission at this agent's boundary."""
+    from src.services.authorization.enforce import permitted_organizations
 
-    External users get no authenticated-tier entitlement (EXT-1 rule 2):
-    a workflow with access_level='authenticated' still requires a role
-    intersection for them.
-    """
-    if not tool_ids:
-        return
+    return permitted_organizations(caller, "agents.readwrite").covers(agent.organization_id)
 
-    from src.models.orm.users import UserRole
-    from src.models.orm.workflow_roles import WorkflowRole
 
-    # Get user's role IDs
-    result = await db.execute(
-        select(UserRole.role_id).where(UserRole.user_id == user_id)
+async def _visible_agent(
+    db: DbSession, user: CurrentActiveUser, agent_id: UUID, *, write: bool = False
+) -> Agent:
+    """Load an Agent only after the original caller's policy allows it."""
+    caller = await load_caller(db, user)
+    agent = (
+        await db.execute(
+            select(Agent)
+            .options(
+                selectinload(Agent.tools),
+                selectinload(Agent.delegated_agents),
+                selectinload(Agent.roles),
+                selectinload(Agent.owner),
+                selectinload(Agent.mcp_connections),
+            )
+            .where(Agent.id == agent_id)
+        )
+    ).scalar_one_or_none()
+    allowed = can_write_agent(caller, agent) if agent is not None and write else (
+        await can_read_agent(db, caller, agent) if agent is not None else False
     )
-    user_role_ids = set(result.scalars().all())
-
-    for tool_id in tool_ids:
-        try:
-            workflow_uuid = UUID(tool_id)
-        except ValueError:
-            raise HTTPException(422, f"Invalid tool ID: {tool_id}")
-
-        result = await db.execute(
-            select(Workflow).where(Workflow.id == workflow_uuid)
-        )
-        workflow = result.scalar_one_or_none()
-        if not workflow:
-            raise HTTPException(422, f"Tool '{tool_id}' not found")
-        if not workflow.is_active:
-            raise HTTPException(422, f"Tool '{workflow.name}' is inactive")
-
-        if workflow.access_level == "everyone":
-            continue
-
-        if workflow.access_level == "authenticated" and not is_external:
-            continue
-
-        result = await db.execute(
-            select(WorkflowRole.role_id).where(WorkflowRole.workflow_id == workflow_uuid)
-        )
-        workflow_role_ids = set(result.scalars().all())
-
-        if not workflow_role_ids or not workflow_role_ids.intersection(user_role_ids):
-            raise HTTPException(403, f"You do not have role access to tool '{workflow.name}'")
-
-
-async def _user_has_permission(
-    db: DbSession,
-    user_id: UUID,
-    permission: str,
-) -> bool:
-    """Check if a user has a permission via any of their roles."""
-    from src.models.orm.users import UserRole
-
-    result = await db.execute(
-        select(Role.permissions)
-        .join(UserRole, UserRole.role_id == Role.id)
-        .where(UserRole.user_id == user_id)
-    )
-    for permissions in result.scalars().all():
-        if permissions and permissions.get(permission):
-            return True
-    return False
+    if not allowed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent {agent_id} not found")
+    assert agent is not None
+    return agent
 
 
 def _logo_data_url(data: bytes | None, content_type: str | None) -> str | None:
@@ -246,7 +173,7 @@ def _agent_to_public(agent: Agent) -> AgentPublic:
         knowledge_sources=agent.knowledge_sources or [],
         system_tools=[t for t in (agent.system_tools or []) if t in valid_system_tool_ids],
         mcp_connection_ids=sorted(str(c.id) for c in (agent.mcp_connections or [])),
-        llm_model=agent.llm_model,
+        llm_profile_id=agent.llm_profile_id,
         llm_max_tokens=agent.llm_max_tokens,
         max_iterations=agent.max_iterations,
         max_token_budget=agent.max_token_budget,
@@ -270,7 +197,7 @@ def _agent_to_public(agent: Agent) -> AgentPublic:
 # =============================================================================
 
 
-@router.get("")
+@router.get("", **operation_route("agents.list"))
 async def list_agents(
     db: DbSession,
     user: CurrentActiveUser,
@@ -284,6 +211,13 @@ async def list_agents(
     include_stats: bool = Query(
         False,
         description="Include per-agent run stats in the list response.",
+    ),
+    discovery_only: bool = Query(
+        False,
+        description=(
+            "Apply ordinary organization and role visibility even for "
+            "impersonation-capable callers. Used by chat discovery."
+        ),
     ),
 ) -> list[AgentSummary]:
     """
@@ -299,33 +233,42 @@ async def list_agents(
     - Platform admins see all agents
     - Users see AUTHENTICATED agents + ROLE_BASED agents assigned to their roles
     """
-    # Apply organization filter using repository
-    try:
-        filter_type, filter_org_id = resolve_org_filter(user, scope)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
-        )
+    caller = await load_caller(db, user)
+    requested_org: UUID | None = None
+    has_explicit_scope = scope is not None
+    if scope is not None:
+        if scope == "global":
+            requested_org = None
+        else:
+            try:
+                requested_org = UUID(scope)
+            except ValueError as exc:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="scope must be 'global' or an organization UUID") from exc
+        if not user_reach(caller).covers(requested_org):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have permission to view agents")
 
-    # Check if user is platform admin
-    is_admin = user.is_platform_admin
-
-    # Create repository with appropriate access context
+    # The repository is a raw loader here.  Visibility below uses canonical
+    # permission reach plus each Agent's object ACL, not repository bypasses.
     repo = AgentRepository(
         session=db,
-        org_id=filter_org_id,
-        user_id=user.user_id,
-        is_superuser=is_admin,
+        org_id=None,
+        user_id=None,
+        is_superuser=False,
         is_external=user.is_external,
     )
-
-    if is_admin:
-        # Admins use list_all_in_scope with filter_type for flexibility
-        agents = await repo.list_all_in_scope(filter_type, active_only=active_only)
-    else:
-        # Regular users use list_agents with built-in cascade + role-based access
-        agents = await repo.list_agents(active_only=active_only)
+    candidates = await repo.list_all_in_scope(OrgFilterType.ALL, active_only=active_only)
+    scoped_candidates: list[Agent] = []
+    for agent in candidates:
+        if has_explicit_scope and agent.organization_id != requested_org:
+            continue
+        if discovery_only and agent.organization_id not in (None, caller.ctx.home_organization_id if caller.ctx else None):
+            continue
+        scoped_candidates.append(agent)
+    agents = await ResourceAccessResolver(db, caller).filter_readable(
+        ResourceKind.AGENT,
+        scoped_candidates,
+        selected_organization_id=requested_org if has_explicit_scope else UNSET,
+    )
 
     # Batch-compute dependency counts (tool count per agent)
     agent_ids = [a.id for a in agents]
@@ -348,7 +291,11 @@ async def list_agents(
         mcp_counts = {row[0]: row[1] for row in mcp_count_result.all()}
 
     stats_by_agent = (
-        await get_agent_stats_batch(agent_ids, db)
+        await get_agent_stats_batch(
+            agent_ids,
+            db,
+            caller,
+        )
         if include_stats and agent_ids
         else {}
     )
@@ -371,7 +318,7 @@ async def list_agents(
     return result
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED, **operation_route("agents.create"))
 async def create_agent(
     agent_data: AgentCreate,
     db: DbSession,
@@ -383,46 +330,54 @@ async def create_agent(
     Platform admins can create any agent type.
     Regular users can only create private agents with tools they have access to.
     """
-    is_admin = user.is_platform_admin
+    caller = await load_caller(db, user)
+    original_user_id = caller_user_id(caller)
+    if original_user_id is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have permission to manage agents")
 
     # Org targeting follows the unified --org standard: an OMITTED
     # organization_id (HOME) defaults to the caller's org, so a bare create
     # never silently writes a global row. Explicit null still means global.
     # (Non-admins are forced to their own org below regardless.)
-    if is_admin and "organization_id" not in agent_data.model_fields_set:
-        agent_data.organization_id = user.organization_id
+    if "organization_id" not in agent_data.model_fields_set:
+        agent_data.organization_id = caller.ctx.home_organization_id if caller.ctx else None
 
-    if not is_admin:
-        # Non-admin: enforce private-only creation
-        if agent_data.access_level != AgentAccessLevel.PRIVATE:
-            raise HTTPException(403, "Non-admin users can only create private agents")
-        agent_data.organization_id = user.organization_id
-        await _validate_user_tool_access(
-            db, user.user_id, agent_data.tool_ids, is_external=user.is_external
-        )
-        agent_data.system_tools = []
-        agent_data.knowledge_sources = []
-        agent_data.delegated_agent_ids = []
-        agent_data.role_ids = []
-        # Non-admins cannot grant MCP connections — those are an
-        # org-admin tool. Private agents simply don't surface MCP tools.
-        agent_data.mcp_connection_ids = []
-
-    # Validate references before creating the agent
-    await _validate_agent_references(
-        db=db,
-        tool_ids=agent_data.tool_ids,
-        delegated_agent_ids=agent_data.delegated_agent_ids,
-        agent_id=None,
+    can_manage_target = (
+        user_reach(caller).covers(agent_data.organization_id)
+        and allows_permission(caller, "agents.readwrite", agent_data.organization_id)
     )
 
     agent_id = uuid4()
+    if not can_manage_target:
+        # A privileged/budget field is applied or refused, never silently
+        # dropped/overridden — see agent_write_policy for the full gate
+        # order (access_level, privileged fields, budget fields, org).
+        enforce_personal_agent_create(
+            agent_data,
+            caller_org_id=caller.ctx.home_organization_id if caller.ctx else None,
+        )
+        agent_data.organization_id = caller.ctx.home_organization_id if caller.ctx else None
+    await validate_user_tool_access(db, caller, agent_data.tool_ids)
+
+    # Validate references before creating the agent (every caller, admins
+    # included).
+    await validate_agent_references(
+        db,
+        tool_ids=agent_data.tool_ids,
+        delegated_agent_ids=agent_data.delegated_agent_ids,
+        role_ids=agent_data.role_ids,
+        mcp_connection_ids=[str(c) for c in agent_data.mcp_connection_ids],
+        organization_id=agent_data.organization_id,
+        agent_id=None,
+    )
+    await _validate_llm_profile_id(db, agent_data.llm_profile_id)
+
     now = datetime.now(timezone.utc)
 
     # Set owner for private agents
     owner_user_id = None
     if agent_data.access_level == AgentAccessLevel.PRIVATE:
-        owner_user_id = user.user_id
+        owner_user_id = original_user_id
 
     # Create the agent
     agent = Agent(
@@ -437,7 +392,7 @@ async def create_agent(
         is_active=True,
         knowledge_sources=agent_data.knowledge_sources or [],
         system_tools=agent_data.system_tools or [],
-        llm_model=agent_data.llm_model,
+        llm_profile_id=agent_data.llm_profile_id,
         llm_max_tokens=agent_data.llm_max_tokens,
         max_iterations=agent_data.max_iterations,
         max_token_budget=agent_data.max_token_budget,
@@ -447,85 +402,46 @@ async def create_agent(
     )
     db.add(agent)
 
-    # Add tool relationships
-    tools: list[Workflow] = []
+    # Add tool relationships. validate_agent_references above already
+    # guarantees each ID exists, is active, and is type='tool'.
     if agent_data.tool_ids:
         for tool_id in agent_data.tool_ids:
-            try:
-                workflow_uuid = UUID(tool_id)
-                result = await db.execute(
-                    select(Workflow)
-                    .where(Workflow.id == workflow_uuid)
-                    .where(Workflow.type == "tool")
-                    .where(Workflow.is_active.is_(True))
-                )
-                workflow = result.scalar_one_or_none()
-                if workflow:
-                    tools.append(workflow)
-                    db.add(AgentTool(agent_id=agent_id, workflow_id=workflow.id))
-            except ValueError:
-                logger.warning(f"Invalid tool ID: {log_safe(tool_id)}")
+            db.add(AgentTool(agent_id=agent_id, workflow_id=UUID(tool_id)))
 
-    # Add delegation relationships
-    delegated_agents: list[Agent] = []
+    # Add delegation relationships. Reference validation guarantees each
+    # delegate exists, is active, and isn't self-delegation.
     if agent_data.delegated_agent_ids:
         for delegate_id in agent_data.delegated_agent_ids:
-            try:
-                delegate_uuid = UUID(delegate_id)
-                result = await db.execute(
-                    select(Agent)
-                    .where(Agent.id == delegate_uuid)
-                    .where(Agent.is_active.is_(True))
-                )
-                delegate = result.scalar_one_or_none()
-                if delegate:
-                    delegated_agents.append(delegate)
-                    db.add(AgentDelegation(
-                        parent_agent_id=agent_id,
-                        child_agent_id=delegate.id,
-                    ))
-            except ValueError:
-                logger.warning(f"Invalid delegate agent ID: {log_safe(delegate_id)}")
+            db.add(AgentDelegation(
+                parent_agent_id=agent_id,
+                child_agent_id=UUID(delegate_id),
+            ))
 
-    # Add role relationships
+    # Add role relationships. Reference validation guarantees each role
+    # exists.
     if agent_data.role_ids:
         for role_id in agent_data.role_ids:
-            try:
-                role_uuid = UUID(role_id)
-                result = await db.execute(
-                    select(Role).where(Role.id == role_uuid)
-                )
-                role = result.scalar_one_or_none()
-                if role:
-                    db.add(AgentRole(
-                        agent_id=agent_id,
-                        role_id=role.id,
-                        assigned_by=user.email,
-                    ))
-            except ValueError:
-                logger.warning(f"Invalid role ID: {log_safe(role_id)}")
-
-    # Add MCP connection grants. Connections must belong to the same org
-    # as the agent — connections are strictly per-org so a grant from
-    # another org is silently dropped here. Platform-level agents
-    # (organization_id IS NULL) cannot carry MCP grants.
-    if agent_data.mcp_connection_ids and agent_data.organization_id is not None:
-        valid_result = await db.execute(
-            select(MCPConnection.id).where(
-                MCPConnection.id.in_(agent_data.mcp_connection_ids),
-                MCPConnection.organization_id == agent_data.organization_id,
-            )
-        )
-        valid_ids = {row[0] for row in valid_result.all()}
-        for cid in agent_data.mcp_connection_ids:
-            if cid in valid_ids:
-                db.add(AgentMCPConnection(
-                    agent_id=agent_id,
-                    connection_id=cid,
-                    granted_by=user.user_id,
-                ))
+            db.add(AgentRole(
+                agent_id=agent_id,
+                role_id=UUID(role_id),
+                assigned_by=user.email,
+            ))
 
     await db.flush()
+
+    # Reference validation above checks the request shape. The repository
+    # independently authorizes the parent Agent and verifies each persisted
+    # connection target before replacing association rows.
+    if agent_data.mcp_connection_ids:
+        await AgentRepository(
+            session=db,
+            org_id=agent.organization_id,
+        ).set_mcp_connection_grants(
+            agent_id,
+            agent_data.mcp_connection_ids,
+            caller=caller,
+            granted_by=user.user_id,
+        )
 
     # Reload with relationships
     result = await db.execute(
@@ -552,19 +468,28 @@ async def get_accessible_tools(
     db: DbSession,
     user: CurrentActiveUser,
 ) -> list[AccessibleTool]:
-    """Get tools the current user can assign to their agents (via role intersection)."""
+    """Get tools the current user can assign to their agents (via role intersection).
+
+    Role membership alone isn't org scope: also require the tool workflow
+    to be in the caller's own org or global, so a role grant on another
+    org's tool-type workflow never surfaces here.
+    """
     from src.models.orm.users import UserRole
     from src.models.orm.workflow_roles import WorkflowRole
 
+    caller = await load_caller(db, user)
+    original_user_id = caller_user_id(caller)
+    if original_user_id is None:
+        return []
     result = await db.execute(
-        select(UserRole.role_id).where(UserRole.user_id == user.user_id)
+        select(UserRole.role_id).where(UserRole.user_id == original_user_id)
     )
     role_ids = list(result.scalars().all())
 
     if not role_ids:
         return []
 
-    result = await db.execute(
+    stmt = (
         select(Workflow)
         .join(WorkflowRole, WorkflowRole.workflow_id == Workflow.id)
         .where(Workflow.type == "tool")
@@ -572,41 +497,15 @@ async def get_accessible_tools(
         .where(WorkflowRole.role_id.in_(role_ids))
         .distinct()
     )
+    reach_clause = user_reach(caller).where(Workflow.organization_id)
+    if reach_clause is not None:
+        stmt = stmt.where(reach_clause)
+    result = await db.execute(stmt)
     tools = result.scalars().all()
 
     return [
         AccessibleTool(id=str(t.id), name=t.name, description=t.tool_description or t.description)
         for t in tools
-    ]
-
-
-@router.get("/accessible-knowledge")
-async def get_accessible_knowledge(
-    db: DbSession,
-    user: CurrentActiveUser,
-) -> list[AccessibleKnowledgeSource]:
-    """Get knowledge sources the current user can assign to their agents."""
-    from src.models.orm.users import UserRole
-    from src.models.orm.knowledge_sources import KnowledgeNamespaceRole
-
-    result = await db.execute(
-        select(UserRole.role_id).where(UserRole.user_id == user.user_id)
-    )
-    role_ids = list(result.scalars().all())
-
-    if not role_ids:
-        return []
-
-    result = await db.execute(
-        select(KnowledgeNamespaceRole.namespace)
-        .where(KnowledgeNamespaceRole.role_id.in_(role_ids))
-        .distinct()
-    )
-    accessible_namespaces = list(result.scalars().all())
-
-    return [
-        AccessibleKnowledgeSource(id=ns, name=ns, namespace=ns, description=None)
-        for ns in sorted(accessible_namespaces)
     ]
 
 
@@ -618,44 +517,34 @@ async def get_fleet_stats_endpoint(
 ) -> FleetStatsResponse:
     """Fleet-wide agent run stats over the last ``window_days``.
 
-    Superusers see cross-org totals; org users are scoped to their org.
+    Bypass callers (platform admin / provider org) see cross-org totals;
+    regular users are scoped to their own org, their own runs/chats, and
+    never see another user's private agent folded into the count. A
+    regular caller with no org never falls through to the platform-wide
+    view — they get an empty fleet instead.
     Route is registered before ``/{agent_id}`` so the literal ``stats``
     prefix is not parsed as a UUID.
     """
-    org_id = None if user.is_superuser else user.organization_id
-    return await get_fleet_stats(db, org_id=org_id, window_days=window_days)
+    caller = await load_caller(db, user)
+    return await get_fleet_stats(
+        db,
+        caller,
+        window_days=window_days,
+    )
 
 
-@router.get("/{agent_id}")
+@router.get("/{agent_id}", **operation_route("agents.get"))
 async def get_agent(
     agent_id: UUID,
     db: DbSession,
     user: CurrentActiveUser,
 ) -> AgentPublic:
     """Get agent by ID."""
-    # Check if user is platform admin
-    is_admin = user.is_platform_admin
-
-    repo = AgentRepository(
-        session=db,
-        org_id=user.organization_id,
-        user_id=user.user_id,
-        is_superuser=is_admin,
-        is_external=user.is_external,
-    )
-
-    agent = await repo.get_agent_with_access_check(agent_id)
-
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
-
+    agent = await _visible_agent(db, user, agent_id)
     return _agent_to_public(agent)
 
 
-@router.put("/{agent_id}")
+@router.put("/{agent_id}", **operation_route("agents.update"))
 async def update_agent(
     agent_id: UUID,
     agent_data: AgentUpdate,
@@ -682,54 +571,78 @@ async def update_agent(
             detail=f"Agent {agent_id} not found",
         )
 
+    caller = await load_caller(db, user)
+    if agent is None or not can_write_agent(caller, agent):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent {agent_id} not found")
+
     # Solution-managed agents are read-only here; deploy is the writer.
     assert_not_solution_managed(agent)
 
-    is_admin = user.is_platform_admin
+    can_manage_configuration = can_configure_agent(caller, agent)
 
-    if not is_admin:
-        # Budget fields gate: only platform admins can set per-agent budgets.
-        # Block before the ownership check so the response is the same whether
-        # the user owns the agent or not (no information leak about ownership).
-        budget_fields_set = [
-            f
-            for f in ("max_iterations", "max_token_budget", "llm_max_tokens")
-            if f in agent_data.model_fields_set
-        ]
-        if budget_fields_set:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=(
-                    "Budget fields ("
-                    + ", ".join(budget_fields_set)
-                    + ") can only be set by platform administrators"
-                ),
-            )
-
-        if agent.owner_user_id != user.user_id or agent.access_level != AgentAccessLevel.PRIVATE:
+    if not can_manage_configuration:
+        if agent.owner_user_id != caller_user_id(caller) or agent.access_level != AgentAccessLevel.PRIVATE:
             raise HTTPException(403, "You can only edit your own private agents")
         if agent_data.access_level is not None and agent_data.access_level != AgentAccessLevel.PRIVATE:
             raise HTTPException(403, "Use the promote endpoint to change access level")
-        if agent_data.tool_ids is not None:
-            await _validate_user_tool_access(
-                db, user.user_id, agent_data.tool_ids, is_external=user.is_external
-            )
-        agent_data.system_tools = None
-        agent_data.knowledge_sources = None
-        agent_data.delegated_agent_ids = None
-        agent_data.role_ids = None
-        # Non-admins cannot manage MCP connection grants — those are an
-        # org-admin tool. Silently drop the field rather than 403 so the
-        # UI can submit a single payload regardless of role.
-        agent_data.mcp_connection_ids = None
+        # A privileged field is applied or refused, never silently dropped —
+        # see agent_write_policy for the full gate (includes clear_roles and
+        # the organization_id rescope gate below).
+        enforce_personal_agent_update(agent, agent_data)
 
-    # Validate references being updated
-    await _validate_agent_references(
-        db=db,
+    if agent_data.tool_ids is not None:
+        await validate_user_tool_access(db, caller, agent_data.tool_ids)
+
+    final_access_level = agent_data.access_level or agent.access_level
+
+    # Effective organization after this mutation: the new value when
+    # provided, else the Agent's current org.
+    target_organization_id = (
+        agent_data.organization_id
+        if "organization_id" in agent_data.model_fields_set
+        else agent.organization_id
+    )
+    if (
+        target_organization_id != agent.organization_id
+        and not (
+            user_reach(caller).covers(target_organization_id)
+            and allows_permission(caller, "agents.readwrite", target_organization_id)
+        )
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have permission to manage agents")
+    if (
+        "organization_id" in agent_data.model_fields_set
+        and target_organization_id != agent.organization_id
+        and agent.mcp_connections
+        and agent_data.mcp_connection_ids is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Rescoping an Agent with MCP connections requires an explicit "
+                "mcp_connection_ids list; pass [] to revoke all grants"
+            ),
+        )
+
+    # Validate references being updated (every caller, admins included).
+    await validate_agent_references(
+        db,
         tool_ids=agent_data.tool_ids,
         delegated_agent_ids=agent_data.delegated_agent_ids,
+        role_ids=agent_data.role_ids,
+        mcp_connection_ids=(
+            [str(c) for c in agent_data.mcp_connection_ids]
+            if agent_data.mcp_connection_ids is not None
+            else None
+        ),
+        organization_id=target_organization_id,
         agent_id=agent_id,  # For self-delegation check
+        clear_roles=agent_data.clear_roles,
     )
+    if "llm_profile_id" in agent_data.model_fields_set:
+        await _validate_llm_profile_id(db, agent_data.llm_profile_id)
+
+    was_private = agent.access_level == AgentAccessLevel.PRIVATE
 
     # Update fields
     if agent_data.name is not None:
@@ -742,6 +655,11 @@ async def update_agent(
         agent.channels = [c.value for c in agent_data.channels]
     if agent_data.access_level is not None:
         agent.access_level = agent_data.access_level
+        if agent_data.access_level == AgentAccessLevel.PRIVATE:
+            if not was_private or agent.owner_user_id is None:
+                agent.owner_user_id = user.user_id
+        elif can_manage_configuration:
+            agent.owner_user_id = None
     # Use model_fields_set to distinguish "not provided" from "explicitly null"
     if "organization_id" in agent_data.model_fields_set:
         agent.organization_id = agent_data.organization_id
@@ -751,8 +669,8 @@ async def update_agent(
         agent.knowledge_sources = agent_data.knowledge_sources
     if agent_data.system_tools is not None:
         agent.system_tools = agent_data.system_tools
-    if agent_data.llm_model is not None:
-        agent.llm_model = agent_data.llm_model if agent_data.llm_model else None
+    if "llm_profile_id" in agent_data.model_fields_set:
+        agent.llm_profile_id = agent_data.llm_profile_id
     if agent_data.llm_max_tokens is not None:
         agent.llm_max_tokens = agent_data.llm_max_tokens if agent_data.llm_max_tokens else None
     if "max_iterations" in agent_data.model_fields_set:
@@ -762,95 +680,74 @@ async def update_agent(
 
     agent.updated_at = datetime.now(timezone.utc)
 
-    # Update tool relationships if provided
-    tools: list[Workflow] = []
+    # Update tool relationships if provided. validate_agent_references above
+    # already guarantees each ID exists, is active, and is type='tool'.
     if agent_data.tool_ids is not None:
         await db.execute(
             delete(AgentTool).where(AgentTool.agent_id == agent_id)
         )
         for tool_id in agent_data.tool_ids:
-            try:
-                workflow_uuid = UUID(tool_id)
-                result = await db.execute(
-                    select(Workflow)
-                    .where(Workflow.id == workflow_uuid)
-                    .where(Workflow.type == "tool")
-                    .where(Workflow.is_active.is_(True))
-                )
-                workflow = result.scalar_one_or_none()
-                if workflow:
-                    tools.append(workflow)
-                    db.add(AgentTool(agent_id=agent_id, workflow_id=workflow.id))
-            except ValueError:
-                logger.warning(f"Invalid tool ID: {log_safe(tool_id)}")
+            db.add(AgentTool(agent_id=agent_id, workflow_id=UUID(tool_id)))
 
-    # Update delegation relationships if provided
-    delegated_agents: list[Agent] = []
+    # Update delegation relationships if provided. Reference validation
+    # guarantees each delegate exists, is active, and isn't self-delegation.
     if agent_data.delegated_agent_ids is not None:
         await db.execute(
             delete(AgentDelegation).where(AgentDelegation.parent_agent_id == agent_id)
         )
         for delegate_id in agent_data.delegated_agent_ids:
-            try:
-                delegate_uuid = UUID(delegate_id)
-                result = await db.execute(
-                    select(Agent)
-                    .where(Agent.id == delegate_uuid)
-                    .where(Agent.is_active.is_(True))
-                )
-                delegate = result.scalar_one_or_none()
-                if delegate:
-                    delegated_agents.append(delegate)
-                    db.add(AgentDelegation(
-                        parent_agent_id=agent_id,
-                        child_agent_id=delegate.id,
-                    ))
-            except ValueError:
-                logger.warning(f"Invalid delegate agent ID: {log_safe(delegate_id)}")
+            db.add(AgentDelegation(
+                parent_agent_id=agent_id,
+                child_agent_id=UUID(delegate_id),
+            ))
 
-    # Clear all role assignments if requested
-    if agent_data.clear_roles:
+    # Private agents are owner-only; do not retain stale role grants when
+    # changing visibility via the generic update endpoint.
+    roles_changed = False
+    if final_access_level == AgentAccessLevel.PRIVATE:
         await db.execute(
             delete(AgentRole).where(AgentRole.agent_id == agent_id)
         )
+        roles_changed = True
+
+    # Clear all role assignments if requested
+    elif agent_data.clear_roles:
+        await db.execute(
+            delete(AgentRole).where(AgentRole.agent_id == agent_id)
+        )
+        roles_changed = True
         # Also set to role_based access level (effectively no access)
         agent.access_level = AgentAccessLevel.ROLE_BASED
         logger.info(f"Cleared all role assignments for agent '{log_safe(agent.name)}'")
 
-    # Update role relationships if provided (and not clearing)
+    # Update role relationships if provided (and not clearing). Reference
+    # validation above guarantees each role exists.
     elif agent_data.role_ids is not None:
         await db.execute(
             delete(AgentRole).where(AgentRole.agent_id == agent_id)
         )
+        roles_changed = True
         for role_id in agent_data.role_ids:
-            try:
-                role_uuid = UUID(role_id)
-                result = await db.execute(
-                    select(Role).where(Role.id == role_uuid)
-                )
-                role = result.scalar_one_or_none()
-                if role:
-                    db.add(AgentRole(
-                        agent_id=agent_id,
-                        role_id=role.id,
-                        assigned_by=user.email,
-                    ))
-            except ValueError:
-                logger.warning(f"Invalid role ID: {log_safe(role_id)}")
+            db.add(AgentRole(
+                agent_id=agent_id,
+                role_id=UUID(role_id),
+                assigned_by=user.email,
+            ))
+
+    if roles_changed:
+        db.expire(agent, ["roles"])
 
     # Sync MCP connection grants if provided. ``mcp_connection_ids=None``
     # means "leave grants alone"; an empty list explicitly revokes all.
     if agent_data.mcp_connection_ids is not None:
         repo = AgentRepository(
             session=db,
-            org_id=user.organization_id,
-            user_id=user.user_id,
-            is_superuser=is_admin,
-            is_external=user.is_external,
+            org_id=agent.organization_id,
         )
         await repo.set_mcp_connection_grants(
             agent_id,
             agent_data.mcp_connection_ids,
+            caller=caller,
             granted_by=user.user_id,
         )
 
@@ -876,7 +773,7 @@ async def update_agent(
     return _agent_to_public(agent)
 
 
-@router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT, **operation_route("agents.delete"))
 async def delete_agent(
     agent_id: UUID,
     db: DbSession,
@@ -887,25 +784,10 @@ async def delete_agent(
     System agents can be deleted - they will be recreated on next startup
     if they are still defined in the system agent definitions.
     """
-    result = await db.execute(
-        select(Agent).where(Agent.id == agent_id)
-    )
-    agent = result.scalar_one_or_none()
-
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
+    agent = await _visible_agent(db, user, agent_id, write=True)
 
     # Solution-managed agents are read-only here; deploy is the writer.
     assert_not_solution_managed(agent)
-
-    is_admin = user.is_platform_admin
-
-    if not is_admin:
-        if agent.owner_user_id != user.user_id:
-            raise HTTPException(403, "You can only delete your own private agents")
 
     # Use a SQL DELETE so database-level cascades remove run history and agent
     # memberships while SET NULL references (such as conversations) are preserved.
@@ -932,20 +814,16 @@ async def promote_agent(
         .where(Agent.id == agent_id)
     )
     agent = result.scalar_one_or_none()
-    if not agent:
+    caller = await load_caller(db, user)
+    if agent is None or not can_write_agent(caller, agent):
         raise HTTPException(404, f"Agent {agent_id} not found")
     assert_not_solution_managed(agent)
 
     if agent.access_level != AgentAccessLevel.PRIVATE:
         raise HTTPException(400, "Agent is not private — nothing to promote")
 
-    is_admin = user.is_platform_admin
-
-    if not is_admin:
-        if agent.owner_user_id != user.user_id:
-            raise HTTPException(403, "You can only promote your own agents")
-        if not await _user_has_permission(db, user.user_id, "can_promote_agent"):
-            raise HTTPException(403, "You do not have permission to promote agents")
+    if not _may_promote_agent(caller, agent):
+        raise HTTPException(403, "You do not have permission to promote agents")
 
     # Promote: change access_level, clear owner
     agent.access_level = request.access_level
@@ -998,24 +876,15 @@ async def get_agent_stats_endpoint(
     window_days: int = Query(7, ge=1, le=90),
 ) -> AgentStatsResponse:
     """Per-agent run stats. Reuses the same access check as ``GET /{agent_id}``."""
-    is_admin = user.has_platform_admin_grant()
+    await _visible_agent(db, user, agent_id)
+    caller = await load_caller(db, user)
 
-    repo = AgentRepository(
-        session=db,
-        org_id=user.organization_id,
-        user_id=user.user_id,
-        is_superuser=is_admin,
-        is_external=user.is_external,
+    return await get_agent_stats(
+        agent_id,
+        db,
+        caller,
+        window_days=window_days,
     )
-
-    agent = await repo.get_agent_with_access_check(agent_id)
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
-
-    return await get_agent_stats(agent_id, db, window_days=window_days)
 
 
 @router.get("/{agent_id}/tools")
@@ -1025,24 +894,7 @@ async def get_agent_tools(
     user: CurrentActiveUser,
 ) -> list[dict]:
     """Get tools assigned to an agent."""
-    # Check if user is platform admin
-    is_admin = user.is_platform_admin
-
-    repo = AgentRepository(
-        session=db,
-        org_id=user.organization_id,
-        user_id=user.user_id,
-        is_superuser=is_admin,
-        is_external=user.is_external,
-    )
-
-    agent = await repo.get_agent_with_access_check(agent_id)
-
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
+    agent = await _visible_agent(db, user, agent_id)
 
     return [
         {
@@ -1067,27 +919,17 @@ async def get_agent_delegations(
     user: CurrentActiveUser,
 ) -> list[AgentSummary]:
     """Get agents this agent can delegate to."""
-    # Check if user is platform admin
-    is_admin = user.is_platform_admin
+    caller = await load_caller(db, user)
+    agent = await _visible_agent(db, user, agent_id)
 
-    repo = AgentRepository(
-        session=db,
-        org_id=user.organization_id,
-        user_id=user.user_id,
-        is_superuser=is_admin,
-        is_external=user.is_external,
-    )
-
-    agent = await repo.get_agent_with_access_check(agent_id)
-
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
-
+    # The parent agent being accessible doesn't make every delegate
+    # accessible — a delegate can be private, role_based, or another org's.
+    # Re-check each one individually rather than trusting the raw
+    # relationship (which carries no access filter of its own).
     summaries = []
     for a in agent.delegated_agents:
+        if not await can_read_agent(db, caller, a):
+            continue
         s = AgentSummary.model_validate(a)
         s.logo = None
         s.logo_url = _agent_logo_url(a)
@@ -1108,20 +950,7 @@ async def upload_agent_logo(
     file: UploadFile = File(..., description="Logo image (PNG/JPEG/SVG, ≤5MB)"),
 ) -> dict:
     """Upload a square logo for an agent."""
-    is_admin = user.is_platform_admin
-    repo = AgentRepository(
-        session=db,
-        org_id=user.organization_id,
-        user_id=user.user_id,
-        is_superuser=is_admin,
-        is_external=user.is_external,
-    )
-    agent = await repo.get_agent_with_access_check(agent_id)
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
+    agent = await _visible_agent(db, user, agent_id, write=True)
     assert_not_solution_managed(agent)
 
     content = await file.read()
@@ -1161,15 +990,7 @@ async def get_agent_logo(
     db: DbSession,
     user: CurrentActiveUser,
 ) -> Response:
-    is_admin = user.is_platform_admin
-    repo = AgentRepository(
-        session=db,
-        org_id=user.organization_id,
-        user_id=user.user_id,
-        is_superuser=is_admin,
-        is_external=user.is_external,
-    )
-    agent = await repo.get_agent_with_access_check(agent_id)
+    agent = await _visible_agent(db, user, agent_id)
     if not agent or not agent.logo_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1201,20 +1022,7 @@ async def delete_agent_logo(
     db: DbSession,
     user: CurrentActiveUser,
 ) -> Response:
-    is_admin = user.is_platform_admin
-    repo = AgentRepository(
-        session=db,
-        org_id=user.organization_id,
-        user_id=user.user_id,
-        is_superuser=is_admin,
-        is_external=user.is_external,
-    )
-    agent = await repo.get_agent_with_access_check(agent_id)
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent {agent_id} not found",
-        )
+    agent = await _visible_agent(db, user, agent_id, write=True)
     assert_not_solution_managed(agent)
     agent.logo_data = None
     agent.logo_content_type = None

@@ -74,7 +74,6 @@ async def test_service_selects_longest_prefix_and_ignores_siblings(db_session) -
         user=_user(org.id),
     ) is False
 
-
 @pytest.mark.asyncio
 async def test_service_isolates_organization_scoped_policies(db_session) -> None:
     org_a = Organization(id=uuid4(), name=f"FilesA-{uuid4().hex[:8]}", created_by="test")
@@ -117,7 +116,7 @@ async def test_service_isolates_organization_scoped_policies(db_session) -> None
         location="workspace",
         path="shared/doc.txt",
         user=_user(org_b.id),
-    ) is False
+    ) is True  # Target reach is enforced before policy evaluation; this policy allows anyone.
 
 
 @pytest.mark.asyncio
@@ -695,6 +694,66 @@ async def test_service_preresolves_custom_claims_before_evaluation(
 
 
 @pytest.mark.asyncio
+async def test_service_applies_one_root_policy_to_compound_claim_scopes(
+    db_session, monkeypatch
+) -> None:
+    from src.services import file_policy_service as service_module
+
+    org = Organization(id=uuid4(), name=f"Files-{uuid4().hex[:8]}", created_by="test")
+    db_session.add(org)
+    await db_session.flush()
+    service = FilePolicyService(db_session)
+    await service.upsert_policy(
+        organization_id=org.id,
+        location="documents",
+        path="",
+        policies=FilePolicies.model_validate(
+            {
+                "policies": [
+                    {
+                        "name": "claim_read",
+                        "actions": ["read"],
+                        "when": {
+                            "path_within_any": [
+                                {"file": "path"},
+                                {"claims": "allowed_resource_paths"},
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        created_by=uuid4(),
+    )
+
+    async def fake_preresolve(user, policies, db, org_id, solution_id=None):
+        assert org_id == org.id
+        user.claims["allowed_resource_paths"] = [
+            "site-a:category-1/pdf",
+            "site-b:category-2/pdf",
+            "site-b:category-2/download",
+        ]
+
+    monkeypatch.setattr(service_module, "preresolve_for_policies", fake_preresolve)
+    user = _user(org.id)
+
+    async def allowed(path: str) -> bool:
+        return await service.is_allowed(
+            "read",
+            organization_id=org.id,
+            location="documents",
+            path=path,
+            user=user,
+        )
+
+    assert await allowed("site-a:category-1/pdf/doc-1/file.pdf") is True
+    assert await allowed("site-a:category-1/download/doc-1/file.dwg") is False
+    assert await allowed("site-a:category-2/pdf/doc-1/file.pdf") is False
+    assert await allowed("site-annex:category-1/pdf/doc-1/file.pdf") is False
+    assert await allowed("site-b:category-2/download/doc-2/file.dwg") is True
+
+
+@pytest.mark.asyncio
 async def test_service_malformed_policy_json_denies(db_session, caplog) -> None:
     org = Organization(id=uuid4(), name=f"Files-{uuid4().hex[:8]}", created_by="test")
     db_session.add(org)
@@ -727,8 +786,11 @@ async def test_service_malformed_policy_json_denies(db_session, caplog) -> None:
 async def test_require_file_policy_denial_emits_audit(monkeypatch, db_session) -> None:
     """The live enforcement path (_require_file_policy → 403) records the
     denial. This audit used to live in FilePolicyService.check_allowed, which
-    had no callers; it now fires from the router helper on every real denial."""
-    from fastapi import HTTPException
+    had no callers; it now fires from the shared helper on every real denial
+    (shared.file_access raises transport-neutral FileServiceError; the HTTP
+    router maps it to 403)."""
+    import shared.file_access as file_access_module
+    from shared.file_access import FileServiceError
 
     from src.routers import files as files_module
 
@@ -736,7 +798,7 @@ async def test_require_file_policy_denial_emits_audit(monkeypatch, db_session) -
     db_session.add(org)
     await db_session.flush()
     # A non-"workspace" location so the request reaches real policy evaluation
-    # (workspace short-circuits to a superuser check with no policy).
+    # (workspace uses a named repository permission with no data policy).
     service = FilePolicyService(db_session)
     await service.upsert_policy(
         organization_id=org.id,
@@ -747,84 +809,48 @@ async def test_require_file_policy_denial_emits_audit(monkeypatch, db_session) -
     )
     emitted: dict = {}
 
-    async def fake_emit(db, action, **kwargs):
-        emitted["action"] = action
+    async def fake_emit(db, **kwargs):
         emitted.update(kwargs)
 
-    monkeypatch.setattr(files_module, "emit_audit", fake_emit)
+    monkeypatch.setattr(file_access_module, "emit_file_policy_deny", fake_emit)
+
+    solution_id = uuid4()
+    db_session.add(Solution(
+        id=solution_id, slug=f"contoso-{solution_id.hex}", name="Contoso",
+        organization_id=org.id,
+    ))
+    await db_session.flush()
 
     ctx = SimpleNamespace(
         db=db_session,
         user=_user(org.id),
         org_id=org.id,
-        solution_id=None,
+        solution_id=solution_id,
     )
 
-    with pytest.raises(HTTPException) as exc:
+    with pytest.raises(FileServiceError) as exc:
         await files_module._require_file_policy(
             ctx,  # type: ignore[arg-type]
             action="read",
             location="attachments",
-            scope=str(org.id),
+            scope=str(solution_id),
             path="private/doc.txt",
+            solution_id=solution_id,
         )
 
     assert exc.value.status_code == 403
-    assert emitted["action"] == "policy.deny"
-    assert emitted["resource_type"] == "file"
-    assert emitted["outcome"] == "failure"
-    assert emitted["details"] == {
+    assert emitted == {
         "policy_action": "read",
         "location": "attachments",
         "path": "private/doc.txt",
+        "scope": str(solution_id),
+        "solution_id": solution_id,
     }
 
 
-# ---------------------------------------------------------------------------
-# _principal_matches_org honors the two-flag bypass rule:
-# is_platform_admin OR is_provider_org. Provider-org members (portal-hopping
-# platform staff) reach any org's files just like platform admins; a plain org
-# user is still pinned to its own org, and a system/no-org user is admitted for
-# the global (org=None) scope only. (repositories/README.md — two bypass flags)
-# ---------------------------------------------------------------------------
-
-
-class TestPrincipalMatchesOrgBypass:
-    def _service(self) -> FilePolicyService:
-        return FilePolicyService.__new__(FilePolicyService)
-
-    def test_provider_org_member_matches_foreign_org(self) -> None:
-        svc = self._service()
-        foreign = uuid4()
-        user = _user(uuid4(), is_platform_admin=False, is_provider_org=True)
-        assert svc._principal_matches_org(user, foreign) is True
-
-    def test_plain_org_user_pinned_to_own_org(self) -> None:
-        svc = self._service()
-        own = uuid4()
-        user = _user(own, is_platform_admin=False, is_provider_org=False)
-        assert svc._principal_matches_org(user, own) is True
-        assert svc._principal_matches_org(user, uuid4()) is False
-
-    def test_platform_admin_matches_foreign_org(self) -> None:
-        svc = self._service()
-        user = _user(uuid4(), is_platform_admin=True, is_provider_org=False)
-        assert svc._principal_matches_org(user, uuid4()) is True
-
-    def test_system_no_org_user_gets_false_for_org_scope(self) -> None:
-        # No org and neither bypass flag: cannot reach an org-scoped policy.
-        svc = self._service()
-        user = _user(None, is_platform_admin=False, is_provider_org=False)
-        assert svc._principal_matches_org(user, uuid4()) is False
-        # …but the global (org=None) scope is open to everyone.
-        assert svc._principal_matches_org(user, None) is True
-
-
 @pytest.mark.asyncio
-async def test_provider_org_member_reads_foreign_org_file(db_session) -> None:
-    """End-to-end: a provider-org, non-admin user reads a file whose org
-    policy is scoped to a DIFFERENT org — the bypass carries through
-    is_allowed()'s _principal_matches_org pre-check."""
+async def test_policy_service_does_not_make_scope_decisions(db_session) -> None:
+    """Target reach is enforced before policy evaluation, not by provider flags."""
     org = Organization(id=uuid4(), name=f"Files-{uuid4().hex[:8]}", created_by="test")
     db_session.add(org)
     await db_session.flush()
@@ -837,7 +863,7 @@ async def test_provider_org_member_reads_foreign_org_file(db_session) -> None:
         created_by=uuid4(),
     )
 
-    # Caller belongs to a different org but is a provider-org member.
+    # Policy evaluation itself receives already-reach-checked calls.
     caller = _user(uuid4(), is_platform_admin=False, is_provider_org=True)
     assert await service.is_allowed(
         "read",
@@ -847,7 +873,7 @@ async def test_provider_org_member_reads_foreign_org_file(db_session) -> None:
         user=caller,
     ) is True
 
-    # A plain org user from a different org is denied at the pre-check.
+    # A provider label cannot affect this decision.
     outsider = _user(uuid4(), is_platform_admin=False, is_provider_org=False)
     assert await service.is_allowed(
         "read",
@@ -855,7 +881,7 @@ async def test_provider_org_member_reads_foreign_org_file(db_session) -> None:
         location="workspace",
         path="reports/q1.pdf",
         user=outsider,
-    ) is False
+    ) is True
 
 
 @pytest.mark.asyncio

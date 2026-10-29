@@ -1,3 +1,5 @@
+import { getErrorMessage } from "@/lib/api-error";
+import { generateUUID } from "@/lib/uuid";
 /**
  * GitHub Integration hooks using openapi-react-query pattern
  *
@@ -13,7 +15,11 @@ import type { components } from "@/lib/v1";
 // Types - Auto-generated from OpenAPI spec
 // =============================================================================
 
-export type GitHubConnectRequest = components["schemas"]["GitHubConfigRequest"];
+export type GitConnectPreviewRequest =
+	components["schemas"]["GitConnectPreviewRequest"];
+export type GitConnectPreview = components["schemas"]["GitConnectPreview"];
+export type GitConnectRequest = components["schemas"]["GitConnectRequest"];
+export type PlatformJobAccepted = components["schemas"]["PlatformJobAccepted"];
 export type GitHubConfigResponse =
 	components["schemas"]["GitHubConfigResponse"];
 export type GitHubRepoInfo = components["schemas"]["GitHubRepoInfo"];
@@ -27,6 +33,9 @@ export type CommitInfo = components["schemas"]["CommitInfo"];
 export type ConflictInfo = components["schemas"]["ConflictInfo"];
 export type CommitHistoryResponse =
 	components["schemas"]["CommitHistoryResponse"];
+export type GitSyncOptions = Partial<
+	Omit<components["schemas"]["SyncRequest"], "job_id">
+>;
 
 // Preflight types - used by CommitResult
 export interface PreflightIssue {
@@ -102,21 +111,6 @@ export interface CommitResult {
 	entity_changes?: EntityChange[];
 }
 
-export interface PullResult {
-	success: boolean;
-	pulled: number;
-	commit_sha?: string | null;
-	conflicts: MergeConflict[];
-	error?: string | null;
-}
-
-export interface PushResult {
-	success: boolean;
-	commit_sha?: string | null;
-	pushed_commits: number;
-	error?: string | null;
-}
-
 export interface ResolveResult {
 	success: boolean;
 	pulled: number;
@@ -144,6 +138,7 @@ export interface SyncResult {
 	entity_changes?: EntityChange[];
 	needs_delete_confirmation?: boolean;
 	pending_deletes?: EntityChange[];
+	retryable?: boolean;
 }
 
 export interface AbortMergeResult {
@@ -239,24 +234,6 @@ export function useValidateGitHubToken() {
 }
 
 /**
- * Configure GitHub integration
- */
-export function useConfigureGitHub() {
-	const queryClient = useQueryClient();
-	return $api.useMutation("post", "/api/github/configure", {
-		onSuccess: () => {
-			// Invalidate related queries after configuration
-			queryClient.invalidateQueries({
-				queryKey: ["get", "/api/github/config"],
-			});
-			queryClient.invalidateQueries({
-				queryKey: ["get", "/api/github/status"],
-			});
-		},
-	});
-}
-
-/**
  * Create a new GitHub repository
  */
 export function useCreateGitHubRepository() {
@@ -333,29 +310,7 @@ export function useFetch() {
 export function useCommit() {
 	return {
 		mutateAsync: async (message: string, jobId?: string): Promise<GitJobResponse> =>
-			gitPost("/api/github/commit", jobId ?? crypto.randomUUID(), { message }, "Failed to queue commit"),
-		isPending: false,
-	};
-}
-
-/**
- * Queue a git pull operation - returns job_id for WebSocket tracking
- */
-export function usePull() {
-	return {
-		mutateAsync: async (jobId?: string): Promise<GitJobResponse> =>
-			gitPost("/api/github/pull", jobId ?? crypto.randomUUID(), undefined, "Failed to queue pull"),
-		isPending: false,
-	};
-}
-
-/**
- * Queue a git push operation - returns job_id for WebSocket tracking
- */
-export function usePush() {
-	return {
-		mutateAsync: async (jobId?: string): Promise<GitJobResponse> =>
-			gitPost("/api/github/push", jobId ?? crypto.randomUUID(), undefined, "Failed to queue push"),
+			gitPost("/api/github/commit", jobId ?? generateUUID(), { message }, "Failed to queue commit"),
 		isPending: false,
 	};
 }
@@ -366,7 +321,7 @@ export function usePush() {
 export function useWorkingTreeChanges() {
 	return {
 		mutateAsync: async (jobId?: string): Promise<GitJobResponse> =>
-			gitPost("/api/github/changes", jobId ?? crypto.randomUUID(), undefined, "Failed to queue status check"),
+			gitPost("/api/github/changes", jobId ?? generateUUID(), undefined, "Failed to queue status check"),
 		isPending: false,
 	};
 }
@@ -380,7 +335,7 @@ export function useResolveConflicts() {
 			resolutions: Record<string, "ours" | "theirs">,
 			jobId?: string,
 		): Promise<GitJobResponse> =>
-			gitPost("/api/github/resolve", jobId ?? crypto.randomUUID(), { resolutions }, "Failed to queue conflict resolution"),
+			gitPost("/api/github/resolve", jobId ?? generateUUID(), { resolutions }, "Failed to queue conflict resolution"),
 		isPending: false,
 	};
 }
@@ -391,7 +346,7 @@ export function useResolveConflicts() {
 export function useDiscard() {
 	return {
 		mutateAsync: async (paths: string[], jobId?: string): Promise<GitJobResponse> =>
-			gitPost("/api/github/discard", jobId ?? crypto.randomUUID(), { paths }, "Failed to queue discard"),
+			gitPost("/api/github/discard", jobId ?? generateUUID(), { paths }, "Failed to queue discard"),
 		isPending: false,
 	};
 }
@@ -402,7 +357,7 @@ export function useDiscard() {
 export function useFileDiff() {
 	return {
 		mutateAsync: async (path: string, jobId?: string): Promise<GitJobResponse> =>
-			gitPost("/api/github/diff", jobId ?? crypto.randomUUID(), { path }, "Failed to queue diff"),
+			gitPost("/api/github/diff", jobId ?? generateUUID(), { path }, "Failed to queue diff"),
 		isPending: false,
 	};
 }
@@ -412,8 +367,8 @@ export function useFileDiff() {
  */
 export function useSync() {
 	return {
-		mutateAsync: async (jobId?: string, opts?: { confirm_deletes?: boolean }): Promise<GitJobResponse> =>
-			gitPost("/api/github/sync", jobId ?? crypto.randomUUID(), opts ? { confirm_deletes: opts.confirm_deletes } : undefined, "Failed to queue sync"),
+		mutateAsync: async (jobId?: string, opts?: GitSyncOptions): Promise<GitJobResponse> =>
+			gitPost("/api/github/sync", jobId ?? generateUUID(), opts, "Failed to queue sync"),
 		isPending: false,
 	};
 }
@@ -424,7 +379,7 @@ export function useSync() {
 export function useAbortMerge() {
 	return {
 		mutateAsync: async (jobId?: string): Promise<GitJobResponse> =>
-			gitPost("/api/github/abort-merge", jobId ?? crypto.randomUUID(), undefined, "Failed to queue abort merge"),
+			gitPost("/api/github/abort-merge", jobId ?? generateUUID(), undefined, "Failed to queue abort merge"),
 		isPending: false,
 	};
 }
@@ -446,7 +401,7 @@ export async function validateGitHubToken(token: string) {
 	});
 
 	if (response.error) {
-		throw new Error("Failed to validate token");
+		throw new Error(getErrorMessage(response.error, "Failed to validate token"));
 	}
 
 	return response.data;
@@ -468,4 +423,33 @@ export async function listGitHubBranches(repoFullName: string) {
 
 	const data = response.data as { branches: GitHubBranchInfo[] };
 	return data.branches;
+}
+
+/** Compare a selected repository with the detached workspace before connecting it. */
+export async function previewGitHubConnect(
+	body: GitConnectPreviewRequest,
+): Promise<GitConnectPreview> {
+	const { data, error } = await apiClient.POST(
+		"/api/github/connect/preview",
+		{
+			body,
+		},
+	);
+	if (error || !data) {
+		throw new Error("Failed to preview the workspace connection");
+	}
+	return data;
+}
+
+/** Queue the reviewed first-connect plan through the shared PlatformJob transport. */
+export async function enqueueGitHubConnect(
+	body: GitConnectRequest,
+): Promise<PlatformJobAccepted> {
+	const { data, error } = await apiClient.POST("/api/github/connect", {
+		body,
+	});
+	if (error || !data) {
+		throw new Error("Failed to queue the workspace connection");
+	}
+	return data;
 }

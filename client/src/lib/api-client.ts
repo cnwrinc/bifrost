@@ -18,6 +18,7 @@ import {
 	consumeEmbedTokenFromHash,
 	getActiveToken,
 	isEmbedSession,
+	isImpersonating,
 } from "./auth-token";
 
 // Pull an embed token off the URL fragment (if any) before any API call
@@ -37,13 +38,7 @@ const TRANSIENT_5XX = new Set([502, 503, 504]);
 // Retry only methods that are safe to replay. POST/PATCH may have already
 // taken effect server-side even when the response was a 5xx; auto-retrying
 // would create duplicate resources.
-const IDEMPOTENT_METHODS = new Set([
-	"GET",
-	"PUT",
-	"DELETE",
-	"HEAD",
-	"OPTIONS",
-]);
+const IDEMPOTENT_METHODS = new Set(["GET", "PUT", "DELETE", "HEAD", "OPTIONS"]);
 
 // Backoff schedule (ms) between retry attempts. Up to 3 retries on top of
 // the initial attempt, totaling ~3s of additional latency in the worst case.
@@ -156,12 +151,27 @@ function isTokenExpiringSoon(token: string): boolean {
 // Lock to prevent concurrent refresh attempts
 let refreshPromise: Promise<boolean> | null = null;
 
+interface PlatformAuthBridge {
+	getAccessToken: () => string | null;
+	canRefreshAccessToken: () => boolean;
+	refreshAccessToken: () => Promise<boolean>;
+	handleAuthenticationFailure: () => void;
+}
+
+type PlatformAuthGlobal = typeof globalThis & {
+	__BIFROST_PLATFORM_AUTH_V1__?: PlatformAuthBridge;
+};
+
 /**
  * Refresh the access token using the refresh token cookie
  * Uses HttpOnly cookie for refresh token (more secure than localStorage)
  * Returns true if successful, false if refresh failed
  */
 async function refreshAccessToken(): Promise<boolean> {
+	// Support-session tokens deliberately have no refresh path. Refreshing the
+	// operator's cookie here would silently swap an expired impersonation into
+	// the operator identity and could replay a mutation under the wrong user.
+	if (isImpersonating()) return false;
 	// Use lock to prevent concurrent refresh attempts
 	if (refreshPromise) {
 		return refreshPromise;
@@ -199,7 +209,7 @@ async function refreshAccessToken(): Promise<boolean> {
  */
 async function retryRequestWithFreshAuth(request: Request): Promise<Response> {
 	const headers = new Headers(request.headers);
-	const token = localStorage.getItem(ACCESS_TOKEN_KEY);
+	const token = getActiveToken();
 
 	if (token) {
 		headers.set("Authorization", `Bearer ${token}`);
@@ -218,19 +228,42 @@ async function retryRequestWithFreshAuth(request: Request): Promise<Response> {
 /**
  * Handle authentication failure - clear session and redirect to login
  */
+let loginRedirectStarted = false;
+
 function handleAuthFailure(): void {
+	// Keep an expired or rejected support session visible so its explicit Exit
+	// control can return to the operator. Do not clear or refresh into the
+	// operator token from an impersonated tab.
+	if (isImpersonating()) return;
 	sessionStorage.removeItem("userId");
 	clearAuthTokens();
 
 	const currentPath = window.location.pathname;
 	if (
+		!loginRedirectStarted &&
 		currentPath !== "/login" &&
 		currentPath !== "/setup" &&
 		!currentPath.startsWith("/auth/callback")
 	) {
+		// Location remains on the protected page until navigation commits. Other
+		// failed requests must not restart that pending navigation.
+		loginRedirectStarted = true;
 		window.location.href = `/login?returnTo=${encodeURIComponent(currentPath)}`;
 	}
 }
+
+// Standalone V2 apps execute in the platform document but ship their own copy
+// of the web SDK. This bridge lets that SDK share the host's live token and
+// single-flight refresh path without adding a new bootstrap prop that every
+// Solution entry would have to forward. Embed sessions intentionally remain
+// non-refreshable: their short-lived capability token must re-enter the embed
+// handshake instead of borrowing the signed-in user's refresh cookie.
+(globalThis as PlatformAuthGlobal).__BIFROST_PLATFORM_AUTH_V1__ = {
+	getAccessToken: getActiveToken,
+	canRefreshAccessToken: () => !isEmbedSession() && !isImpersonating(),
+	refreshAccessToken,
+	handleAuthenticationFailure: handleAuthFailure,
+};
 
 /**
  * Ensure we have a valid (non-expiring) access token before making a request
@@ -242,6 +275,10 @@ async function ensureValidToken(): Promise<boolean> {
 	// for it. Just trust whatever's in sessionStorage; expiry surfaces
 	// as a 401 and the caller can re-enter the embed flow.
 	if (isEmbedSession()) return true;
+	if (isImpersonating()) {
+		const token = getActiveToken();
+		return !!token && !isTokenExpiringSoon(token);
+	}
 
 	const token = localStorage.getItem(ACCESS_TOKEN_KEY);
 
@@ -268,6 +305,17 @@ export function getCsrfToken(): string | null {
 /**
  * Check if request method requires CSRF protection
  */
+let refusedChangeListener: (() => void) | null = null;
+
+/**
+ * Run ``listener`` whenever the server refuses a change with 403: the UI
+ * offered something the caller may no longer do. ``main.tsx`` uses it to
+ * refetch the caller's authorization. Pass ``null`` to remove it.
+ */
+export function setRefusedChangeListener(listener: (() => void) | null) {
+	refusedChangeListener = listener;
+}
+
 function requiresCsrf(method: string): boolean {
 	return ["POST", "PUT", "PATCH", "DELETE"].includes(method.toUpperCase());
 }
@@ -291,15 +339,7 @@ baseClient.use({
 		if (!isAuthEndpoint) {
 			const hasValidToken = await ensureValidToken();
 			if (!hasValidToken) {
-				// No valid token and refresh failed - redirect to login
-				const currentPath = window.location.pathname;
-				if (
-					currentPath !== "/login" &&
-					currentPath !== "/setup" &&
-					!currentPath.startsWith("/auth/callback")
-				) {
-					window.location.href = `/login?returnTo=${encodeURIComponent(currentPath)}`;
-				}
+				handleAuthFailure();
 				// Throw to prevent the request from proceeding
 				throw new Error("Authentication required");
 			}
@@ -349,27 +389,14 @@ baseClient.use({
 			throw new RateLimitError(retryAfter);
 		}
 
-		// Handle 401 Unauthorized - attempt token refresh and retry
-		if (response.status === 401) {
-			// Skip retry for auth endpoints to prevent infinite loops
-			const url = request.url;
-			if (AUTH_ENDPOINTS.some((ep) => url.includes(ep))) {
-				handleAuthFailure();
-				return response;
-			}
+		if (response.status === 401)
+			return handleAuthResponse(request, response);
 
-			// Attempt token refresh via cookie
-			const refreshed = await refreshAccessToken();
-			if (refreshed) {
-				// Retry original request with current credentials
-				return retryRequestWithFreshAuth(request);
-			}
-
-			// Refresh failed - redirect to login
-			handleAuthFailure();
-		}
 		// 403 Forbidden = permission issue, don't redirect (user is authenticated)
-		// Let the calling code handle displaying an appropriate error message
+		// Let the calling code handle displaying an appropriate error message.
+		if (response.status === 403 && requiresCsrf(request.method)) {
+			refusedChangeListener?.();
+		}
 
 		// Retry transient 5xx (502/503/504) on idempotent methods. Rides
 		// through brief windows during a rolling API deploy where a pod is
@@ -430,16 +457,33 @@ async function handleAuthResponse(
 		throw new RateLimitError(retryAfter);
 	}
 
-	// Handle 401 Unauthorized - attempt token refresh and retry
 	if (response.status === 401) {
-		const url = request.url;
-		if (!AUTH_ENDPOINTS.some((ep) => url.includes(ep))) {
-			const refreshed = await refreshAccessToken();
-			if (refreshed) {
-				// Retry original request with current credentials
-				return retryRequestWithFreshAuth(request);
-			}
+		const pathname = new URL(request.url, window.location.origin).pathname;
+		// Login failures and embed capabilities belong to their own callers.
+		if (
+			isEmbedSession() ||
+			isImpersonating() ||
+			AUTH_ENDPOINTS.some((ep) => pathname.startsWith(ep))
+		)
+			return response;
+
+		// A resource can reject otherwise valid credentials. Confirm the session
+		// through the identity endpoint before rotating tokens or leaving the page.
+		try {
+			const headers = new Headers();
+			const token = getActiveToken();
+			if (token) headers.set("Authorization", `Bearer ${token}`);
+			const session = await fetch("/auth/me", {
+				headers,
+				credentials: "same-origin",
+			});
+			if (session.status !== 401) return response;
+		} catch {
+			// An unavailable identity service is not proof that the session ended.
+			return response;
 		}
+		const refreshed = await refreshAccessToken();
+		if (refreshed) return retryRequestWithFreshAuth(request);
 		handleAuthFailure();
 	}
 
@@ -459,10 +503,7 @@ export function withUserContext(userId: string) {
 			// Ensure valid token before request
 			const hasValidToken = await ensureValidToken();
 			if (!hasValidToken) {
-				const currentPath = window.location.pathname;
-				if (currentPath !== "/login" && currentPath !== "/setup") {
-					window.location.href = `/login?returnTo=${encodeURIComponent(currentPath)}`;
-				}
+				handleAuthFailure();
 				throw new Error("Authentication required");
 			}
 

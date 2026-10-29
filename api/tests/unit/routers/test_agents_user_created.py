@@ -61,7 +61,8 @@ def make_agent(
     agent.roles = []
     agent.knowledge_sources = []
     agent.system_tools = []
-    agent.llm_model = None
+    agent.llm_profile_id = None
+    agent.llm_profile = None
     agent.llm_max_tokens = None
     agent.created_by = "admin@test.com"
     agent.created_at = datetime.now(timezone.utc)
@@ -233,35 +234,116 @@ class TestDeleteAgentAuthorization:
 
 
 class TestPromoteAgentPermission:
-    """Test promote endpoint permission logic."""
+    """Promotion consults the authorization context at the agent's actual org."""
 
-    @pytest.mark.asyncio
-    async def test_user_has_permission_returns_true(self):
-        """_user_has_permission returns True when role has the permission."""
-        from src.routers.agents import _user_has_permission
+    def test_grant_at_another_org_cannot_promote(self):
+        from shared.builtin_roles import USER_ROLE_ID
+        from src.core.principal import UserPrincipal
+        from src.routers.agents import _may_promote_agent
+        from src.services.authorization.context import AuthorizationContext, Boundary, BoundaryKind, RoleGrant
+        from src.services.authorization.enforce import Caller
 
-        user_id = uuid4()
+        home, granted, agent_org = uuid4(), uuid4(), uuid4()
+        caller = Caller(
+            UserPrincipal(user_id=uuid4(), email="person@example.com", organization_id=home),
+            AuthorizationContext(
+                user_id=uuid4(), home_organization_id=home, base_role_id=USER_ROLE_ID,
+                is_external=False, base_permissions=frozenset(),
+                role_grants=(RoleGrant(uuid4(), frozenset({"agents.readwrite"}), (Boundary(BoundaryKind.ORGANIZATION, granted),)),),
+            ),
+        )
+        assert not _may_promote_agent(caller, make_agent(organization_id=agent_org))
 
-        # Mock the DB session
-        mock_session = AsyncMock()
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [{"can_promote_agent": True}]
-        mock_session.execute = AsyncMock(return_value=mock_result)
+    def test_grant_at_agent_org_can_promote(self):
+        from shared.builtin_roles import USER_ROLE_ID
+        from src.core.principal import UserPrincipal
+        from src.routers.agents import _may_promote_agent
+        from src.services.authorization.context import AuthorizationContext, Boundary, BoundaryKind, RoleGrant
+        from src.services.authorization.enforce import Caller
 
-        result = await _user_has_permission(mock_session, user_id, "can_promote_agent")
-        assert result is True
+        home, agent_org = uuid4(), uuid4()
+        caller = Caller(
+            UserPrincipal(user_id=uuid4(), email="person@example.com", organization_id=home),
+            AuthorizationContext(
+                user_id=uuid4(), home_organization_id=home, base_role_id=USER_ROLE_ID,
+                is_external=False, base_permissions=frozenset(),
+                role_grants=(RoleGrant(uuid4(), frozenset({"agents.readwrite"}), (Boundary(BoundaryKind.ORGANIZATION, agent_org),)),),
+            ),
+        )
+        assert _may_promote_agent(caller, make_agent(organization_id=agent_org))
 
-    @pytest.mark.asyncio
-    async def test_user_has_permission_returns_false_when_no_permission(self):
-        """_user_has_permission returns False when no role has the permission."""
-        from src.routers.agents import _user_has_permission
 
-        user_id = uuid4()
+class TestAgentConfigurationPermission:
+    """Privileged Agent fields follow original scoped permissions."""
 
-        mock_session = AsyncMock()
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [{}]
-        mock_session.execute = AsyncMock(return_value=mock_result)
+    @staticmethod
+    def _caller(*, user_id: UUID, organization_id: UUID, permissions: set[str], actor_admin: bool = False):
+        from src.core.principal import UserPrincipal
+        from src.services.authorization.context import AuthorizationContext, Boundary, BoundaryKind, RoleGrant
+        from src.services.authorization.enforce import Caller
 
-        result = await _user_has_permission(mock_session, user_id, "can_promote_agent")
-        assert result is False
+        return Caller(
+            UserPrincipal(
+                user_id=uuid4(),
+                email="actor@contoso.example",
+                organization_id=organization_id,
+                is_superuser=actor_admin,
+            ),
+            AuthorizationContext(
+                user_id=user_id,
+                home_organization_id=organization_id,
+                base_role_id=uuid4(),
+                is_external=False,
+                base_permissions=frozenset(),
+                role_grants=(
+                    RoleGrant(
+                        uuid4(),
+                        frozenset(permissions),
+                        (Boundary(BoundaryKind.ORGANIZATION, organization_id),),
+                    ),
+                ) if permissions else (),
+            ),
+        )
+
+    def test_actor_platform_flag_cannot_configure_private_agent(self):
+        from src.services.agent_write_policy import can_configure_agent
+
+        organization_id, owner = uuid4(), uuid4()
+        caller = self._caller(
+            user_id=owner,
+            organization_id=organization_id,
+            permissions=set(),
+            actor_admin=True,
+        )
+
+        assert not can_configure_agent(
+            caller,
+            make_agent(
+                access_level=AgentAccessLevel.PRIVATE,
+                owner_user_id=owner,
+                organization_id=organization_id,
+            ),
+        )
+
+    def test_private_other_requires_write_and_private_all(self):
+        from src.services.agent_write_policy import can_configure_agent
+
+        organization_id, owner = uuid4(), uuid4()
+        agent = make_agent(
+            access_level=AgentAccessLevel.PRIVATE,
+            owner_user_id=owner,
+            organization_id=organization_id,
+        )
+        writer_only = self._caller(
+            user_id=uuid4(),
+            organization_id=organization_id,
+            permissions={"agents.readwrite"},
+        )
+        writer_with_private_access = self._caller(
+            user_id=uuid4(),
+            organization_id=organization_id,
+            permissions={"agents.readwrite", "agents.readwrite.all"},
+        )
+
+        assert not can_configure_agent(writer_only, agent)
+        assert can_configure_agent(writer_with_private_access, agent)

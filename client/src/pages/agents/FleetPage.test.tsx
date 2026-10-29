@@ -1,3 +1,5 @@
+import { FleetPage } from "./FleetPage";
+import { useLocation } from "react-router-dom";
 /**
  * Tests for FleetPage.
  *
@@ -8,11 +10,23 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { fireEvent, renderWithProviders, screen, within } from "@/test-utils";
+import {
+	fireEvent,
+	renderWithProviders,
+	screen,
+	within,
+	waitFor,
+} from "@/test-utils";
 
 // -----------------------------------------------------------------------------
 // Mocks
 // -----------------------------------------------------------------------------
+
+vi.mock("@/lib/detail-route-loaders", () => ({ prefetchAgentDetail: vi.fn() }));
+
+vi.mock("@/hooks/useOrganizations", () => ({
+	useOrganizations: () => ({ data: [], isLoading: false }),
+}));
 
 const mockUseAgents = vi.fn();
 vi.mock("@/hooks/useAgents", () => ({
@@ -31,9 +45,13 @@ const mockUseAuth = vi.fn();
 vi.mock("@/contexts/AuthContext", () => ({
 	useAuth: () => mockUseAuth(),
 }));
+const mockAuthorization = vi.fn();
+vi.mock("@/services/authorization", () => ({
+	useAuthorization: () => mockAuthorization(),
+}));
 
 vi.mock("@/components/agents/SummaryBackfillButton", () => ({
-	SummaryBackfillButton: () => null,
+	SummaryBackfillButton: () => <div data-testid="summary-backfill" />,
 }));
 
 const mockToastSuccess = vi.fn();
@@ -90,11 +108,24 @@ beforeEach(() => {
 	mockUseAgents.mockReturnValue({ data: [], isLoading: false });
 	mockUseFleetStats.mockReturnValue({ data: fleetStats, isLoading: false });
 	mockUseAuth.mockReturnValue({ isPlatformAdmin: false });
+	mockAuthorization.mockReturnValue({
+		canAt: () => true,
+		canAnywhere: () => true,
+	});
 });
 
 async function renderPage() {
-	const { FleetPage } = await import("./FleetPage");
-	return renderWithProviders(<FleetPage />);
+	return renderWithProviders(
+		<>
+			<FleetPage />
+			<LocationProbe />
+		</>,
+	);
+}
+
+function LocationProbe() {
+	const location = useLocation();
+	return <output aria-label="location">{location.pathname}</output>;
 }
 
 // -----------------------------------------------------------------------------
@@ -109,6 +140,25 @@ describe("FleetPage — header + fleet stats", () => {
 		).toBeInTheDocument();
 	});
 
+	it("shows fleet backfill only with a named run-write grant", async () => {
+		mockAuthorization.mockReturnValue({
+			canAt: () => true,
+			canAnywhere: () => false,
+		});
+		await renderPage();
+		expect(
+			screen.queryByTestId("summary-backfill"),
+		).not.toBeInTheDocument();
+
+		mockAuthorization.mockReturnValue({
+			canAt: () => true,
+			canAnywhere: (permission: string) =>
+				permission === "agentruns.readwrite.all",
+		});
+		await renderPage();
+		expect(screen.getByTestId("summary-backfill")).toBeInTheDocument();
+	});
+
 	it("renders fleet stats once loaded", async () => {
 		mockUseAgents.mockReturnValue({
 			data: [makeAgent()],
@@ -121,19 +171,24 @@ describe("FleetPage — header + fleet stats", () => {
 		expect(screen.getByText("92%")).toBeInTheDocument();
 	});
 
-	it("uses compact fleet metrics on mobile while reserving full stat cards for larger screens", async () => {
+	it("keeps all five fleet measurements in the responsive summary", async () => {
 		mockUseAgents.mockReturnValue({
 			data: [makeAgent()],
 			isLoading: false,
 		});
 		await renderPage();
-		expect(screen.getByTestId("mobile-fleet-metrics")).toHaveClass(
-			"md:hidden",
+		const summary = within(
+			screen.getByRole("region", { name: "Fleet statistics" }),
 		);
-		expect(screen.getByTestId("desktop-fleet-stats")).toHaveClass(
-			"hidden",
-			"md:grid",
-		);
+		for (const label of [
+			"Runs (7d)",
+			"Success rate",
+			"Spend (7d)",
+			"Active agents",
+			"Needs review",
+		]) {
+			expect(summary.getByText(label)).toBeInTheDocument();
+		}
 	});
 
 	it("shows total/active subtitle from agents list", async () => {
@@ -204,14 +259,16 @@ describe("FleetPage — agent cards (grid)", () => {
 		expect(screen.getByText("Beta")).toBeInTheDocument();
 	});
 
-	it("each card links to the agent detail page", async () => {
+	it("opens the agent detail page from the card primary action", async () => {
 		mockUseAgents.mockReturnValue({
 			data: [makeAgent({ id: "alpha-id", name: "Alpha" })],
 			isLoading: false,
 		});
-		await renderPage();
-		const link = screen.getByRole("link", { name: /alpha/i });
-		expect(link).toHaveAttribute("href", "/agents/alpha-id");
+		const { user } = await renderPage();
+		await user.click(screen.getByRole("link", { name: /^Alpha$/ }));
+		expect(screen.getByLabelText("location")).toHaveTextContent(
+			"/agents/alpha-id",
+		);
 	});
 });
 
@@ -297,33 +354,38 @@ describe("FleetPage — agent MCP URL copy badge", () => {
 		}
 	});
 
-	it("copies the agent-scoped MCP URL when the badge is clicked", async () => {
+	it("copies the agent-scoped MCP URL from the card overflow menu", async () => {
 		mockUseAgents.mockReturnValue({
 			data: [makeAgent({ id: "agent-xyz", name: "Alpha" })],
 			isLoading: false,
 		});
-		await renderPage();
-		fireEvent.click(screen.getByTestId("agent-mcp-copy"));
+		const { user } = await renderPage();
+		await user.click(screen.getByRole("button", { name: "Alpha actions" }));
+		await user.click(
+			screen.getByRole("menuitem", { name: "Copy MCP URL" }),
+		);
 		expect(writeText).toHaveBeenCalledWith(
 			`${window.location.origin}/mcp/agent-xyz`,
 		);
-		expect(mockToastSuccess).toHaveBeenCalledWith("Agent MCP URL copied");
+		await waitFor(() =>
+			expect(mockToastSuccess).toHaveBeenCalledWith(
+				"Agent MCP URL copied",
+			),
+		);
 	});
 
-	it("badge click prevents the default action so the card link doesn't navigate", async () => {
+	it("copying the MCP URL leaves the card route unchanged", async () => {
 		mockUseAgents.mockReturnValue({
 			data: [makeAgent({ id: "agent-xyz", name: "Alpha" })],
 			isLoading: false,
 		});
-		await renderPage();
-		const badge = screen.getByTestId("agent-mcp-copy");
-		const event = new MouseEvent("click", {
-			bubbles: true,
-			cancelable: true,
-		});
-		badge.dispatchEvent(event);
+		const { user } = await renderPage();
+		await user.click(screen.getByRole("button", { name: "Alpha actions" }));
+		await user.click(
+			screen.getByRole("menuitem", { name: "Copy MCP URL" }),
+		);
 		expect(writeText).toHaveBeenCalledTimes(1);
-		expect(event.defaultPrevented).toBe(true);
+		expect(screen.getByLabelText("location")).toHaveTextContent("/");
 	});
 });
 
@@ -416,4 +478,31 @@ describe("FleetPage — empty state", () => {
 		await renderPage();
 		expect(screen.getByText(/no agents yet/i)).toBeInTheDocument();
 	});
+});
+
+it("opens an agent row in another tab without navigating the current page", async () => {
+	mockUseAgents.mockReturnValue({ data: [makeAgent()], isLoading: false });
+	const open = vi.spyOn(window, "open").mockReturnValue(null);
+	const { user } = await renderPage();
+	await user.click(screen.getByLabelText(/table view/i));
+	fireEvent.mouseUp(screen.getByText("Triages support tickets"), {
+		button: 1,
+	});
+	expect(open).toHaveBeenCalledExactlyOnceWith("/agents/agent-1", "_blank");
+	expect(screen.getByLabelText("location")).toHaveTextContent(/^\/$/);
+	open.mockRestore();
+});
+
+it("keeps agent editing in the table action menu", async () => {
+	mockUseAuth.mockReturnValue({ isPlatformAdmin: true });
+	mockUseAgents.mockReturnValue({ data: [makeAgent()], isLoading: false });
+	const { user } = await renderPage();
+	await user.click(screen.getByLabelText(/table view/i));
+	await user.click(
+		screen.getByRole("button", { name: "Tier-1 Triage actions" }),
+	);
+	expect(
+		screen.getByRole("menuitem", { name: "Edit Agent" }),
+	).toHaveAttribute("href", "/agents/agent-1?tab=settings");
+	expect(screen.getByLabelText("location")).toHaveTextContent(/^\/$/);
 });

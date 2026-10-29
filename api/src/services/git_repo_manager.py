@@ -17,22 +17,114 @@ only used for bulk sync operations (git clone/fetch/merge/push).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
+from uuid import UUID, uuid4
 from contextlib import asynccontextmanager
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import redis.asyncio as redis
 
 from src.config import Settings, get_settings
+
+if TYPE_CHECKING:
+    from git import Repo as GitRepo
 
 logger = logging.getLogger(__name__)
 
 
 GIT_LOCK_KEY = "bifrost:git-lock"
 GIT_LOCK_TIMEOUT = 300  # 5 minutes
+WORKSPACE_CHECKPOINT_PREFIX = "_workspace_sync_checkpoints"
 
 PERSISTENT_WORK_DIR = Path("/tmp/git")
+TREE_HASH_CHUNK_SIZE = 8 * 1024 * 1024
+# Fingerprint of S3 _repo/ taken when the working dir last matched it. Kept
+# inside .git/ so it lives and dies with the working dir it describes.
+STORAGE_BASELINE_FILE = "bifrost-storage-baseline"
+
+
+# user:password@ in an http(s) URL, as earlier releases wrote into .git/config.
+_URL_CREDENTIALS = re.compile(r"(https?://)[^/@\s]+@")
+
+
+class WorkspaceStorageChanged(RuntimeError):
+    """S3 _repo/ changed since the persistent working dir last matched it."""
+
+
+@dataclass(frozen=True)
+class TreeEntryMetadata:
+    """Content-independent metadata for a workspace file."""
+
+    path: str
+    size: int
+    sha256: str
+
+
+def iter_repo_files(root: Path) -> Iterator[Path]:
+    """Yield workspace files without descending into Git internals."""
+    for path in root.rglob("*"):
+        if not path.is_file() or ".git" in path.relative_to(root).parts:
+            continue
+        yield path
+
+
+def hash_file(path: Path) -> tuple[int, str]:
+    """Stream one file's hash without retaining its content."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        while chunk := source.read(TREE_HASH_CHUNK_SIZE):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def iter_tree_metadata(root: Path) -> Iterator[TreeEntryMetadata]:
+    """Yield metadata for each workspace file while retaining bounded memory."""
+    for path in iter_repo_files(root):
+        size, sha256 = hash_file(path)
+        yield TreeEntryMetadata(path.relative_to(root).as_posix(), size, sha256)
+
+
+def merge_in_progress(work_dir: Path, repo: GitRepo) -> bool:
+    """Whether a merge or stash pop left conflicts that are not yet resolved."""
+    return (work_dir / ".git" / "MERGE_HEAD").exists() or bool(repo.index.unmerged_blobs())
+
+
+def _unsynced_work_warning(work_dir: Path, branch: str) -> str:
+    """Describe local-only git work that Fetch, a full mirror of S3, discards."""
+    from git import GitCommandError, InvalidGitRepositoryError
+    from git import Repo as GitRepo
+
+    try:
+        repo = GitRepo(str(work_dir))
+    except InvalidGitRepositoryError:
+        return ""
+    if merge_in_progress(work_dir, repo):
+        return (
+            " You have an unfinished merge with conflict resolutions. Fetch "
+            "discards it, so you'll need to sync and resolve the conflicts again."
+        )
+    if not repo.head.is_valid():
+        return ""
+    try:
+        ahead = int(repo.git.rev_list("--count", f"origin/{branch}..HEAD"))
+    except GitCommandError:
+        # Never fetched: no commit has been published yet.
+        ahead = int(repo.git.rev_list("--count", "HEAD"))
+    if ahead == 0:
+        return ""
+    noun = "commit" if ahead == 1 else "commits"
+    pronoun = "it" if ahead == 1 else "them"
+    return (
+        f" You have {ahead} local {noun} not yet synced. Fetch discards "
+        f"{pronoun}, so you'll need to redo {pronoun} after fetching."
+    )
 
 
 class GitRepoManager:
@@ -126,19 +218,135 @@ class GitRepoManager:
             await client.aclose()
 
     async def sync_down(self, target: Path) -> None:
-        """Sync _repo/ from S3 to a local directory."""
+        """Mirror S3 _repo/ into a local directory, removing stale local files."""
         target.mkdir(parents=True, exist_ok=True)
         s3_uri = self._s3_uri()
-        cmd = self._build_sync_cmd(source=s3_uri, dest=str(target))
+        # Without --exact-timestamps the CLI skips an S3 object that kept its
+        # size when the local copy is older, so a same-size edit never arrives.
+        cmd = self._build_sync_cmd(
+            source=s3_uri, dest=str(target), delete=True, exact_timestamps=True,
+        )
         logger.info(f"sync_down: {s3_uri} -> {target}")
+        self._clear_storage_baseline(target)
+        # Fingerprint before transferring: a write that lands mid-transfer then
+        # shows up as a change rather than being silently absorbed.
+        fingerprint = await self._storage_fingerprint()
         await self._run_aws_cli(cmd)
+        self._write_storage_baseline(target, fingerprint)
 
     async def sync_up(self, source: Path) -> None:
         """Sync a local directory back to S3 _repo/ with --delete."""
         s3_uri = self._s3_uri()
         cmd = self._build_sync_cmd(source=str(source), dest=s3_uri, delete=True)
         logger.info(f"sync_up: {source} -> {s3_uri}")
+        self._clear_storage_baseline(source)
         await self._run_aws_cli(cmd)
+        self._write_storage_baseline(source, await self._storage_fingerprint())
+
+    async def ensure_storage_unchanged(self, work_dir: Path, branch: str) -> None:
+        """Refuse to act on a working dir that predates the current S3 _repo/.
+
+        Editor, MCP and CLI writes reach S3 only. An operation that commits the
+        working dir or syncs it back to S3 with --delete would otherwise revert
+        or delete them.
+        """
+        baseline = work_dir / ".git" / STORAGE_BASELINE_FILE
+        if not baseline.is_file() or baseline.read_text() != await self._storage_fingerprint():
+            raise WorkspaceStorageChanged(
+                "Workspace files changed since this working copy was last fetched, "
+                "so continuing could overwrite them. Nothing was changed. "
+                "Run Fetch to pick up the changes, then try again."
+                + _unsynced_work_warning(work_dir, branch)
+            )
+
+    async def _storage_fingerprint(self) -> str:
+        """Hash every S3 _repo/ key and ETag except .bifrost/, which commit regenerates."""
+        from src.services.repo_storage import RepoStorage
+
+        listing = await RepoStorage(self._settings).list_with_metadata("")
+        digest = hashlib.sha256()
+        for path in sorted(listing):
+            if path.startswith(".bifrost/"):
+                continue
+            digest.update(path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(listing[path].etag.encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _clear_storage_baseline(work_dir: Path) -> None:
+        (work_dir / ".git" / STORAGE_BASELINE_FILE).unlink(missing_ok=True)
+
+    @staticmethod
+    def _write_storage_baseline(work_dir: Path, fingerprint: str) -> None:
+        git_dir = work_dir / ".git"
+        if git_dir.is_dir():
+            (git_dir / STORAGE_BASELINE_FILE).write_text(fingerprint)
+
+    async def checkpoint_workspace(self, source: Path) -> str:
+        """Persist an exact workspace snapshot for a post-DB publication retry."""
+        checkpoint_id = str(uuid4())
+        uri = self._checkpoint_uri(checkpoint_id)
+        await self._run_aws_cli(self._build_sync_cmd(str(source), uri, delete=True))
+        return checkpoint_id
+
+    async def restore_workspace_checkpoint(self, checkpoint_id: str, target: Path) -> None:
+        """Restore a checkpoint exactly, including Git objects and uncommitted files."""
+        target.mkdir(parents=True, exist_ok=True)
+        await self._run_aws_cli(
+            self._build_sync_cmd(self._checkpoint_uri(checkpoint_id), str(target), delete=True)
+        )
+
+    async def delete_workspace_checkpoint(self, checkpoint_id: str) -> None:
+        """Remove a checkpoint only after successful publication."""
+        cmd = ["aws", "s3", "rm", self._checkpoint_uri(checkpoint_id), "--recursive"]
+        endpoint_url = self._settings.s3_endpoint_url
+        if endpoint_url:
+            cmd.extend(["--endpoint-url", endpoint_url])
+        cmd.append("--only-show-errors")
+        await self._run_aws_cli(cmd)
+
+    async def remove_stored_credentials(self) -> None:
+        """Strip credentials from every stored copy of .git/config.
+
+        Covers this process's working dir, S3 _repo/ and every retry
+        checkpoint. Another process's working dir is rewritten the next time a
+        git operation opens it there.
+        """
+        from src.core.s3_transport import S3NoSuchKey, S3Transport
+
+        local = PERSISTENT_WORK_DIR / ".git" / "config"
+        if local.is_file():
+            local.write_text(_URL_CREDENTIALS.sub(r"\1", local.read_text()))
+
+        bucket = self._settings.s3_bucket
+        async with S3Transport(
+            endpoint_url=self._settings.s3_endpoint_url,
+            access_key_id=self._settings.s3_access_key,
+            secret_access_key=self._settings.s3_secret_key,
+            region=self._settings.s3_region,
+        ) as client:
+            keys = ["_repo/.git/config"]
+            paginator = client.get_paginator("list_objects_v2")
+            async for page in paginator.paginate(
+                Bucket=bucket, Prefix=f"{WORKSPACE_CHECKPOINT_PREFIX}/"
+            ):
+                keys.extend(
+                    key for obj in page.get("Contents", [])
+                    if (key := obj.get("Key", "")).endswith("/.git/config")
+                )
+            for key in keys:
+                try:
+                    response = await client.get_object(Bucket=bucket, Key=key)
+                except S3NoSuchKey:
+                    continue
+                config = (await response["Body"].read()).decode("utf-8")
+                stripped = _URL_CREDENTIALS.sub(r"\1", config)
+                if stripped != config:
+                    await client.put_object(
+                        Bucket=bucket, Key=key, Body=stripped.encode("utf-8")
+                    )
 
     async def has_git_dir(self) -> bool:
         """Check if .git/HEAD exists in S3 _repo/ (quick existence check)."""
@@ -151,16 +359,27 @@ class GitRepoManager:
         bucket = self._settings.s3_bucket
         return f"s3://{bucket}/_repo/"
 
+    def _checkpoint_uri(self, checkpoint_id: str) -> str:
+        """Build a bounded, validated prefix for one workspace checkpoint."""
+        try:
+            checkpoint = UUID(checkpoint_id)
+        except ValueError as error:
+            raise ValueError("Invalid workspace checkpoint ID") from error
+        return f"s3://{self._settings.s3_bucket}/{WORKSPACE_CHECKPOINT_PREFIX}/{checkpoint}/"
+
     def _build_sync_cmd(
         self,
         source: str,
         dest: str,
         delete: bool = False,
+        exact_timestamps: bool = False,
     ) -> list[str]:
         """Build the aws s3 sync command with proper flags."""
         cmd = ["aws", "s3", "sync", source, dest]
         if delete:
             cmd.append("--delete")
+        if exact_timestamps:
+            cmd.append("--exact-timestamps")
         # For self-hosted or custom S3 endpoints
         endpoint_url = self._settings.s3_endpoint_url
         if endpoint_url:

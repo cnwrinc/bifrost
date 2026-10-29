@@ -105,6 +105,9 @@ class ExecutionContext:
 
     # ==================== EXECUTION ====================
     execution_id: str
+    # UTC deadline for a timed workflow; None when timeout_seconds=0.
+    workflow_deadline: datetime | None = None
+    workflow_timeout_seconds: int | None = None
     workflow_name: str = field(default="")  # Name of the executing workflow
     is_agent: bool = False  # True when triggered by an autonomous agent
     # Shared file workspace inherited by nested tools. Chat uses the
@@ -175,27 +178,13 @@ class ExecutionContext:
         return self.scope == "GLOBAL"
 
     def set_scope(self, org_id: str | None) -> None:
-        """Override the effective scope for all subsequent SDK calls.
+        """Select the scope sent on subsequent SDK calls.
 
-        C2 rule (matches ``resolve_scope`` and ``_resolve_sdk_org_id``):
-        platform admins (``is_platform_admin``) AND provider-org members
-        (``organization.is_provider``) can both override to another org.
-        Pass None to reset to the original scope.
+        Selection grants no authority; the API checks current original-user
+        reach and the operation permission for every request.
         """
-        if org_id is None:
-            self._scope_override = None
-            return
         original_org_id = self.organization.id if self.organization else None
-        if org_id == original_org_id:
-            self._scope_override = None
-            return
-        is_provider_org = bool(self.organization and self.organization.is_provider)
-        if not (self.is_platform_admin or is_provider_org):
-            raise PermissionError(
-                f"Scope override to '{org_id}' denied. "
-                "Platform admins or provider-org members only."
-            )
-        self._scope_override = org_id
+        self._scope_override = None if org_id is None or org_id == original_org_id else org_id
 
     @property
     def db(self) -> "AsyncSession":
@@ -243,6 +232,10 @@ class ExecutionContext:
             "is_platform_admin": self.is_platform_admin,
             "is_function_key": self.is_function_key,
             "execution_id": self.execution_id,
+            "workflow_deadline": (
+                self.workflow_deadline.isoformat() if self.workflow_deadline else None
+            ),
+            "workflow_timeout_seconds": self.workflow_timeout_seconds,
             "workflow_name": self.workflow_name,
             "is_agent": self.is_agent,
             "artifact_workspace_id": self.artifact_workspace_id,

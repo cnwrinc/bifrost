@@ -26,8 +26,8 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Path, status
 
 from src.core.auth import Context, CurrentUser
-from src.core.exceptions import AccessDeniedError
 from src.core.log_safety import log_safe
+from src.services.audit import emit_audit
 from src.services.solutions.guard import assert_entity_id_not_solution_managed
 from src.models.contracts.applications import (
     AppFileUpdate,
@@ -37,10 +37,15 @@ from src.models.contracts.applications import (
     SimpleFileResponse,
 )
 from src.models.orm.applications import Application
-from src.routers.applications import ApplicationRepository
+from src.routers.applications import (
+    get_application_by_id_or_404 as _get_application_by_id_or_404,
+    get_application_for_write_or_404 as _get_application_for_write_or_404,
+)
 from src.services.app_storage import AppStorageService
 from src.services.repo_storage import RepoStorage
 from src.services.file_storage.service import get_file_storage_service
+from src.services.operation_catalog import operation_route
+from src.services.authorization.enforce import allows_permission, load_caller
 
 logger = logging.getLogger(__name__)
 
@@ -222,50 +227,27 @@ def validate_file_path(path: str) -> None:
 
 
 async def get_application_or_404(ctx: Context, app_id: UUID) -> Application:
-    """Get application by UUID with access control.
+    """Load source-bearing App data with full App read authority."""
+    return await _get_application_by_id_or_404(ctx, app_id, permission="apps.read")
 
-    Uses ApplicationRepository for cascade scoping and role-based access.
-    Returns 404 for both not found and access denied to avoid leaking
-    existence information.
 
-    Returns:
-        Application if found and accessible
-
-    Raises:
-        HTTPException 404 if not found or access denied
-    """
-    if ctx.user.embed is True:
-        # Embed pre-auth (OPEN-D): the token is HMAC-bound to exactly ONE
-        # app (its app_id claim). Tier/role checks don't apply; identity
-        # binding does — only the bound app's files resolve.
-        if ctx.user.app_id == str(app_id):
-            app = await ctx.db.get(Application, app_id)
-            if app is not None:
-                return app
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Application '{app_id}' not found",
-        )
-
-    repo = ApplicationRepository(
-        session=ctx.db,
-        org_id=ctx.org_id,
-        user_id=ctx.user.user_id,
-        is_superuser=ctx.user.is_platform_admin,
-        is_external=ctx.user.is_external,
-    )
-    try:
-        return await repo.can_access(id=app_id)
-    except AccessDeniedError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Application '{app_id}' not found",
-        )
+async def get_application_for_write_or_404(ctx: Context, app_id: UUID) -> Application:
+    """Load an App for source mutation at its actual organization boundary."""
+    return await _get_application_for_write_or_404(ctx, app_id)
 
 
 class FileMode(str, Enum):
     draft = "draft"
     live = "live"
+
+
+def _server_source_prefix(app: Application) -> str:
+    if app.repo_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This App's source is local and is not stored by Bifrost.",
+        )
+    return app.repo_prefix
 
 
 # =============================================================================
@@ -296,7 +278,7 @@ async def list_app_files(
     repo = RepoStorage()
 
     # List source files from S3 (source of truth)
-    repo_prefix = app.repo_prefix
+    repo_prefix = _server_source_prefix(app)
     source_paths = await repo.list(repo_prefix)
 
     if not source_paths:
@@ -360,7 +342,7 @@ async def read_app_file(
     app_storage = AppStorageService()
 
     # Source from S3 (_repo/)
-    repo_path = f"{app.repo_prefix}{file_path}"
+    repo_path = f"{_server_source_prefix(app)}{file_path}"
     repo = RepoStorage()
     try:
         source = (await repo.read(repo_path)).decode("utf-8", errors="replace")
@@ -406,7 +388,7 @@ async def write_app_file(
     Validates the path, then writes via FileStorageService (which handles
     S3 _repo/ storage, file_index update, pubsub, and preview sync).
     """
-    app = await get_application_or_404(ctx, app_id)
+    app = await get_application_for_write_or_404(ctx, app_id)
     # Solution-managed app source is read-only on the platform — only deploy
     # may write it. The before_flush backstop can't see this: it writes to S3 +
     # file_index, never dirtying the Application ORM row. (criterion 6)
@@ -415,7 +397,7 @@ async def write_app_file(
     # Validate path conventions
     validate_file_path(file_path)
 
-    prefix = app.repo_prefix
+    prefix = _server_source_prefix(app)
     full_path = f"{prefix}{file_path}"
     source = data.source or ""
 
@@ -456,10 +438,10 @@ async def delete_app_file(
     Deletes via FileStorageService (which handles S3 _repo/ deletion,
     file_index cleanup, pubsub, and preview sync).
     """
-    app = await get_application_or_404(ctx, app_id)
+    app = await get_application_for_write_or_404(ctx, app_id)
     # Read-only for solution-managed apps (S3 delete bypasses the ORM backstop).
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    prefix = app.repo_prefix
+    prefix = _server_source_prefix(app)
     full_path = f"{prefix}{file_path}"
 
     storage = get_file_storage_service(ctx.db)
@@ -491,7 +473,7 @@ async def render_app(
 
     Unlike /files, this returns only `path` + `code` (no source).
     """
-    app = await get_application_or_404(ctx, app_id)
+    app = await _get_application_by_id_or_404(ctx, app_id)
     app_storage = AppStorageService()
     storage_mode = "preview" if mode == FileMode.draft else "live"
     app_id_str = str(app.id)
@@ -587,7 +569,9 @@ async def get_bundle_manifest(
 
     If no manifest exists yet, triggers a build and returns that one.
     """
-    app = await get_application_or_404(ctx, app_id)
+    # The manifest bootstraps the running app, just like its dist/assets.
+    # Source reads remain behind get_application_or_404 (apps.read).
+    app = await _get_application_by_id_or_404(ctx, app_id)
     app_storage = AppStorageService()
     storage_mode = "preview" if mode == FileMode.draft else "live"
     app_id_str = str(app.id)
@@ -609,7 +593,13 @@ async def get_bundle_manifest(
         css: str | None = None
         runtime_contract: str | None = None
         try:
-            html = (await SolutionAppBuilder().read_dist(app_id_str, "index.html")).decode()
+            html = (
+                await SolutionAppBuilder().read_dist(
+                    app_id_str,
+                    "index.html",
+                    deployment_id=app.active_deployment_id,
+                )
+            ).decode()
             if m := re.search(r'<script[^>]+type="module"[^>]+src="([^"]+)"', html):
                 entry = m.group(1).split("/dist/")[-1].lstrip("/")
             if m := re.search(r'<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"', html):
@@ -661,6 +651,27 @@ async def get_bundle_manifest(
                 needs_rebuild = True
 
     if needs_rebuild:
+        caller = await load_caller(ctx.db, ctx.user)
+        if not allows_permission(caller, "apps.readwrite", app.organization_id):
+            # A GET must never trigger a _repo build/write for anyone who
+            # can't write the app (platform admins only). Serve the existing (possibly stale-schema) manifest
+            # as-is, or 404 if there is none yet — never build here.
+            if manifest_bytes is None:
+                raise HTTPException(
+                    status_code=404, detail="Bundle manifest not built yet"
+                )
+            manifest_bytes_stale = manifest_bytes
+            m = _json.loads(manifest_bytes_stale)
+            return {
+                "entry": m.get("entry"),
+                "css": m.get("css"),
+                "base_url": f"/api/applications/{app_id}/bundle-asset",
+                "mode": storage_mode,
+                "dependencies": m.get("dependencies") or (app.dependencies or {}),
+                "migrated": False,
+                "organization_id": str(app.organization_id) if app.organization_id else None,
+                "app_model": app.app_model,
+            }
         repo_prefix = app.repo_prefix
         # Serialize migrate+rebuild across concurrent first-viewers so two
         # requests don't double-migrate or race on writes. Hold the lock
@@ -707,6 +718,7 @@ async def get_bundle_manifest(
             result, migrated = await build_with_migrate(
                 app_id_str, repo_prefix, storage_mode,
                 dependencies=app.dependencies or {},
+                db=ctx.db,
             )
             if not migrated:
                 logger.info(f"No migration needed for app={app_id_str}")
@@ -768,7 +780,7 @@ async def get_bundle_asset(
     """
     from fastapi.responses import Response
 
-    app = await get_application_or_404(ctx, app_id)
+    app = await _get_application_by_id_or_404(ctx, app_id)
     app_storage = AppStorageService()
     storage_mode = "preview" if mode == FileMode.draft else "live"
 
@@ -812,19 +824,20 @@ async def get_v2_dist_asset(
     hashed entry/css from the bundle-manifest and loads them from this dist/
     prefix; the app's own bundle pulls any further chunks from here too.
     """
-    from botocore.exceptions import ClientError
+    from src.core.s3_transport import S3Error
     from fastapi import HTTPException
     from fastapi.responses import Response
 
     from src.services.solutions.app_build import SolutionAppBuilder
 
-    app = await get_application_or_404(ctx, app_id)
+    app = await _get_application_by_id_or_404(ctx, app_id)
     rel = path or "index.html"
     try:
-        data = await SolutionAppBuilder().read_dist(str(app.id), rel)
-    except ClientError as exc:
-        # read_dist surfaces a missing key as the raw botocore ClientError from
-        # get_object (Code=NoSuchKey). Only THAT is a 404 — anything else is a
+        data = await SolutionAppBuilder().read_dist(
+            str(app.id), rel, deployment_id=app.active_deployment_id
+        )
+    except S3Error as exc:
+        # A missing object (Code=NoSuchKey) is a 404; anything else is a
         # real storage failure and must surface, not masquerade as not-found.
         if exc.response.get("Error", {}).get("Code") == "NoSuchKey":
             raise HTTPException(
@@ -862,7 +875,7 @@ async def get_v2_dist_asset(
     "/dependencies",
     response_model=dict[str, str],
     summary="Get app dependencies",
-)
+**operation_route("apps.dependencies.get"))
 async def get_dependencies(
     app_id: UUID = Path(..., description="Application UUID"),
     *,
@@ -878,7 +891,7 @@ async def get_dependencies(
     "/dependencies",
     response_model=dict[str, str],
     summary="Update app dependencies",
-)
+**operation_route("apps.dependencies.update"))
 async def put_dependencies(
     deps: dict[str, str],
     app_id: UUID = Path(..., description="Application UUID"),
@@ -890,7 +903,7 @@ async def put_dependencies(
 
     Validates every package name and version, enforces the max-dependency limit.
     """
-    app = await get_application_or_404(ctx, app_id)
+    app = await get_application_for_write_or_404(ctx, app_id)
     # Dependencies are solution-owned metadata — read-only for managed apps.
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
 
@@ -914,6 +927,13 @@ async def put_dependencies(
 
     # Update DB
     app.dependencies = deps if deps else None
+    await emit_audit(
+        ctx.db,
+        "app.dependencies.update",
+        resource_type="application",
+        resource_id=app.id,
+        details={"dependencies": deps},
+    )
     await ctx.db.commit()
 
     # Invalidate render cache

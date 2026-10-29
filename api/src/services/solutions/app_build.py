@@ -4,8 +4,9 @@ SolutionAppBuilder — server-side Vite build for v2 standalone apps (criterion 
 A v2 app's transient ``src/`` is built into a ``dist/`` and uploaded to
 ``_apps/{app_id}/dist/``, from which the platform serves the standalone app. A
 deploy bundle may instead ship a prebuilt ``dist/`` (the disconnected fast-path),
-in which case the Vite build is skipped. App ``src/`` is NEVER persisted under
-``_solutions/`` — it is transient build input only (success-criteria §3.6).
+in which case the Vite build is skipped. Solution app ``src/`` is not persisted
+under ``_solutions/`` by this builder; independent deploy source retention is
+owned by ``ApplicationSourceArtifactStorage``.
 
 This is the ONE canonical build path: git-connected installs always build here
 (from the clone); disconnected installs build here too unless they pre-ship
@@ -21,9 +22,10 @@ import tempfile
 from pathlib import Path
 from uuid import UUID
 
-from aiobotocore.session import get_session
-
+from shared.app_build_errors import AppBuildMemoryError, subprocess_memory_error
+from shared.subprocess_env import package_tool_env
 from src.config import Settings, get_settings
+from src.core.s3_transport import S3Transport
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,17 @@ APPS_PREFIX = "_apps/"
 # install until process restart (every subsequent deploy 409s).
 _BUILD_STEP_TIMEOUT_S = 600
 
+# How much of a failed step's output is surfaced on the deploy job.
+_FAILURE_OUTPUT_LINES = 20
+
+
+def _output_tail(exc: subprocess.CalledProcessError) -> str:
+    """The last lines of a failed step's stderr, or stdout when stderr is empty."""
+    raw = exc.stderr or exc.output or b""
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    return "\n".join(lines[-_FAILURE_OUTPUT_LINES:]) or "(no output)"
+
 
 class SolutionAppBuilder:
     """Builds a v2 app's dist/ and serves it from ``_apps/{app_id}/dist/``."""
@@ -43,18 +56,26 @@ class SolutionAppBuilder:
         self._settings = settings or get_settings()
         self._bucket: str = self._settings.s3_bucket or ""
 
-    def _dist_key(self, app_id: UUID | str, rel: str = "") -> str:
-        base = f"{APPS_PREFIX}{app_id}/dist/"
+    def _dist_key(
+        self,
+        app_id: UUID | str,
+        rel: str = "",
+        *,
+        deployment_id: UUID | str | None = None,
+    ) -> str:
+        base = (
+            f"{APPS_PREFIX}{app_id}/deployments/{deployment_id}/dist/"
+            if deployment_id is not None
+            else f"{APPS_PREFIX}{app_id}/dist/"
+        )
         return f"{base}{rel.lstrip('/')}" if rel else base
 
     def _client(self):
-        session = get_session()
-        return session.create_client(
-            "s3",
+        return S3Transport(
             endpoint_url=self._settings.s3_endpoint_url,
-            aws_access_key_id=self._settings.s3_access_key,
-            aws_secret_access_key=self._settings.s3_secret_key,
-            region_name=self._settings.s3_region,
+            access_key_id=self._settings.s3_access_key,
+            secret_access_key=self._settings.s3_secret_key,
+            region=self._settings.s3_region,
         )
 
     def compile_dist(
@@ -77,8 +98,8 @@ class SolutionAppBuilder:
             return prebuilt_dist
         with tempfile.TemporaryDirectory(prefix=f"bifrost-appbuild-{app_id}-") as tmp:
             workdir = Path(tmp)
-            self._materialize(workdir, src_files, dependencies)
             try:
+                self._materialize(workdir, src_files, dependencies)
                 # base must match the serving route so emitted asset URLs resolve
                 # under /api/applications/{id}/dist/ rather than the site root.
                 return self._run_vite_build(workdir, base=self._dist_base(app_id))
@@ -91,11 +112,43 @@ class SolutionAppBuilder:
                     f"npm/vite step timed out after {_BUILD_STEP_TIMEOUT_S}s for "
                     f"app {app_id}; a dependency's install script may be hanging"
                 ) from exc
+            except subprocess.CalledProcessError as exc:
+                memory_error = subprocess_memory_error(
+                    exc.returncode, exc.stderr, exc.stdout
+                )
+                if memory_error is not None:
+                    raise memory_error from exc
+                # Same translation for a non-OOM failing step, carrying the
+                # tool's own error so the deploy job reports why instead of
+                # "see server logs".
+                from src.services.solutions.deploy import SolutionDeployConflict
+
+                raise SolutionDeployConflict(
+                    f"`{' '.join(exc.cmd[:2])}` failed for app {app_id} "
+                    f"(exit {exc.returncode}):\n{_output_tail(exc)}"
+                ) from exc
+            except MemoryError as exc:
+                raise AppBuildMemoryError() from exc
 
     async def upload_dist(self, app_id: UUID | str, dist: dict[str, bytes]) -> None:
         """Full-replace upload of an already-compiled dist/ to
         ``_apps/{app_id}/dist/`` (cheap PUTs). Runs AFTER the DB commit."""
         await self._upload_dist(app_id, dist)
+
+    async def upload_deployment(
+        self,
+        app_id: UUID | str,
+        deployment_id: UUID | str,
+        dist: dict[str, bytes],
+    ) -> None:
+        """Upload one immutable deployment without touching the active build."""
+        async with self._client() as c:
+            for rel, data in dist.items():
+                await c.put_object(
+                    Bucket=self._bucket,
+                    Key=self._dist_key(app_id, rel, deployment_id=deployment_id),
+                    Body=data,
+                )
 
     async def build(
         self,
@@ -172,6 +225,7 @@ class SolutionAppBuilder:
             check=True,
             capture_output=True,
             timeout=_BUILD_STEP_TIMEOUT_S,
+            env=package_tool_env(),
         )
         subprocess.run(  # noqa: S603 - trusted toolchain, fixed argv
             ["npx", "vite", "build", "--base", base],
@@ -179,6 +233,7 @@ class SolutionAppBuilder:
             check=True,
             capture_output=True,
             timeout=_BUILD_STEP_TIMEOUT_S,
+            env=package_tool_env(),
         )
         dist_dir = workdir / "dist"
         out: dict[str, bytes] = {}
@@ -195,15 +250,29 @@ class SolutionAppBuilder:
             for rel, data in dist.items():
                 await c.put_object(Bucket=self._bucket, Key=self._dist_key(app_id, rel), Body=data)
 
-    async def read_dist(self, app_id: UUID | str, rel: str) -> bytes:
+    async def read_dist(
+        self,
+        app_id: UUID | str,
+        rel: str,
+        *,
+        deployment_id: UUID | str | None = None,
+    ) -> bytes:
         """Read one built dist file back from ``_apps/{app_id}/dist/``."""
         async with self._client() as c:
-            resp = await c.get_object(Bucket=self._bucket, Key=self._dist_key(app_id, rel))
+            resp = await c.get_object(
+                Bucket=self._bucket,
+                Key=self._dist_key(app_id, rel, deployment_id=deployment_id),
+            )
             return await resp["Body"].read()
 
-    async def list_dist(self, app_id: UUID | str) -> list[str]:
+    async def list_dist(
+        self,
+        app_id: UUID | str,
+        *,
+        deployment_id: UUID | str | None = None,
+    ) -> list[str]:
         """List the relative paths of an app's uploaded ``dist/``."""
-        prefix = self._dist_key(app_id)
+        prefix = self._dist_key(app_id, deployment_id=deployment_id)
         strip = len(prefix)
         paths: list[str] = []
         token = None
@@ -227,3 +296,37 @@ class SolutionAppBuilder:
         async with self._client() as c:
             for rel in await self.list_dist(app_id):
                 await c.delete_object(Bucket=self._bucket, Key=self._dist_key(app_id, rel))
+
+    async def delete_deployment(
+        self, app_id: UUID | str, deployment_id: UUID | str
+    ) -> None:
+        """Delete one versioned deployment artifact."""
+        rels = await self.list_dist(app_id, deployment_id=deployment_id)
+        async with self._client() as c:
+            for rel in rels:
+                await c.delete_object(
+                    Bucket=self._bucket,
+                    Key=self._dist_key(app_id, rel, deployment_id=deployment_id),
+                )
+
+    async def delete_all_app_artifacts(self, app_id: UUID | str) -> None:
+        """Delete every artifact under ``_apps/{app_id}/``.
+
+        Used when the app row itself is removed. This clears both the legacy
+        unversioned dist prefix and every immutable versioned deployment.
+        """
+        prefix = f"{APPS_PREFIX}{app_id}/"
+        token = None
+        async with self._client() as c:
+            while True:
+                kwargs: dict = {"Bucket": self._bucket, "Prefix": prefix}
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = await c.list_objects_v2(**kwargs)
+                for obj in resp.get("Contents", []):
+                    key = obj.get("Key")
+                    if key:
+                        await c.delete_object(Bucket=self._bucket, Key=key)
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")

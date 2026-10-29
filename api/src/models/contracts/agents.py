@@ -76,7 +76,7 @@ class AgentCreate(BaseModel):
             "agent's organization must own each listed connection."
         ),
     )
-    llm_model: str | None = Field(default=None, description="Override model (null=use global config)")
+    llm_profile_id: UUID | None = Field(default=None, description="Model profile UUID (null=use default profile assignment)")
     llm_max_tokens: int | None = Field(default=None, ge=1, le=200000, description="Override max tokens")
     max_iterations: int | None = Field(default=None, ge=1, le=200, description="Max LLM iterations for autonomous runs")
     max_token_budget: int | None = Field(default=None, ge=1000, le=1000000, description="Max token budget for autonomous runs")
@@ -107,7 +107,7 @@ class AgentUpdate(BaseModel):
         ),
     )
     clear_roles: bool = Field(default=False, description="If true, clear all role assignments (sets to role_based with no roles)")
-    llm_model: str | None = Field(default=None, description="Override model (null=use global config)")
+    llm_profile_id: UUID | None = Field(default=None, description="Model profile UUID (null=use default profile assignment)")
     llm_max_tokens: int | None = Field(default=None, ge=1, le=200000, description="Override max tokens")
     max_iterations: int | None = Field(default=None, ge=1, le=200, description="Max LLM iterations for autonomous runs")
     max_token_budget: int | None = Field(default=None, ge=1000, le=1000000, description="Max token budget for autonomous runs")
@@ -129,14 +129,6 @@ class AccessibleTool(BaseModel):
     """A tool the current user can assign to their agents."""
     id: str
     name: str
-    description: str | None = None
-
-
-class AccessibleKnowledgeSource(BaseModel):
-    """A knowledge source the current user can assign to their agents."""
-    id: str
-    name: str
-    namespace: str
     description: str | None = None
 
 
@@ -169,7 +161,7 @@ class AgentPublic(BaseModel):
         default_factory=list,
         description="MCP connection UUIDs this agent is granted access to.",
     )
-    llm_model: str | None = None
+    llm_profile_id: UUID | None = None
     llm_max_tokens: int | None = None
     max_iterations: int | None = None
     max_token_budget: int | None = None
@@ -187,7 +179,7 @@ class AgentPublic(BaseModel):
     def serialize_id(self, v: UUID) -> str:
         return str(v)
 
-    @field_serializer("organization_id", "owner_user_id")
+    @field_serializer("organization_id", "owner_user_id", "llm_profile_id")
     def serialize_nullable_uuid(self, v: UUID | None) -> str | None:
         return str(v) if v else None
 
@@ -206,10 +198,11 @@ class AgentSummary(BaseModel):
     channels: list[str]
     is_active: bool
     access_level: AgentAccessLevel
+    role_ids: list[str] = Field(default_factory=list, description="List of role IDs assigned to this agent")
     organization_id: UUID | None = None
     owner_user_id: UUID | None = None
     created_at: datetime
-    llm_model: str | None = None
+    llm_profile_id: UUID | None = None
     dependency_count: int = Field(default=0, description="Number of tool dependencies this agent uses")
     mcp_connection_count: int = Field(
         default=0,
@@ -251,7 +244,7 @@ class AgentSummary(BaseModel):
     def serialize_id(self, v: UUID) -> str:
         return str(v)
 
-    @field_serializer("organization_id", "owner_user_id", "solution_id")
+    @field_serializer("organization_id", "owner_user_id", "solution_id", "llm_profile_id")
     def serialize_nullable_uuid(self, v: UUID | None) -> str | None:
         return str(v) if v else None
 
@@ -380,22 +373,28 @@ class ChatArtifactUpdate(BaseModel):
         return cleaned
 
 
-ChatModelTierId = Literal["fast", "balanced", "pro"]
+class ChatModelProfilePublic(BaseModel):
+    """One administrator-governed reusable model profile exposed in Chat."""
 
-
-class ChatModelTierPublic(BaseModel):
-    """One administrator-governed model choice exposed in Chat."""
-
-    id: ChatModelTierId
+    id: UUID
+    name: str
     label: str
     capabilities: ModelCapabilities
 
+    @field_serializer("id")
+    def serialize_id(self, value: UUID) -> str:
+        return str(value)
 
-class ChatModelTiersResponse(BaseModel):
-    """Enabled Chat model tiers and the default selection."""
 
-    tiers: list[ChatModelTierPublic]
-    default_tier: ChatModelTierId
+class ChatModelProfilesResponse(BaseModel):
+    """Enabled Chat model profiles and the default selection."""
+
+    profiles: list[ChatModelProfilePublic]
+    default_profile_id: UUID | None = None
+
+    @field_serializer("default_profile_id")
+    def serialize_default_profile_id(self, value: UUID | None) -> str | None:
+        return str(value) if value else None
 
 
 class MessagePublic(BaseModel):
@@ -439,7 +438,7 @@ class ChatRequest(BaseModel):
     message: str = Field(default="", max_length=100000)
     stream: bool = Field(default=True, description="Whether to stream the response")
     attachment_ids: list[UUID] = Field(default_factory=list, max_length=5)
-    model_tier: ChatModelTierId = "balanced"
+    model_profile_id: UUID | None = None
 
     @model_validator(mode="after")
     def require_content(self):
@@ -457,8 +456,54 @@ class ChatResponse(BaseModel):
     token_count_input: int | None = None
     token_count_output: int | None = None
     duration_ms: int | None = None
+    finish_reason: str | None = None
+    incomplete: bool | None = None
 
     @field_serializer("message_id")
+    def serialize_uuid(self, v: UUID) -> str:
+        return str(v)
+
+
+class ChatRunCreateRequest(BaseModel):
+    """Request for durable chat submission."""
+
+    conversation_id: UUID | None = Field(
+        default=None,
+        description="Conversation to append to. Omit to create a new chat conversation.",
+    )
+    content: str = Field(default="", max_length=100000)
+    client_run_id: UUID | None = Field(
+        default=None,
+        description="Client-provided idempotency key for the run. Server creates one if omitted.",
+    )
+    user_message_id: UUID | None = Field(
+        default=None,
+        description="Client-generated UUID for the persisted user message. Server creates one if omitted.",
+    )
+    agent_id: UUID | None = Field(
+        default=None,
+        description="Optional agent override. Null means use the conversation's current agent (or agentless chat).",
+    )
+    attachment_ids: list[UUID] = Field(default_factory=list, max_length=5)
+    model_profile_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def require_content(self):
+        if not self.content.strip() and not self.attachment_ids:
+            raise ValueError("A message or attachment is required")
+        return self
+
+
+class ChatRunCreateResponse(BaseModel):
+    """Response from durable chat submission."""
+
+    run_id: UUID
+    conversation: ConversationPublic
+    user_message: MessagePublic
+    status: str
+    idempotent: bool = False
+
+    @field_serializer("run_id")
     def serialize_uuid(self, v: UUID) -> str:
         return str(v)
 
@@ -492,6 +537,19 @@ class ToolProgress(BaseModel):
     log: ToolProgressLog | None = Field(default=None, description="Log entry if this is a log update")
 
 
+class ChatContextUsage(BaseModel):
+    """Context and cached input for the latest request in the Chat conversation."""
+
+    input_tokens: int = Field(ge=0)
+    context_window: int | None = Field(default=None, gt=0)
+    cache_read_tokens: int = Field(ge=0)
+    model_profile_id: UUID
+
+    @field_serializer("model_profile_id")
+    def serialize_model_profile_id(self, value: UUID) -> str:
+        return str(value)
+
+
 class ChatStreamChunk(BaseModel):
     """
     Unified streaming chat response chunk.
@@ -512,8 +570,11 @@ class ChatStreamChunk(BaseModel):
         "artifact_failed",
         "agent_switch",
         "context_warning",
+        "context_usage",
+        "run_status",
         "title_update",
         "done",
+        "cancelled",
         "error",
     ]
 
@@ -530,6 +591,7 @@ class ChatStreamChunk(BaseModel):
     # Agent switch and context warning
     agent_switch: AgentSwitch | None = None
     context_warning: ContextWarning | None = None
+    context_usage: ChatContextUsage | None = None
 
     # Message IDs
     message_id: str | None = None
@@ -544,6 +606,9 @@ class ChatStreamChunk(BaseModel):
     token_count_input: int | None = None
     token_count_output: int | None = None
     duration_ms: int | None = None
+    finish_reason: str | None = None
+    incomplete: bool | None = None
+    run_status: str | None = None
 
     # Error info
     error: str | None = None
@@ -553,6 +618,80 @@ class ChatStreamChunk(BaseModel):
 
     # Message boundary fields (for assistant_message_end)
     stop_reason: str | None = Field(default=None, description="Why message ended: 'tool_use' or 'end_turn'")
+
+
+class ChatRunEventPublic(BaseModel):
+    """Versioned event envelope broadcast over chat:{conversation_id}."""
+
+    type: Literal["chat_run_event"] = "chat_run_event"
+    protocol_version: Literal[1] = 1
+    event_id: UUID
+    sequence: int
+    conversation_id: UUID
+    run_id: UUID
+    occurred_at: datetime
+    kind: str
+    status: str
+    payload: ChatStreamChunk
+
+    @field_serializer("event_id", "conversation_id", "run_id")
+    def serialize_uuid(self, v: UUID) -> str:
+        return str(v)
+
+    @field_serializer("occurred_at")
+    def serialize_dt(self, v: datetime) -> str:
+        return v.isoformat()
+
+
+class ChatRunPublic(BaseModel):
+    """Run status needed to reconstruct the realtime chat projection."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    conversation_id: UUID
+    agent_id: UUID | None = None
+    status: str
+    error: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    @field_serializer("id", "conversation_id")
+    def serialize_uuid(self, v: UUID) -> str:
+        return str(v)
+
+    @field_serializer("agent_id")
+    def serialize_optional_uuid(self, v: UUID | None) -> str | None:
+        return str(v) if v else None
+
+    @field_serializer("created_at")
+    def serialize_dt(self, v: datetime) -> str:
+        return v.isoformat()
+
+    @field_serializer("started_at", "completed_at")
+    def serialize_optional_dt(self, v: datetime | None) -> str | None:
+        return v.isoformat() if v else None
+
+
+class ChatRunStateResponse(BaseModel):
+    """Authoritative snapshot for a chat conversation and its active run."""
+
+    conversation: ConversationPublic
+    active_run: ChatRunPublic | None = None
+    messages: list[MessagePublic] = Field(default_factory=list)
+    events: list[ChatRunEventPublic] = Field(default_factory=list)
+    latest_sequence: int = 0
+    context_usage: ChatContextUsage | None = None
+
+
+class ChatRunCancelResponse(BaseModel):
+    run_id: UUID
+    status: Literal["cancelling", "cancelled"]
+
+    @field_serializer("run_id")
+    def serialize_uuid(self, v: UUID) -> str:
+        return str(v)
 
 
 # ==================== ROLE ASSIGNMENT MODELS ====================

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -38,6 +38,7 @@ class Workflow(Base):
     - workflow: Standard workflows (@workflow decorator)
     - tool: AI agent tools (@tool decorator)
     - data_provider: Data providers for forms/app builder (@data_provider decorator)
+    - service: Long-lived supervised services (@service decorator)
     """
 
     __tablename__ = "workflows"
@@ -86,6 +87,13 @@ class Workflow(Base):
     disable_global_key: Mapped[bool] = mapped_column(Boolean, default=False)
     execution_mode: Mapped[str] = mapped_column(String(20), default="sync")
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=1800)  # 30 min default
+    # Decaying maximum of its runs' peak memory growth (memory_requests),
+    # and the code version it was learned from.
+    learned_memory_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    learned_memory_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Declared memory request (operational setting, API/CLI/MCP/UI); when set
+    # it replaces the learned value.
+    memory_request_mib: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Tool configuration (for AI agent tool calling when type='tool')
     tool_description: Mapped[str | None] = mapped_column(Text, default=None)
@@ -114,6 +122,17 @@ class Workflow(Base):
     # Values: 'authenticated' (any logged-in user), 'role_based' (must have assigned role)
     access_level: Mapped[str] = mapped_column(
         String(20), default="role_based", server_default="role_based"
+    )
+
+    # Values: 'full' | 'restricted'. NULL follows the platform default; nothing
+    # reads this until delegated execution.
+    permission_mode: Mapped[str | None] = mapped_column(String(16), default=None)
+
+    # Identity this workflow runs as when no person starts it; NULL = its
+    # organization's default identity. Not read for execution until run
+    # lineage lands.
+    run_identity_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), default=None, index=True
     )
 
     # Timestamps
@@ -147,6 +166,10 @@ class Workflow(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "permission_mode IN ('full', 'restricted')",
+            name="ck_workflows_permission_mode",
+        ),
         Index(
             "ix_workflows_api_key_hash",
             "api_key_hash",

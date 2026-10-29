@@ -32,26 +32,107 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Literal
 from urllib.parse import urlencode
 
 from .client import get_client, raise_for_status_with_detail
-from ._context import resolve_scope, _execution_context
+from ._context import resolve_scope, get_caller_solution, get_effective_solution
 
 Mode = Literal["local", "cloud"]
 # `location` is a free string. Special names: "workspace", "temp", "uploads".
 # Anything else is a freeform user-defined location (e.g. "reports", "exports"),
 # except blocked internal prefixes such as "_repo", "_tmp", and "_apps".
 
+# Matches the files.move platform job's timeout, so the SDK never gives up on
+# a job that is still allowed to run.
+MOVE_TIMEOUT_SECONDS = 4 * 60 * 60
+
+
+class FileMoveError(RuntimeError):
+    """``files.move`` could not move the file; ``status_code`` follows HTTP semantics."""
+
+    def __init__(self, status_code: int, error: str | None, *, job_id: str) -> None:
+        super().__init__(
+            f"File move failed ({status_code}): {error or 'unknown error'} (platform job {job_id})"
+        )
+        self.status_code = status_code
+        self.error = error
+        self.job_id = job_id
+
+
+class FileMoveJobError(RuntimeError):
+    """The move platform job failed or was cancelled.
+
+    ``results`` holds the per-item results when the job carried them (for
+    example ``storage_unavailable``), so callers can see what had moved;
+    it is ``None`` when the job left none.
+    """
+
+    def __init__(self, job_id: str, status: str, error: dict, results: list[dict] | None) -> None:
+        super().__init__(
+            f"File move platform job {job_id} {status}: {error.get('message') or status}"
+        )
+        self.job_id = job_id
+        self.code = error.get("code")
+        self.results = results
+
+
+async def _run_move_job(
+    path: str,
+    body: dict,
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+) -> tuple[str, list[dict]]:
+    """Enqueue a files.move job, then poll it with short requests until terminal."""
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than zero.")
+    if poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be greater than zero.")
+    client = get_client()
+    response = await client.engine_request("POST", f"{path}{_solution_query()}", json=body)
+    raise_for_status_with_detail(response)
+    job_id = str(response.json()["job_id"])
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status_response = await client.engine_request("GET", f"/api/platform-jobs/{job_id}")
+        raise_for_status_with_detail(status_response)
+        job = status_response.json()
+        if job["status"] == "succeeded":
+            return job_id, list(job["result"]["results"])
+        if job["status"] in ("failed", "cancelled"):
+            result = job.get("result")
+            results = result.get("results") if isinstance(result, dict) else None
+            raise FileMoveJobError(
+                job_id,
+                job["status"],
+                job.get("error") or {},
+                list(results) if results is not None else None,
+            )
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(poll_interval_seconds)
+    raise TimeoutError(f"File move is still running as platform job {job_id}; the move may still be running.")
+
+
 
 def _current_context():
+    from ._context import _execution_context
+
     return _execution_context.get()
 
 
-def _solution_query() -> str:
-    ctx = _current_context()
-    solution_id = getattr(ctx, "solution_id", None) if ctx is not None else None
-    return f"?{urlencode({'solution': str(solution_id)})}" if solution_id else ""
+def _solution_query(solution: str | None = None) -> str:
+    params: dict[str, str] = {}
+    solution_id = get_effective_solution(solution)
+    if solution_id:
+        params["solution"] = str(solution_id)
+    caller = get_caller_solution()
+    if caller:
+        params["caller_solution"] = str(caller)
+    return f"?{urlencode(params)}" if params else ""
 
 
 class files:
@@ -62,6 +143,13 @@ class files:
     - local: Local filesystem (for CLI usage)
     - cloud: S3 storage (for platform execution, default)
 
+    Every operation sends the ordinary HTTP request through the shared
+    ``BifrostClient``: over the worker's private Unix socket when the
+    engine injected one, and over the network API otherwise. The worker
+    parent owns the pooled database and protected storage credentials;
+    an engine child holds neither, and a local attempt never falls back to
+    the network API after a failure.
+
     All operations are performed via HTTP API endpoints.
     """
 
@@ -71,6 +159,7 @@ class files:
         location: str = "workspace",
         mode: Mode = "cloud",
         scope: str | None = None,
+        solution: str | None = None,
     ) -> str:
         """
         Read a text file.
@@ -89,11 +178,12 @@ class files:
             >>> content = await files.read("data/customers.csv")
             >>> uploaded = await files.read("form_id/uuid/file.txt", location="uploads")
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
-            f"/api/files/read{_solution_query()}",
-            json={"path": path, "location": location, "mode": mode, "binary": False, "scope": effective_scope}
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
+            f"/api/files/read{_solution_query(solution)}",
+            json={"path": path, "location": location, "mode": mode, "binary": False, "scope": effective_scope},
         )
         raise_for_status_with_detail(response)
         return response.json()["content"]
@@ -114,11 +204,12 @@ class files:
             mode: Storage mode (local or cloud, default: cloud)
             scope: Org scope; provider-org override allowed.
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             f"/api/files/read{_solution_query()}",
-            json={"path": path, "location": location, "mode": mode, "binary": True, "scope": effective_scope}
+            json={"path": path, "location": location, "mode": mode, "binary": True, "scope": effective_scope},
         )
         raise_for_status_with_detail(response)
         import base64
@@ -147,9 +238,10 @@ class files:
             create_only: Create a new file and fail if the path already exists.
             scope: Org scope; provider-org override allowed.
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             f"/api/files/write{_solution_query()}",
             json={
                 "path": path,
@@ -160,7 +252,7 @@ class files:
                 "expected_version": expected_version,
                 "create_only": create_only,
                 "scope": effective_scope,
-            }
+            },
         )
         raise_for_status_with_detail(response)
 
@@ -187,11 +279,12 @@ class files:
             create_only: Create a new file and fail if the path already exists.
             scope: Org scope; provider-org override allowed.
         """
-        client = get_client()
         import base64
         encoded_content = base64.b64encode(content).decode('utf-8')
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             f"/api/files/write{_solution_query()}",
             json={
                 "path": path,
@@ -202,7 +295,7 @@ class files:
                 "expected_version": expected_version,
                 "create_only": create_only,
                 "scope": effective_scope,
-            }
+            },
         )
         raise_for_status_with_detail(response)
 
@@ -233,11 +326,12 @@ class files:
             >>> for item in items:
             ...     print(item)
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             f"/api/files/list{_solution_query()}",
-            json={"directory": directory, "location": location, "mode": mode, "scope": effective_scope}
+            json={"directory": directory, "location": location, "mode": mode, "scope": effective_scope},
         )
         raise_for_status_with_detail(response)
         return response.json()["files"]
@@ -265,9 +359,10 @@ class files:
             >>> from bifrost import files
             >>> await files.delete("temp/old_file.txt", location="temp")
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             f"/api/files/delete{_solution_query()}",
             json={
                 "path": path,
@@ -275,9 +370,92 @@ class files:
                 "mode": mode,
                 "expected_version": expected_version,
                 "scope": effective_scope,
-            }
+            },
         )
         raise_for_status_with_detail(response)
+
+    @staticmethod
+    async def move_many(
+        items: list[dict[str, str]],
+        location: str,
+        on_conflict: Literal["error", "rename"] = "error",
+        scope: str | None = None,
+        timeout_seconds: float = MOVE_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = 2,
+    ) -> list[dict]:
+        """
+        Move up to 500 files within one location as a single durable job.
+
+        Each file is copied server-side, its metadata (and so its file-policy
+        access) follows it, and the original is deleted only after the copy
+        is verified. Items succeed or fail independently; nothing is undone
+        when another item fails. Workspace files cannot be moved.
+
+        Args:
+            items: ``[{"source": ..., "destination": ...}]``, 1–500 entries.
+            location: A non-workspace location (required).
+            on_conflict: ``"error"`` fails an item whose destination exists;
+                ``"rename"`` uses the first free ``name (n).ext`` instead.
+            scope: Org scope; provider-org override allowed. Solution context wins.
+            timeout_seconds: How long to wait for the job (default: the job's
+                own 4-hour limit). The calling workflow's ``timeout_seconds``
+                must be at least this long, including time queued behind other
+                moves in the same location.
+
+        Returns:
+            One result per item, in request order: ``source``, ``destination``,
+            ``path`` (set when renamed), ``renamed``, ``adopted``,
+            ``status_code`` (200, 400, 403, 404, 409, 500), and ``error``.
+        """
+        _, results = await _run_move_job(
+            "/api/files/move-many",
+            {
+                "items": [
+                    {"source": item["source"], "destination": item["destination"]}
+                    for item in items
+                ],
+                "location": location,
+                "scope": resolve_scope(scope),
+                "on_conflict": on_conflict,
+            },
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return results
+
+    @staticmethod
+    async def move(
+        source: str,
+        destination: str,
+        location: str,
+        on_conflict: Literal["error", "rename"] = "error",
+        scope: str | None = None,
+        timeout_seconds: float = MOVE_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = 2,
+    ) -> str:
+        """
+        Move one file within a location; returns its final path.
+
+        Each call is its own durable job, so move more than one file with
+        ``files.move_many``. Raises :class:`FileMoveError` with the item's
+        status code when the move fails (for example 409 ``file_exists``).
+        See ``files.move_many`` for the arguments.
+        """
+        job_id, (result,) = await _run_move_job(
+            "/api/files/move",
+            {
+                "source": source,
+                "destination": destination,
+                "location": location,
+                "scope": resolve_scope(scope),
+                "on_conflict": on_conflict,
+            },
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        if result["status_code"] != 200:
+            raise FileMoveError(result["status_code"], result.get("error"), job_id=job_id)
+        return result.get("path") or result["destination"]
 
     @staticmethod
     async def stat(
@@ -292,9 +470,10 @@ class files:
         Returns:
             dict with keys: path, exists, version, size, last_modified, updated_by
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             f"/api/files/stat{_solution_query()}",
             json={"path": path, "location": location, "mode": mode, "scope": effective_scope},
         )
@@ -317,11 +496,12 @@ class files:
             mode: Storage mode (local or cloud, default: cloud)
             scope: Org scope; provider-org override allowed.
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             f"/api/files/exists{_solution_query()}",
-            json={"path": path, "location": location, "mode": mode, "scope": effective_scope}
+            json={"path": path, "location": location, "mode": mode, "scope": effective_scope},
         )
         raise_for_status_with_detail(response)
         return response.json()["exists"]
@@ -333,6 +513,7 @@ class files:
         content_type: str = "application/octet-stream",
         location: str = "uploads",
         scope: str | None = None,
+        expires_in: int = 600,
     ) -> dict:
         """
         Generate a presigned S3 URL for direct file upload or download.
@@ -345,6 +526,7 @@ class files:
                 compatibility with form upload flows. Use "workspace" to sign
                 URLs for files written via `files.write_bytes(..., location="workspace")`.
             scope: Org scope; provider-org override allowed.
+            expires_in: URL lifetime in seconds, from 1 second through 7 days.
 
         Returns:
             dict with keys: url, path, expires_in
@@ -357,9 +539,10 @@ class files:
             ...     content_type="application/pdf",
             ... )
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             f"/api/files/signed-url{_solution_query()}",
             json={
                 "path": path,
@@ -367,7 +550,8 @@ class files:
                 "content_type": content_type,
                 "location": location,
                 "scope": effective_scope,
-            }
+                "expires_in": expires_in,
+            },
         )
         raise_for_status_with_detail(response)
         return response.json()
@@ -375,50 +559,71 @@ class files:
     @staticmethod
     async def search(
         query: str,
-        case_sensitive: bool = False,
+        *,
         is_regex: bool = False,
-        include_pattern: str = "**/*",
-        max_results: int = 1000,
+        case_sensitive: bool = False,
+        include_pattern: str | None = None,
+        source: str = "all",
+        solution_id: str | None = None,
+        output_mode: str = "content",
+        context_lines: int = 1,
+        limit: int = 25,
+        cursor: str | None = None,
     ) -> dict:
         """
-        Search workspace file contents.
+        Search workspace and Solution source like grep, one page at a time.
 
         Note:
             Unlike the other ``files`` methods, ``search`` has no ``scope`` parameter.
-            The server scopes results by the caller's identity; a provider-org cannot
-            cross-search another org's workspace through this endpoint.
+            It searches source, not runtime file bytes: the instance ``_repo/``
+            workspace and every Solution install's deployed source.
 
         Args:
-            query: Text or regex pattern to search for.
+            query: Literal text, or a Python ``re`` pattern when ``is_regex`` is true.
+            is_regex: Treat query as a regular expression (default: False).
             case_sensitive: Case-sensitive matching (default: False).
-            is_regex: Treat query as a regex (default: False; literal substring).
-            include_pattern: Glob restricting which files to search (default: ``**/*``).
-                The SDK does not expose the server's nullable form; callers always send
-                a pattern, defaulting to "match all files".
-            max_results: Maximum results returned (default: 1000, max: 10000).
+            include_pattern: ripgrep-style glob, e.g. ``"*.py"`` or ``"workflows/**"``.
+            source: ``"all"`` (default), ``"workspace"``, or ``"solutions"``.
+            solution_id: Restrict to one Solution install's source.
+            output_mode: ``"content"`` (matching lines) or ``"files"`` (one entry per file).
+            context_lines: Lines of context around each match (0-5, default 1).
+            limit: Results per page (1-200, default 25).
+            cursor: ``next_cursor`` from the previous page of this exact search.
 
         Returns:
-            dict with keys: query, total_matches, files_searched, results,
-            truncated, search_time_ms. ``results`` is a list of dicts with
-            keys: file_path, line, column, match_text, context_before,
-            context_after.
+            dict with keys: query, output_mode, matches, files, returned,
+            has_more_matches, response_complete, next_cursor, guidance,
+            search_time_ms. Each match has file_path, line, column, text,
+            context_before, context_after, and source (kind, solution_slug,
+            editable).
 
         Example:
             >>> from bifrost import files
-            >>> hits = await files.search("TODO", include_pattern="**/*.py")
-            >>> for r in hits["results"]:
-            ...     print(f"{r['file_path']}:{r['line']}: {r['match_text']}")
+            >>> cursor = None
+            >>> while True:
+            ...     page = await files.search("TODO", include_pattern="*.py", cursor=cursor)
+            ...     for m in page["matches"]:
+            ...         print(f"{m['file_path']}:{m['line']}: {m['text']}")
+            ...     if page["response_complete"]:
+            ...         break
+            ...     cursor = page["next_cursor"]
         """
+        body: dict = {
+            "query": query,
+            "is_regex": is_regex,
+            "case_sensitive": case_sensitive,
+            "source": source,
+            "output_mode": output_mode,
+            "context_lines": context_lines,
+            "limit": limit,
+        }
+        if include_pattern is not None:
+            body["include_pattern"] = include_pattern
+        if solution_id is not None:
+            body["solution_id"] = solution_id
+        if cursor is not None:
+            body["cursor"] = cursor
         client = get_client()
-        response = await client.post(
-            "/api/files/search",
-            json={
-                "query": query,
-                "case_sensitive": case_sensitive,
-                "is_regex": is_regex,
-                "include_pattern": include_pattern,
-                "max_results": max_results,
-            },
-        )
+        response = await client.engine_request("POST", "/api/files/search", json=body)
         raise_for_status_with_detail(response)
         return response.json()

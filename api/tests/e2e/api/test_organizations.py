@@ -4,7 +4,14 @@ E2E tests for organization management.
 Tests CRUD operations and access control for organizations.
 """
 
+from uuid import UUID
+
 import pytest
+from sqlalchemy import select
+
+from shared.identities import IDENTITY_EMAIL_DOMAIN
+from src.models.enums import IdentityKind
+from src.models.orm.users import User
 
 
 @pytest.mark.e2e
@@ -108,6 +115,28 @@ class TestOrganizationCRUD:
         assert response.status_code == 403
         assert response.json()["detail"] == "Provider organization cannot be disabled"
 
+    @pytest.mark.asyncio
+    async def test_created_organization_has_its_default_identity(
+        self, e2e_client, platform_admin, db_session
+    ):
+        """Creating an organization creates its default identity with it."""
+        response = e2e_client.post(
+            "/api/organizations",
+            headers=platform_admin.headers,
+            json={"name": "Identity Org"},
+        )
+        assert response.status_code == 201, response.text
+        org_id = UUID(response.json()["id"])
+
+        identities = (
+            await db_session.scalars(
+                select(User).where(User.organization_id == org_id, User.identity_kind.is_not(None))
+            )
+        ).all()
+        assert [(i.identity_kind, i.email, i.name) for i in identities] == [
+            (IdentityKind.ORG_DEFAULT, f"identity-{org_id}@{IDENTITY_EMAIL_DOMAIN}", "Default Identity")
+        ]
+
 
 @pytest.mark.e2e
 class TestOrganizationAccess:
@@ -135,19 +164,11 @@ class TestOrganizationAccess:
 class TestOrganizationIsolation:
     """Test organization isolation."""
 
-    def test_org1_user_only_sees_own_org_data(self, e2e_client, org1_user, org2):
-        """Org1 user only sees their own org's resources regardless of query param."""
-        # With the new query param approach, org users always see their own org's data
-        # The scope param is ignored for non-superusers (they can't filter other orgs)
+    def test_org1_user_cannot_select_foreign_scope(self, e2e_client, org1_user, org2):
+        """An explicit foreign organization scope is rejected."""
         response = e2e_client.get(
             "/api/forms",
-            params={"scope": org2["id"]},  # Try to filter by org2
+            params={"scope": org2["id"]},
             headers=org1_user.headers,
         )
-        # Request succeeds but returns org1's forms (query param ignored for org users)
-        assert response.status_code == 200
-        # Verify no org2 data is returned - all forms should be org1's or global
-        forms = response.json()
-        for form in forms:
-            assert form.get("organization_id") in [None, str(org1_user.organization_id)], \
-                f"Org user should only see their own org's forms, not {form.get('organization_id')}"
+        assert response.status_code == 403, response.text

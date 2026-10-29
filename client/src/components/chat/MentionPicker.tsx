@@ -20,6 +20,7 @@ import {
 	PopoverContent,
 	PopoverAnchor,
 } from "@/components/ui/popover";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { term, useTerminology } from "@/lib/terminology";
 import { useAgents } from "@/hooks/useAgents";
@@ -32,6 +33,7 @@ interface MentionPickerProps {
 	onOpenChange: (open: boolean) => void;
 	onSelect: (agent: AgentSummary) => void;
 	searchTerm: string;
+	onSearchChange?: (value: string) => void;
 	position?: { x: number; y: number };
 }
 
@@ -40,16 +42,20 @@ export function MentionPicker({
 	onOpenChange,
 	onSelect,
 	searchTerm,
+	onSearchChange,
 	position,
 }: MentionPickerProps) {
 	const terminology = useTerminology();
-	const { data: agents } = useAgents();
-	const [selectedIndex, setSelectedIndex] = useState(0);
+	const { data: agents, isLoading, isError, isFetching, refetch } = useAgents(undefined, { discoveryOnly: true });
+	const selectionKey = `${open ? "open" : "closed"}:${searchTerm}`;
+	const [selection, setSelection] = useState({ key: selectionKey, index: 0 });
 	const listRef = useRef<HTMLDivElement>(null);
+	if (selection.key !== selectionKey) {
+		setSelection({ key: selectionKey, index: 0 });
+	}
+	const selectedIndex = selection.key === selectionKey ? selection.index : 0;
 
-	// Filter agents by search term - include searchTerm to reset selection
 	const filteredAgents = useMemo(() => {
-		// Reset selection when search term changes by returning fresh array
 		const filtered =
 			agents?.filter((agent) => {
 				if (!searchTerm) return true;
@@ -62,7 +68,6 @@ export function MentionPicker({
 		return filtered;
 	}, [agents, searchTerm]);
 
-	// Clamp selectedIndex to valid range
 	const clampedIndex = Math.min(
 		selectedIndex,
 		Math.max(0, filteredAgents.length - 1),
@@ -84,14 +89,23 @@ export function MentionPicker({
 		if (!open) return;
 
 		const handleKeyDown = (e: KeyboardEvent) => {
+			// The focused command input owns its navigation; do not select twice.
+			if (e.target instanceof Element && e.target.closest("[cmdk-root], button")) return;
 			if (e.key === "ArrowDown") {
 				e.preventDefault();
-				setSelectedIndex((prev) =>
-					prev < filteredAgents.length - 1 ? prev + 1 : prev,
-				);
+				setSelection({
+					key: selectionKey,
+					index:
+						clampedIndex < filteredAgents.length - 1
+							? clampedIndex + 1
+							: clampedIndex,
+				});
 			} else if (e.key === "ArrowUp") {
 				e.preventDefault();
-				setSelectedIndex((prev) => (prev > 0 ? prev - 1 : prev));
+				setSelection({
+					key: selectionKey,
+					index: clampedIndex > 0 ? clampedIndex - 1 : clampedIndex,
+				});
 			} else if (
 				(e.key === "Enter" || e.key === "Tab") &&
 				filteredAgents.length > 0
@@ -106,7 +120,14 @@ export function MentionPicker({
 
 		window.addEventListener("keydown", handleKeyDown);
 		return () => window.removeEventListener("keydown", handleKeyDown);
-	}, [open, filteredAgents, clampedIndex, onSelect, onOpenChange]);
+	}, [
+		open,
+		filteredAgents,
+		clampedIndex,
+		onSelect,
+		onOpenChange,
+		selectionKey,
+	]);
 
 	if (!open) return null;
 
@@ -120,41 +141,62 @@ export function MentionPicker({
 				}}
 			/>
 			<PopoverContent
-				className="w-[300px] p-0"
+				className="w-[300px] max-w-[calc(100vw-2rem)] p-0"
 				align="start"
 				side="top"
 				sideOffset={8}
 				onOpenAutoFocus={(e) => e.preventDefault()}
 			>
-				<Command>
+				<Command
+					shouldFilter={false}
+					value={filteredAgents[clampedIndex]?.id ?? ""}
+					onValueChange={(agentId) => {
+						const index = filteredAgents.findIndex(
+							(agent) => agent.id === agentId,
+						);
+						if (index >= 0) {
+							setSelection({ key: selectionKey, index });
+						}
+					}}
+				>
 					<CommandInput
 						placeholder={`Search ${term(terminology, "agent", "pluralLower")}...`}
 						value={searchTerm}
-						className="h-9"
+						onValueChange={onSearchChange}
+						aria-label={`Search ${term(terminology, "agent", "pluralLower")}`}
+						className="h-11"
 					/>
+					{isLoading && <p role="status" className="p-4 text-sm text-muted-foreground">Loading {term(terminology, "agent", "pluralLower")}…</p>}
+					{isError && (
+						<div role="alert" className="space-y-2 border-b bg-[var(--bf-warning-soft)] p-4 text-sm">
+							<p>{agents?.length ? "Could not refresh" : "Could not load"} {term(terminology, "agent", "pluralLower")}.</p>
+							<Button variant="outline" className="min-h-11" disabled={isFetching} onClick={() => void refetch()}>{isFetching ? "Retrying…" : "Retry"}</Button>
+						</div>
+					)}
 					<CommandList ref={listRef}>
-						<CommandEmpty>
-							No {term(terminology, "agent", "pluralLower")} found.
-						</CommandEmpty>
+						{!isLoading && !isError && <CommandEmpty>
+							No {term(terminology, "agent", "pluralLower")}{" "}
+							found.
+						</CommandEmpty>}
 						<CommandGroup
 							heading={term(terminology, "agent", "plural")}
 						>
 							{filteredAgents.map((agent, index) => (
 								<CommandItem
 									key={agent.id}
-									value={agent.name}
+									value={agent.id}
 									data-checked={index === clampedIndex}
 									onSelect={() => onSelect(agent)}
 									className={cn(
-										"cursor-pointer",
+										"min-h-11 cursor-pointer items-start",
 										index === clampedIndex && "bg-muted",
 									)}
 								>
 									<Bot className="mr-2 h-4 w-4 text-muted-foreground" />
-									<div className="flex flex-col">
+									<div className="min-w-0 flex flex-col [overflow-wrap:anywhere]">
 										<span>{agent.name}</span>
 										{agent.description && (
-											<span className="text-xs text-muted-foreground truncate max-w-[220px]">
+											<span className="text-xs text-muted-foreground line-clamp-2">
 												{agent.description}
 											</span>
 										)}

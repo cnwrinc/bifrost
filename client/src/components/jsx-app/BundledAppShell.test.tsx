@@ -1,3 +1,4 @@
+import { BundledAppShell, prepareAppBundle } from "./BundledAppShell";
 /**
  * Component tests for BundledAppShell.
  *
@@ -117,13 +118,23 @@ afterEach(() => {
 		.forEach((el) => el.remove());
 });
 
-async function renderShell({ isPreview = true }: { isPreview?: boolean } = {}) {
-	const { BundledAppShell } = await import("./BundledAppShell");
+async function renderShell({
+	isPreview = true,
+	appName,
+	appLogo,
+}: {
+	isPreview?: boolean;
+	appName?: string | null;
+	appLogo?: string | null;
+} = {}) {
+
 	return renderWithProviders(
 		<BundledAppShell
 			appId="app-1"
 			appSlug="my-app"
 			isPreview={isPreview}
+			appName={appName}
+			appLogo={appLogo}
 		/>,
 	);
 }
@@ -142,9 +153,15 @@ describe("BundledAppShell — loading", () => {
 				}),
 		);
 
-		await renderShell();
+		await renderShell({
+			appName: "Dispatch Board",
+			appLogo: "data:image/svg+xml,%3Csvg%3E%3C/svg%3E",
+		});
 
-		expect(screen.getByText(/loading application/i)).toBeInTheDocument();
+		expect(screen.getByRole("status")).toHaveAccessibleName(
+			"Opening Dispatch Board…",
+		);
+		expect(screen.getByText("Dispatch Board")).toBeInTheDocument();
 
 		// Clean up the hanging promise so the test doesn't leak.
 		resolveFetch({
@@ -162,17 +179,44 @@ describe("BundledAppShell — loading", () => {
 });
 
 describe("BundledAppShell — error path", () => {
-	it("renders the 'Bundle Load Error' panel when the manifest fetch fails", async () => {
-		// Silence the expected console.error from the failed dynamic import.
-		vi.spyOn(console, "error").mockImplementation(() => {});
-		mockManifestError(500, "manifest broken");
+	it.each([
+		[401, "Sign in again to open this app."],
+		[403, "You do not have permission to open this app."],
+		[404, "This app is unavailable."],
+		[500, "The app could not be loaded. Please try again."],
+	])(
+		"shows a safe message for a %i manifest response",
+		async (status, expectedMessage) => {
+			// Silence the expected console.error from the failed dynamic import.
+			vi.spyOn(console, "error").mockImplementation(() => {});
+			mockManifestError(
+				status,
+				'{"detail":"internal deployment metadata"}',
+			);
 
-		await renderShell();
+			await renderShell();
 
-		expect(
-			await screen.findByText(/bundle load error/i),
-		).toBeInTheDocument();
-		expect(screen.getByText(/manifest broken/i)).toBeInTheDocument();
+			expect(
+				await screen.findByText(/bundle load error/i),
+			).toBeInTheDocument();
+			expect(
+				screen.getByLabelText("Bundle error details"),
+			).toHaveTextContent(expectedMessage);
+			expect(
+				screen.queryByText(/internal deployment metadata/i),
+			).not.toBeInTheDocument();
+			expect(
+				screen.queryByText(new RegExp(`\\b${status}\\b`)),
+			).not.toBeInTheDocument();
+		},
+	);
+
+	it("does not expose a manifest response body while preparing a bundle", async () => {
+		mockManifestError(403, '{"detail":"internal deployment metadata"}');
+
+		await expect(
+			prepareAppBundle({ appId: "prepared-forbidden", isPreview: false }),
+		).rejects.toThrow("You do not have permission to open this app.");
 	});
 });
 
@@ -235,6 +279,7 @@ describe("BundledAppShell — app_model render branch", () => {
 			<BundledAppShell
 				appId="app-prepared"
 				appSlug="prepared"
+				solutionId="solution-prepared"
 				isPreview={false}
 			/>,
 		);
@@ -243,6 +288,7 @@ describe("BundledAppShell — app_model render branch", () => {
 			await screen.findByTestId("solution-v2-app-root"),
 		).toBeInTheDocument();
 		expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+		expect(mockStandaloneV2App).toHaveBeenCalledWith(expect.objectContaining({ solutionId: "solution-prepared" }));
 	});
 
 	it("mounts the standalone v2 app same-document (no iframe) and injects auth", async () => {
@@ -280,7 +326,7 @@ describe("BundledAppShell — app_model render branch", () => {
 	it("drops the v2 mount when navigating to an inline_v1 app in the same shell", async () => {
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		localStorage.setItem("bifrost_access_token", "tok-xyz");
-		const { BundledAppShell } = await import("./BundledAppShell");
+
 
 		// First app: standalone_v2 → same-document container.
 		mockManifestOk({
@@ -308,7 +354,7 @@ describe("BundledAppShell — app_model render branch", () => {
 	it("does not render a v2 app with the new appId while the new manifest is still pending (Codex #10)", async () => {
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		localStorage.setItem("bifrost_access_token", "tok-xyz");
-		const { BundledAppShell } = await import("./BundledAppShell");
+
 
 		// App A: standalone_v2, resolves immediately.
 		mockManifestOk({

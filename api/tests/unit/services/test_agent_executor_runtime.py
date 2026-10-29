@@ -1,6 +1,7 @@
 """Chat contract coverage for the Pydantic AI loop."""
 
 from contextlib import asynccontextmanager
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -11,13 +12,17 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
 
+from src.core.principal import UserPrincipal
 from src.models.contracts.agents import ToolResult
+from src.models.contracts.artifacts import ModelCapabilities
+from src.models.enums import MessageRole
+from src.models.orm.ai_models import AIModelProfile
 from src.services.agent_executor import AgentExecutor
+from src.services.authorization.enforce import Caller
 from src.services.llm import LLMMessage, ToolDefinition
 from src.services.llm.base import LLMConfig
 from src.services.llm.pydantic_client import PydanticAIClient
-from src.services.llm_config_service import LLMProviderConfig
-from src.services.model_capabilities import manual_capabilities
+from src.services.model_catalog import parse_catalog
 
 
 class CountingTestModel(TestModel):
@@ -48,6 +53,16 @@ class CapturingTestModel(CountingTestModel):
             yield response
 
 
+class UsageTestModel(CountingTestModel):
+    """Provider fixture with measured input and cache counts."""
+
+    @asynccontextmanager
+    async def request_stream(self, messages, *args, **kwargs):
+        async with super().request_stream(messages, *args, **kwargs) as response:
+            response._usage = RequestUsage(input_tokens=105_000, cache_read_tokens=78_750)
+            yield response
+
+
 @pytest.fixture
 def executor() -> AgentExecutor:
     return AgentExecutor(MagicMock())
@@ -56,21 +71,29 @@ def executor() -> AgentExecutor:
 @pytest.fixture(autouse=True)
 def configured_chat_model():
     """Keep these runtime-contract tests focused on the Pydantic event loop."""
-    config = LLMProviderConfig(
-        provider="openai",
-        model="test-model",
-        chat_balanced_capabilities=manual_capabilities(
-            provider="openai",
-            model="test-model",
-            endpoint=None,
-            image_input=False,
-            pdf_input=False,
-            tool_calling=True,
+    profile = MagicMock(spec=AIModelProfile)
+    profile.id = uuid4()
+    profile.name = "Everyday"
+    config = LLMConfig(provider="openai", model="test-model", api_key="test-key")
+    capabilities = ModelCapabilities(tool_calling=True, source="manual")
+    with (
+        patch(
+            "src.services.agent_executor.AIModelService.resolve_chat_profile",
+            new=AsyncMock(return_value=(profile, config, capabilities)),
         ),
-    )
-    with patch(
-        "src.services.llm_config_service.LLMConfigService.get_config",
-        new=AsyncMock(return_value=config),
+        patch(
+            "src.services.agent_executor.AIModelService.has_assignment",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "src.services.agent_executor.AIBehaviorService.get_agent_execution_mode",
+            new=AsyncMock(return_value="delegated"),
+        ),
+        patch("src.services.agent_executor.store_chat_context_usage", new=AsyncMock()),
+        patch(
+            "src.services.agent_executor.authorize_agentless_ai",
+            new=AsyncMock(side_effect=lambda _session, caller: caller),
+        ),
     ):
         yield
 
@@ -83,6 +106,19 @@ def conversation():
     return value
 
 
+@pytest.fixture
+def caller() -> Caller:
+    return Caller(
+        UserPrincipal(
+            user_id=uuid4(),
+            email="chat.operator@contoso.example",
+            organization_id=uuid4(),
+            is_active=True,
+        ),
+        None,
+    )
+
+
 def _saved_message(*args, **kwargs):
     return MagicMock(id=kwargs.get("message_id") or uuid4())
 
@@ -91,6 +127,7 @@ def _saved_message(*args, **kwargs):
 async def test_chat_stream_contract_is_driven_by_pydantic_runtime(
     executor: AgentExecutor,
     conversation,
+    caller: Caller,
 ) -> None:
     executor._save_message = AsyncMock(side_effect=_saved_message)
     executor._record_ai_usage = AsyncMock()
@@ -109,8 +146,8 @@ async def test_chat_stream_contract_is_driven_by_pydantic_runtime(
         new_callable=AsyncMock,
         return_value=client,
     ), patch(
-        "src.services.agent_executor.create_agent_model",
-        return_value=CountingTestModel(custom_output_text="Hello from Pydantic"),
+            "src.services.agent_runtime.model_factory.create_agent_model",
+            return_value=CountingTestModel(custom_output_text="Hello from Pydantic",),
     ):
         chunks = [
             chunk
@@ -120,6 +157,8 @@ async def test_chat_stream_contract_is_driven_by_pydantic_runtime(
                 "Hello",
                 stream=True,
                 enable_routing=False,
+                caller=caller,
+                run_user_id=None,
             )
         ]
 
@@ -132,9 +171,150 @@ async def test_chat_stream_contract_is_driven_by_pydantic_runtime(
 
 
 @pytest.mark.asyncio
+async def test_chat_context_uses_serving_model_capacity_and_per_request_cache(
+    executor: AgentExecutor,
+    conversation,
+    caller: Caller,
+) -> None:
+    executor._save_message = AsyncMock(side_effect=_saved_message)
+    executor._record_ai_usage = AsyncMock()
+    executor._build_message_history = AsyncMock(
+        return_value=[LLMMessage(role="system", content="Be useful")]
+    )
+    client = PydanticAIClient(
+        LLMConfig(provider="openai", model="test-model", api_key="test-key")
+    )
+    catalog = parse_catalog(
+        {"openai": {"id": "openai", "name": "OpenAI", "models": {
+            "test-model": {"id": "test-model", "name": "Test", "limit": {"context": 475_000}}
+        }}},
+        fetched_at=None,
+        source="bundled",
+    )
+    with (
+        patch("src.services.agent_executor.get_llm_client", new=AsyncMock(return_value=client)),
+        patch("src.services.agent_executor.get_model_catalog", new=AsyncMock(return_value=catalog)),
+        # The runtime's conservative limit may differ from the serving model's capacity.
+        patch("src.services.agent_executor.chain_context_window", new=AsyncMock(return_value=200_000)),
+        patch("src.services.agent_executor.store_chat_context_usage", new=AsyncMock()) as store,
+        patch("src.services.agent_runtime.model_factory.create_agent_model", return_value=UsageTestModel(
+            model_name="test-model", custom_output_text="Hello", call_tools=[]
+        )),
+    ):
+        chunks = [chunk async for chunk in executor.chat(
+            None, conversation, "Hello", stream=True, enable_routing=False, caller=caller, run_user_id=None
+        )]
+
+    context = next(chunk.context_usage for chunk in chunks if chunk.type == "context_usage")
+    assert context is not None
+    assert context.input_tokens == 105_000
+    assert context.cache_read_tokens == 78_750
+    assert context.context_window == 475_000
+    store.assert_awaited_once()
+    assert store.await_args.args[1:] == (conversation.id, context)
+
+
+@pytest.mark.asyncio
+async def test_chat_resolves_explicit_model_profile_id(
+    executor: AgentExecutor,
+    conversation,
+    caller: Caller,
+) -> None:
+    profile_id = uuid4()
+    profile = MagicMock(spec=AIModelProfile)
+    profile.id = profile_id
+    profile.name = "Pro"
+    resolver = AsyncMock(
+        return_value=(
+            profile,
+            LLMConfig(provider="openai", model="pro-model", api_key="test-key"),
+            ModelCapabilities(tool_calling=True, source="manual"),
+        )
+    )
+    executor._save_message = AsyncMock(side_effect=_saved_message)
+    executor._record_ai_usage = AsyncMock()
+    executor._build_message_history = AsyncMock(return_value=[LLMMessage(role="user", content="Hello")])
+    client = PydanticAIClient(LLMConfig(provider="openai", model="pro-model", api_key="test-key"))
+
+    with (
+        patch("src.services.agent_executor.AIModelService.resolve_chat_profile", resolver),
+        patch("src.services.agent_executor.get_llm_client", new=AsyncMock(return_value=client)) as client_factory,
+        patch(
+            "src.services.agent_runtime.model_factory.create_agent_model",
+            return_value=CountingTestModel(custom_output_text="Hello",),
+        ),
+    ):
+        _ = [
+            chunk
+            async for chunk in executor.chat(
+                None,
+                conversation,
+                "Hello",
+                stream=False,
+                enable_routing=False,
+                model_profile_id=profile_id,
+                caller=caller,
+                run_user_id=None,
+            )
+        ]
+
+    resolver.assert_awaited_once_with(profile_id)
+    client_factory.assert_awaited_once()
+    assert client_factory.await_args.kwargs["profile_id"] == profile_id
+
+
+@pytest.mark.asyncio
+async def test_chat_omitted_model_profile_uses_default_resolution(
+    executor: AgentExecutor,
+    conversation,
+    caller: Caller,
+) -> None:
+    profile = MagicMock(spec=AIModelProfile)
+    profile.id = uuid4()
+    profile.name = "Default"
+    resolver = AsyncMock(
+        return_value=(
+            profile,
+            LLMConfig(provider="openai", model="test-model", api_key="test-key"),
+            ModelCapabilities(tool_calling=True, source="manual"),
+        )
+    )
+    executor._save_message = AsyncMock(side_effect=_saved_message)
+    executor._record_ai_usage = AsyncMock()
+    executor._build_message_history = AsyncMock(return_value=[LLMMessage(role="user", content="Hello")])
+    client = PydanticAIClient(LLMConfig(provider="openai", model="test-model", api_key="test-key"))
+
+    with patch(
+        "src.services.agent_executor.AIModelService.resolve_chat_profile",
+        resolver,
+    ), patch(
+        "src.services.agent_executor.get_llm_client",
+        new=AsyncMock(return_value=client),
+    ), patch(
+            "src.services.agent_runtime.model_factory.create_agent_model",
+            return_value=CountingTestModel(custom_output_text="Hello",),
+    ):
+        _ = [
+            chunk
+            async for chunk in executor.chat(
+                None,
+                conversation,
+                "Hello",
+                stream=False,
+                enable_routing=False,
+                caller=caller,
+                run_user_id=None,
+            )
+        ]
+
+    resolver.assert_awaited_once_with(None)
+
+
+@pytest.mark.asyncio
 async def test_chat_reapplies_agent_instructions_when_stored_history_exists(
     executor: AgentExecutor,
     conversation,
+    caller: Caller,
 ) -> None:
     executor._save_message = AsyncMock(side_effect=_saved_message)
     executor._record_ai_usage = AsyncMock()
@@ -156,8 +336,8 @@ async def test_chat_reapplies_agent_instructions_when_stored_history_exists(
         new_callable=AsyncMock,
         return_value=client,
     ), patch(
-        "src.services.agent_executor.create_agent_model",
-        return_value=model,
+            "src.services.agent_runtime.model_factory.create_agent_model",
+            return_value=model,
     ):
         _ = [
             chunk
@@ -167,6 +347,8 @@ async def test_chat_reapplies_agent_instructions_when_stored_history_exists(
                 "Current ticket",
                 stream=False,
                 enable_routing=False,
+                caller=caller,
+                run_user_id=None,
             )
         ]
 
@@ -181,11 +363,116 @@ async def test_chat_reapplies_agent_instructions_when_stored_history_exists(
 
 
 @pytest.mark.asyncio
+async def test_unknown_capabilities_still_offer_agent_tools(
+    executor: AgentExecutor,
+    conversation,
+    caller: Caller,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeRunStreamEvents:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class FakePydanticAgent:
+        def __init__(self, model, **kwargs):
+            captured["toolsets"] = kwargs["toolsets"]
+
+        def run_stream_events(self, *args, **kwargs):
+            return FakeRunStreamEvents()
+
+    profile = MagicMock(spec=AIModelProfile)
+    profile.id = uuid4()
+    profile.name = "Unknown"
+    config = LLMConfig(provider="openai", model="test-model", api_key="test-key")
+    capabilities = ModelCapabilities(source="unknown", tool_calling=False)
+    agent = MagicMock()
+    agent.delegated_agents = []
+    agent.id = uuid4()
+    agent.name = "Test Agent"
+    agent.organization_id = None
+    agent.max_iterations = None
+    agent.max_token_budget = None
+    agent.llm_max_tokens = None
+
+    executor._save_message = AsyncMock(side_effect=_saved_message)
+    executor._record_ai_usage = AsyncMock()
+    executor._build_message_history = AsyncMock(
+        return_value=[
+            LLMMessage(role="system", content="Be useful"),
+            LLMMessage(role="user", content="Hello"),
+        ]
+    )
+    executor._get_agent_tools = AsyncMock(
+        return_value=[
+            ToolDefinition(
+                name="wf_test",
+                description="Test",
+                parameters={"type": "object"},
+            )
+        ]
+    )
+
+    llm_client = MagicMock()
+    llm_client.config = LLMConfig(
+        provider="openai",
+        model="test-model",
+        api_key="test-key",
+    )
+    llm_client.provider_name = "openrouter"
+
+    with patch(
+        "src.services.agent_executor.AIModelService.resolve_chat_profile",
+        new=AsyncMock(return_value=(profile, config, capabilities)),
+    ), patch(
+        "src.services.agent_executor.get_llm_client",
+        new=AsyncMock(return_value=llm_client),
+    ), patch(
+            "src.services.agent_runtime.model_factory.create_agent_model",
+            return_value=CountingTestModel(custom_output_text="Hello from Pydantic",),
+    ), patch(
+        "src.services.agent_executor.PydanticAgent",
+        new=FakePydanticAgent,
+    ), patch(
+        "src.services.agent_executor.authorize_agent_execution",
+        new=AsyncMock(return_value=(caller, agent)),
+    ):
+        chunks = [
+            chunk
+            async for chunk in executor.chat(
+                agent,
+                conversation,
+                "Hello",
+                stream=False,
+                enable_routing=False,
+                caller=caller,
+                run_user_id=None,
+            )
+        ]
+
+    assert any(chunk.type == "done" for chunk in chunks)
+    toolsets = captured["toolsets"]
+    assert len(toolsets) == 1
+    assert toolsets[0]._definitions[0].name == "wf_test"
+
+
+@pytest.mark.asyncio
 async def test_chat_maps_pydantic_tool_events_to_existing_bifrost_contract(
     executor: AgentExecutor,
     conversation,
+    caller: Caller,
 ) -> None:
     agent = MagicMock()
+    agent.delegated_agents = []
     agent.id = uuid4()
     agent.name = "Ticket Agent"
     agent.max_iterations = 5
@@ -233,11 +520,14 @@ async def test_chat_maps_pydantic_tool_events_to_existing_bifrost_contract(
         new_callable=AsyncMock,
         return_value=client,
     ), patch(
-        "src.services.agent_executor.create_agent_model",
-        return_value=CountingTestModel(
+            "src.services.agent_runtime.model_factory.create_agent_model",
+            return_value=CountingTestModel(
             call_tools=["get_ticket"],
             custom_output_text="Ticket checked",
         ),
+    ), patch(
+        "src.services.agent_executor.authorize_agent_execution",
+        new=AsyncMock(return_value=(caller, agent)),
     ):
         chunks = [
             chunk
@@ -247,6 +537,8 @@ async def test_chat_maps_pydantic_tool_events_to_existing_bifrost_contract(
                 "Check the ticket",
                 stream=True,
                 enable_routing=False,
+                caller=caller,
+                run_user_id=None,
             )
         ]
 
@@ -257,3 +549,74 @@ async def test_chat_maps_pydantic_tool_events_to_existing_bifrost_contract(
     ]
     assert next(chunk for chunk in chunks if chunk.type == "done").content == "Ticket checked"
     executor._execute_tool.assert_awaited_once()
+
+    contexts = [chunk.context_usage for chunk in chunks if chunk.type == "context_usage"]
+    assert len(contexts) == 2
+    assert all(context is not None for context in contexts)
+    assert all(context.input_tokens > 0 for context in contexts if context is not None)
+    persisted_total = executor._record_ai_usage.await_args.kwargs["input_tokens"]
+    assert persisted_total == sum(context.input_tokens for context in contexts if context)
+    assert contexts[-1].input_tokens < persisted_total
+
+
+@pytest.mark.asyncio
+async def test_chat_uses_persisted_user_message_without_duplication(
+    executor: AgentExecutor,
+    conversation,
+    caller: Caller,
+) -> None:
+    user_message_id = uuid4()
+
+    executor._save_message = AsyncMock(side_effect=_saved_message)
+    executor._record_ai_usage = AsyncMock()
+    executor._build_message_history = AsyncMock(
+        return_value=[
+            LLMMessage(role="system", content="Be useful"),
+            LLMMessage(role="user", content="Prior message"),
+        ]
+    )
+    executor._is_first_user_message = AsyncMock(return_value=True)
+    router = MagicMock()
+    router.parse_mention = AsyncMock(return_value=None)
+    router.route_message = AsyncMock(return_value=None)
+    router.strip_mention = MagicMock(side_effect=lambda text: text)
+    client = PydanticAIClient(
+        LLMConfig(provider="openai", model="test-model", api_key="test-key")
+    )
+
+    with patch(
+        "src.services.agent_router.AgentRouter",
+        return_value=router,
+    ), patch(
+        "src.services.agent_executor.get_llm_client",
+        new_callable=AsyncMock,
+        return_value=client,
+    ), patch(
+            "src.services.agent_runtime.model_factory.create_agent_model",
+            return_value=CountingTestModel(custom_output_text="Hello from Pydantic",),
+    ):
+        chunks = [
+            chunk
+            async for chunk in executor.chat(
+                None,
+                conversation,
+                "Current message",
+                stream=True,
+                enable_routing=True,
+                user_message_id=user_message_id,
+                caller=caller,
+                run_user_id=None,
+            )
+        ]
+
+    executor._is_first_user_message.assert_awaited_once_with(
+        conversation.id,
+        exclude_message_id=user_message_id,
+    )
+    user_persistence_calls = [
+        call for call in executor._save_message.await_args_list if call.kwargs.get("role") == MessageRole.USER
+    ]
+    assert user_persistence_calls == []
+    done = next(chunk for chunk in chunks if chunk.type == "done")
+    assert done.message_id is not None
+    assert next(call for call in executor._save_message.await_args_list if call.kwargs.get("role") == MessageRole.ASSISTANT)

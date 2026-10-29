@@ -24,6 +24,7 @@ from .keys import (
     CONFIG_GLOBAL_VERSION_KEY,
     TTL_CONFIG,
     TTL_ORGS,
+    active_execution_key,
     config_hash_key,
     config_hash_key_versioned,
     config_key,
@@ -341,20 +342,18 @@ async def cleanup_execution_cache(execution_id: str) -> None:
     """
     Clean up all execution-scoped cache entries.
 
-    Called after execution completes to remove:
-    - Pending changes (should already be flushed)
-    - Log stream (if using Redis streams)
-    - Any other execution-scoped data
+    Called after execution completes to remove the active execution lease.
+
+    The log stream remains until its explicitly staged entries have committed
+    and retention removes the execution record. Deleting it here can race a
+    final persistence pass and discard logs.
 
     Args:
         execution_id: Execution ID to clean up
     """
-    from .keys import execution_logs_stream_key, pending_changes_key
-
     try:
         r = await get_shared_redis()
-        await r.delete(pending_changes_key(execution_id))
-        await r.delete(execution_logs_stream_key(execution_id))
+        await r.delete(active_execution_key(execution_id))
         logger.debug(f"Cleaned up execution cache: execution_id={execution_id}")
     except Exception as e:
         logger.warning(f"Failed to cleanup execution cache: {e}")

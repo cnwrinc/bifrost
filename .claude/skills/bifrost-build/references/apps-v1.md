@@ -1,6 +1,6 @@
 # Inline v1 Apps
 
-Use this reference only to maintain an existing `inline_v1` app or when the user explicitly requires a loose instance app. Build new apps as v2 apps inside a Solution.
+Use this reference only to maintain an existing `inline_v1` App. Build new Apps as V2 projects, either independently or inside a Solution according to ownership needs.
 
 ## Ownership
 
@@ -37,7 +37,7 @@ Other imports follow these rules:
 
 ## v1-only capabilities
 
-`useUser`, `RequireRole`, and `useAppState` belong to the v1 injected surface. They do not exist in the v2 SDK. Preserve them while maintaining v1 code, but do not carry them into a v2 migration.
+`useAppState` belongs to the v1 injected surface and does not exist in the v2 SDK. `useUser` and `RequireRole` exist in both with the same shape (the v2 `useUser` adds `isLoading`, since it reads the user over the network); in v2, import them from `bifrost`.
 
 Server-side workflows and policies remain the authorization boundary even when a v1 component hides UI by role.
 
@@ -69,4 +69,4 @@ Publication queues the production rebuild. Verify its result and the published r
 
 Apply `app-quality.md` to v1 changes as well. Use semantic platform tokens where the runtime supports them, verify the actual rendered preview, and test all affected states.
 
-When converting to v2, use `bifrost solution migrate-app <source-slug> <v2-slug>` and then complete the judgment work it reports: real package imports, local shadcn components, provider/mount lifecycle, portable workflow refs, state replacement, full theming, and visual QA. Do not perform a mechanical import rewrite and call the migration complete.
+When converting to V2, choose ownership first. Use `bifrost app migrate <source-dir> <destination>` when the frontend should remain backed by live platform resources. Use `bifrost solution migrate-app <source-dir> <v2-slug>` when the App and selected backing definitions should become one installable package. Both commands stop before judgment-heavy route wiring, access review, theming, and visual QA; do not perform a mechanical import rewrite and call the migration complete.

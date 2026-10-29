@@ -8,6 +8,8 @@ import {
 	type APIRequestContext,
 	type Locator,
 } from "@playwright/test";
+import { registerAndSetupMFA } from "./setup/auth-helpers";
+import type { TestUser } from "./fixtures/users";
 
 const API_URL = process.env.TEST_API_URL || "http://api:8000";
 const BIFROST_URL = process.env.TEST_BASE_URL || "http://client:80";
@@ -21,6 +23,7 @@ const PROVIDER_FN = `e2e_public_provider_${UNIQUE}`;
 const SUBMIT_PATH = `e2e_public_submit_${UNIQUE}.py`;
 const SUBMIT_FN = `e2e_public_submit_${UNIQUE}`;
 const HMAC_SECRET = `hmac-${UNIQUE}`;
+const DECRYPTION_ROLE_ID = "00000000-0000-0000-0000-000000000008";
 
 const PROVIDER_SOURCE = `from bifrost import data_provider
 
@@ -66,6 +69,62 @@ test.describe.serial("Public form iframe", () => {
 	let publicKey: string;
 	let scrollFormId: string;
 	let scrollPublicKey: string;
+	let secretsReaderId: string | undefined;
+
+	const createSecretsReaderApi = async () => {
+		const secretsReader: TestUser = {
+			key: "hmac_secrets_reader",
+			email: `hmac-secrets-reader-${UNIQUE}@example.com`,
+			name: "Contoso HMAC Secrets Reader",
+			password: `HmacSecretsReader-${UNIQUE}!`,
+			isSuperuser: true,
+		};
+		const created = await api.post("/api/users", {
+			data: {
+				email: secretsReader.email,
+				name: secretsReader.name,
+				is_superuser: true,
+			},
+		});
+		await expectOk(created);
+		secretsReaderId = ((await created.json()) as { id: string }).id;
+
+		const credentials = await registerAndSetupMFA(secretsReader);
+		const assignments = await api.get(
+			`/api/users/${secretsReaderId}/role-assignments`,
+		);
+		await expectOk(assignments);
+		const current = (await assignments.json()) as {
+			base_role: { id: string };
+			additional: Array<{
+				role_id: string;
+				boundaries: Array<{
+					kind: string;
+					organization_id: string | null;
+				}>;
+			}>;
+		};
+		const grant = await api.put(
+			`/api/users/${secretsReaderId}/role-assignments`,
+			{
+				data: {
+					base_role_id: current.base_role.id,
+					additional: [
+						...current.additional,
+						{ role_id: DECRYPTION_ROLE_ID },
+					],
+				},
+			},
+		);
+		await expectOk(grant);
+
+		return playwrightRequest.newContext({
+			baseURL: API_URL,
+			extraHTTPHeaders: {
+				Authorization: `Bearer ${credentials.accessToken}`,
+			},
+		});
+	};
 
 	test.beforeAll(async () => {
 		const credentials = JSON.parse(
@@ -219,6 +278,9 @@ test.describe.serial("Public form iframe", () => {
 		if (!api) return;
 		if (scrollFormId) await api.delete(`/api/forms/${scrollFormId}`);
 		if (formId) await api.delete(`/api/forms/${formId}`);
+		if (secretsReaderId) {
+			await expectOk(await api.delete(`/api/users/${secretsReaderId}`));
+		}
 		await api.delete(
 			`/api/files/editor?path=${encodeURIComponent(PROVIDER_PATH)}`,
 		);
@@ -316,7 +378,9 @@ test.describe.serial("Public form iframe", () => {
 			await expect(
 				adminPage.getByText("Published", { exact: true }),
 			).toBeVisible();
-			const embedCode = adminPage.getByLabel("Embed Code");
+			const embedCode = adminPage.getByLabel("Embed code source", {
+				exact: true,
+			});
 			await expect(embedCode).toContainText(
 				"theme=light&header=true&background=solid",
 			);
@@ -393,14 +457,16 @@ test.describe.serial("Public form iframe", () => {
 			await expect(frame.getByLabel("Company name")).toHaveValue(
 				"Acme Corporation",
 			);
-			await frame.getByLabel("Email").fill("visitor@example.com");
+			await frame
+				.getByRole("textbox", { name: "Email *", exact: true })
+				.fill("visitor@example.com");
 			const submit = frame.getByRole("button", { name: "Submit" });
 			await expect(submit).toBeDisabled();
 			await frame
 				.getByRole("checkbox", { name: "I'm not a robot" })
 				.click();
 			await expect(
-				frame.getByText("Verified", { exact: true }),
+				frame.locator("label").filter({ hasText: /^Verified$/ }),
 			).toBeVisible();
 			await expect(submit).toBeEnabled();
 			await submit.click();
@@ -434,14 +500,6 @@ test.describe.serial("Public form iframe", () => {
 				path: "playwright-results/public-form-confirmation.png",
 				fullPage: true,
 			});
-
-			const hmacSecret = await api.post(
-				`/api/forms/${formId}/embed-secrets`,
-				{
-					data: { name: "Browser result test", secret: HMAC_SECRET },
-				},
-			);
-			await expectOk(hmacSecret);
 		},
 	);
 
@@ -494,9 +552,10 @@ test.describe.serial("Public form iframe", () => {
 		await clickVisibleControl(
 			frame.getByRole("combobox", { name: "Company size" }),
 		);
-		await expect(
-			frame.getByRole("option", { name: "1–10 people" }),
-		).toBeVisible();
+		const companySizeOption = frame.getByRole("option", {
+			name: "1–10 people",
+		});
+		await expect(companySizeOption).toBeVisible();
 		await expectParentToRemainFixed();
 		await page.keyboard.press("Escape");
 		await expect(
@@ -517,58 +576,84 @@ test.describe.serial("Public form iframe", () => {
 	test("shows only the signed session's execution result after an HMAC submission", async ({
 		page,
 	}) => {
-		const signedParams = { agent_id: "42" };
-		const message = Object.entries(signedParams)
-			.sort(([left], [right]) => left.localeCompare(right))
-			.map(([key, value]) => `${key}=${value}`)
-			.join("&");
-		const signature = createHmac("sha256", HMAC_SECRET)
-			.update(message)
-			.digest("hex");
+		const secretsReaderApi = await createSecretsReaderApi();
+		try {
+			const hmacSecret = await secretsReaderApi.post(
+				`/api/forms/${formId}/embed-secrets`,
+				{
+					data: { name: "Browser result test", secret: HMAC_SECRET },
+				},
+			);
+			await expectOk(hmacSecret);
 
-		await page.route(`${ALLOWED_ORIGIN}/**`, (route) =>
-			route.request().resourceType() === "script"
-				? route.abort()
-				: route.continue(),
-		);
-		await page.goto(`${ALLOWED_ORIGIN}/`);
-		await page.setContent(
-			`<iframe title="HMAC form" style="width:100%;height:900px" src="${BIFROST_URL}/embed/forms/${formId}?agent_id=42&hmac=${signature}"></iframe>`,
-		);
-		const frame = page.frameLocator('iframe[title="HMAC form"]');
-		await expect(
-			frame.getByRole("heading", {
-				name: `Public website form ${UNIQUE}`,
-			}),
-		).toBeVisible();
-		await frame
-			.getByRole("combobox", { name: "Company *", exact: true })
-			.click();
-		await frame.getByText("Acme Corporation", { exact: true }).click();
-		await frame.getByLabel("Email").fill("hmac@example.com");
-		await expect(
-			frame.getByRole("checkbox", { name: "I'm not a robot" }),
-		).toHaveCount(0);
-		await frame.getByRole("button", { name: "Submit" }).click();
+			const signedParams = { agent_id: "42" };
+			const message = Object.entries(signedParams)
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([key, value]) => `${key}=${value}`)
+				.join("&");
+			const signature = createHmac("sha256", HMAC_SECRET)
+				.update(message)
+				.digest("hex");
 
-		await expect
-			.poll(
-				() =>
-					page
-						.frames()
-						.some((candidate) =>
-							/\/history\/[0-9a-f-]{36}$/.test(candidate.url()),
-						),
-				{ timeout: 20_000 },
-			)
-			.toBe(true);
-		await expect(
-			frame.getByRole("heading", { name: "Result" }),
-		).toBeVisible({
-			timeout: 30_000,
-		});
-		await expect(frame.getByText("hmac@example.com").first()).toBeVisible();
-		await expect(frame.getByRole("status")).toHaveCount(0);
+			await page.route(`${ALLOWED_ORIGIN}/**`, (route) =>
+				route.request().resourceType() === "script"
+					? route.abort()
+					: route.continue(),
+			);
+			await page.goto(`${ALLOWED_ORIGIN}/`);
+			await page.setContent(
+				`<iframe title="HMAC form" style="width:100%;height:900px" src="${BIFROST_URL}/embed/forms/${formId}?agent_id=42&hmac=${signature}"></iframe>`,
+			);
+			const frame = page.frameLocator('iframe[title="HMAC form"]');
+			await expect(
+				frame.getByRole("heading", {
+					name: `Public website form ${UNIQUE}`,
+				}),
+			).toBeVisible();
+			await frame
+				.getByRole("combobox", { name: "Company *", exact: true })
+				.click();
+			await frame.getByText("Acme Corporation", { exact: true }).click();
+			await frame
+				.getByRole("textbox", { name: "Email *", exact: true })
+				.fill("hmac@example.com");
+			await expect(
+				frame.getByRole("checkbox", { name: "I'm not a robot" }),
+			).toHaveCount(0);
+			await frame.getByRole("button", { name: "Submit" }).click();
+
+			await expect
+				.poll(
+					() =>
+						page
+							.frames()
+							.some((candidate) =>
+								/\/history\/[0-9a-f-]{36}$/.test(
+									candidate.url(),
+								),
+							),
+					{ timeout: 20_000 },
+				)
+				.toBe(true);
+			await expect(
+				frame.getByRole("tabpanel", { name: "Result" }),
+			).toBeVisible({
+				timeout: 30_000,
+			});
+			await expect(
+				frame.getByText("hmac@example.com").first(),
+			).toBeVisible();
+			// The result page announces execution status. It must not show the
+			// public form's confirmation message instead of the signed result.
+			await expect(
+				frame.getByRole("heading", { name: "Thank you", exact: true }),
+			).toHaveCount(0);
+			await expect(
+				frame.getByText("Your form was submitted.", { exact: true }),
+			).toHaveCount(0);
+		} finally {
+			await secretsReaderApi.dispose();
+		}
 	});
 
 	test("blocks a disallowed browser ancestor on the final document", async ({

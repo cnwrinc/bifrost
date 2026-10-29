@@ -6,14 +6,23 @@
 
 Agent execution operations.
 
-**`agents.run(agent_name: str, input: dict[str, Any] | None = None, output_schema: dict[str, Any] | None = None, timeout: int = 1800) -> dict[str, Any] | str`**
+**`agents.enqueue(agent_name: str, input: dict[str, Any] | None = None, output_schema: dict[str, Any] | None = None, run_as: str | None = None) -> AgentRunHandle`**
+  Queue an agent and return as soon as the run is accepted.
+
+**`agents.get_run(run_id: str) -> AgentRun`**
+  Get the current status and result for an agent run.
+
+**`agents.run(agent_name: str, input: dict[str, Any] | None = None, output_schema: dict[str, Any] | None = None, timeout: float | None = None, run_as: str | None = None) -> dict[str, Any] | str | AgentRunPending`**
   Run an agent and wait for the result.
+
+**`agents.wait(run_id: str, output_schema: dict[str, Any] | None = None, timeout: float | None = None) -> dict[str, Any] | str | AgentRunPending`**
+  Wait for a previously enqueued run using short status requests.
 
 ### ai
 
 
 
-**`ai.complete(prompt: str | None = None, messages: list[dict[str, str]] | None = None, system: str | None = None, response_format: type[T] | None = None, knowledge: list[str] | None = None, max_tokens: int | None = None, org_id: str | None = None, model: str | None = None, timeout: float | None = None, files: list[AIInputFile | ArtifactRef | dict[str, Any]] | None = None) -> AIResponse | T`**
+**`ai.complete(prompt: str | None = None, messages: list[dict[str, str]] | None = None, system: str | None = None, response_format: type[T] | None = None, knowledge: list[str] | None = None, max_tokens: int | None = None, org_id: str | None = None, profile: str | None = None, model: str | None = None, timeout: float | None = None, files: list[AIInputFile | ArtifactRef | dict[str, Any]] | None = None) -> AIResponse | T`**
 
 **`ai.create_image(prompt: str, filename: str | None = None) -> ArtifactRef`**
   Generate an image and return one portable artifact reference.
@@ -72,7 +81,7 @@ Create, read, and share generated files from workflows.
 
 Event publishing operations (async).
 
-**`events.emit(topic: str, data: dict, scope: str | None = None) -> dict`**
+**`events.emit(topic: str, data: dict, scope: str | None = None, solution: str | None = None) -> dict`**
 
 ### executions
 
@@ -82,7 +91,7 @@ Event publishing operations (async).
 
 **`executions.get_current_logs(execution_id: str | None = None, start: str = '0', count: int = 100) -> 'list[ExecutionLog]'`**
 
-**`executions.list(workflow_name: str | None = None, status: str | None = None, start_date: str | None = None, end_date: str | None = None, limit: int = 50) -> list[WorkflowExecution]`**
+**`executions.list(workflow_name: str | None = None, status: str | None = None, start_date: str | None = None, end_date: str | None = None, limit: int = 50, workflow_id: str | None = None, continuation_token: str | None = None) -> ExecutionList`**
 
 ### files
 
@@ -92,15 +101,19 @@ Event publishing operations (async).
 
 **`files.exists(path: str, location: str = 'workspace', mode: Mode = 'cloud', scope: str | None = None) -> bool`**
 
-**`files.get_signed_url(path: str, method: Literal['PUT', 'GET'] = 'PUT', content_type: str = 'application/octet-stream', location: str = 'uploads', scope: str | None = None) -> dict`**
+**`files.get_signed_url(path: str, method: Literal['PUT', 'GET'] = 'PUT', content_type: str = 'application/octet-stream', location: str = 'uploads', scope: str | None = None, expires_in: int = 600) -> dict`**
 
 **`files.list(directory: str = '', location: str = 'workspace', mode: Mode = 'cloud', scope: str | None = None) -> list[str]`**
 
-**`files.read(path: str, location: str = 'workspace', mode: Mode = 'cloud', scope: str | None = None) -> str`**
+**`files.move(source: str, destination: str, location: str, on_conflict: Literal['error', 'rename'] = 'error', scope: str | None = None, timeout_seconds: float = 14400, poll_interval_seconds: float = 2) -> str`**
+
+**`files.move_many(items: list[dict[str, str]], location: str, on_conflict: Literal['error', 'rename'] = 'error', scope: str | None = None, timeout_seconds: float = 14400, poll_interval_seconds: float = 2) -> list[dict]`**
+
+**`files.read(path: str, location: str = 'workspace', mode: Mode = 'cloud', scope: str | None = None, solution: str | None = None) -> str`**
 
 **`files.read_bytes(path: str, location: str = 'workspace', mode: Mode = 'cloud', scope: str | None = None) -> bytes`**
 
-**`files.search(query: str, case_sensitive: bool = False, is_regex: bool = False, include_pattern: str = '**/*', max_results: int = 1000) -> dict`**
+**`files.search(query: str, is_regex: bool = False, case_sensitive: bool = False, include_pattern: str | None = None, source: str = 'all', solution_id: str | None = None, output_mode: str = 'content', context_lines: int = 1, limit: int = 25, cursor: str | None = None) -> dict`**
 
 **`files.stat(path: str, location: str = 'workspace', mode: Mode = 'cloud', scope: str | None = None) -> dict`**
 
@@ -188,6 +201,8 @@ Event publishing operations (async).
 
 
 
+**`tables.bulk_upsert(table: str, documents: list[dict[str, Any]], scope: str | None = None, created_by: str | None = None, updated_by: str | None = None, conflict_retries: int = 2) -> BulkUpsertResult`**
+
 **`tables.count(table: str, where: dict[str, Any] | None = None, scope: str | None = None) -> int`**
 
 **`tables.create(name: str, description: str | None = None, table_schema: dict[str, Any] | None = None, scope: str | None = None, app: str | None = None) -> TableInfo`**
@@ -198,15 +213,15 @@ Event publishing operations (async).
 
 **`tables.delete_document(table: str, doc_id: str, scope: str | None = None) -> bool`**
 
-**`tables.get(table: str, doc_id: str, scope: str | None = None) -> DocumentData | None`**
+**`tables.get(table: str, doc_id: str, scope: str | None = None, solution: str | None = None) -> DocumentData | None`**
 
-**`tables.insert(table: str, data: dict[str, Any], id: str | None = None, scope: str | None = None, created_by: str | None = None) -> DocumentData`**
+**`tables.insert(table: str, data: dict[str, Any], id: str | None = None, scope: str | None = None, created_by: str | None = None, solution: str | None = None) -> DocumentData`**
 
 **`tables.insert_batch(table: str, documents: list[dict[str, Any]], scope: str | None = None, created_by: str | None = None) -> BatchResult`**
 
 **`tables.list(scope: str | None = None, app: str | None = None) -> list[TableInfo]`**
 
-**`tables.query(table: str, where: dict[str, Any] | None = None, order_by: str | None = None, order_dir: str = 'asc', limit: int = 100, offset: int = 0, scope: str | None = None) -> DocumentList`**
+**`tables.query(table: str, where: dict[str, Any] | None = None, order_by: str | None = None, order_dir: str = 'asc', limit: int = 100, offset: int = 0, scope: str | None = None, after_document_id: str | None = None, document_id_prefix: str | None = None, skip_count: bool = False, document_ids: list[str] | None = None, solution: str | None = None) -> DocumentList`**
 
 **`tables.update(table: str, doc_id: str, data: dict[str, Any], scope: str | None = None, updated_by: str | None = None) -> DocumentData | None`**
 
@@ -235,7 +250,7 @@ Event publishing operations (async).
 **`workflows.cancel(execution_id: str) -> None`**
   Cancel a Scheduled workflow execution.
 
-**`workflows.execute(workflow: str, input_data: dict[str, Any] | None = None, org_id: str | None = None, run_as: str | None = None, scheduled_at: datetime | None = None, delay_seconds: int | None = None) -> str`**
+**`workflows.execute(workflow: str, input_data: dict[str, Any] | None = None, org_id: str | None = None, run_as: str | None = None, solution: str | None = None, scheduled_at: datetime | None = None, delay_seconds: int | None = None) -> str`**
 
 **`workflows.get(execution_id: str) -> WorkflowExecution`**
 

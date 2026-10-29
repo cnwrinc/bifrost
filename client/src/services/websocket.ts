@@ -13,6 +13,7 @@
 import type { components } from "@/lib/v1";
 import { refreshAccessToken } from "@/lib/api-client";
 import { getActiveToken } from "@/lib/auth-token";
+import type { ChatStreamEnvelope } from "@/lib/chat-runtime";
 import { useNotificationStore } from "@/stores/notificationStore";
 import type { Notification } from "@/stores/notificationStore";
 
@@ -119,13 +120,22 @@ export interface ExecutionLog {
 	sequence?: number; // Only present when sequencing is enabled
 }
 
+/** Live service log line (bridged from the attempt stream, snake_case). */
+export interface ServiceLog {
+	serviceId: string;
+	attemptId: string;
+	timestamp: string;
+	level: string;
+	message: string;
+}
+
 export interface NewExecution {
 	execution_id: string;
 	workflow_name: string;
 	executed_by: string;
 	executed_by_name: string;
 	status: string;
-	started_at: string;
+	started_at: string | null;
 	timestamp: string;
 }
 
@@ -140,16 +150,6 @@ export interface HistoryUpdate {
 	completed_at?: string;
 	duration_ms?: number;
 	timestamp: string;
-}
-
-export interface PackageLog {
-	level: string;
-	message: string;
-}
-
-export interface PackageComplete {
-	status: "success" | "error";
-	message: string;
 }
 
 export interface PackageProgress {
@@ -169,24 +169,6 @@ export interface PackageProgress {
 		package: string | null;
 		error: string | null;
 	}[];
-}
-
-export interface LocalRunnerStateUpdate {
-	file_path: string;
-	workflows: Array<{
-		name: string;
-		description: string;
-		parameters: Array<{
-			name: string;
-			type: string;
-			label: string | null;
-			required: boolean;
-			default_value: unknown;
-		}>;
-	}>;
-	selected_workflow: string | null;
-	pending: boolean;
-	execution_id: string | null;
 }
 
 // Event source update types for real-time event streaming
@@ -211,7 +193,7 @@ export interface EventSourceUpdate {
 export interface AgentRunUpdate {
 	type: "agent_run_update";
 	run_id: string;
-	agent_id: string;
+	agent_id: string | null;
 	agent_name: string;
 	status: string;
 	trigger_type: string;
@@ -257,108 +239,17 @@ export interface AgentRunStepUpdate {
 	timestamp: string;
 }
 
-// Chat streaming types
-export interface ChatToolCall {
-	id: string;
-	name: string;
-	arguments: Record<string, unknown>;
-}
-
-export interface ChatToolResult {
-	tool_call_id: string;
-	tool_name: string;
-	result: unknown;
-	error?: string | null;
-	duration_ms?: number | null;
-}
-
-export interface ChatAgentSwitch {
-	agent_id: string;
-	agent_name: string;
-	reason: string;
-}
-
-export interface ChatToolProgress {
-	tool_call_id: string;
-	execution_id?: string;
-	status?: "pending" | "running" | "success" | "failed" | "timeout";
-	log?: {
-		level: "debug" | "info" | "warning" | "error";
-		message: string;
-	};
-}
-
-// AskUserQuestion types for SDK permission prompts
-export interface AskUserQuestionOption {
-	label: string;
-	description: string;
-}
-
-export interface AskUserQuestion {
-	question: string;
-	header: string;
-	options: AskUserQuestionOption[];
-	multi_select: boolean;
-}
+// Chat event payloads are generated from the backend contract. The socket only
+// transports the versioned ChatStreamEnvelope below; it never executes a turn.
+export type ChatAgentSwitch = components["schemas"]["AgentSwitch"];
+export type ChatToolProgress = components["schemas"]["ToolProgress"];
+export type ChatStreamChunk = components["schemas"]["ChatStreamChunk"];
 
 // TodoItem type for todo list updates from SDK
 export interface TodoItem {
 	content: string;
 	status: "pending" | "in_progress" | "completed";
 	active_form: string;
-}
-
-export interface ChatStreamChunk {
-	type:
-		| "message_start"
-		| "delta"
-		| "tool_call"
-		| "tool_progress"
-		| "tool_result"
-		| "artifact_started"
-		| "artifact_ready"
-		| "artifact_failed"
-		| "agent_switch"
-		| "done"
-		| "error"
-		| "title_update"
-		| "ask_user_question"
-		| "assistant_message_start"
-		| "assistant_message_end"
-		| "todo_update"
-		| "context_warning";
-	conversation_id?: string;
-	content?: string | null;
-	tool_call?: ChatToolCall | null;
-	tool_progress?: ChatToolProgress | null;
-	tool_result?: ChatToolResult | null;
-	artifact?: {
-		type: "bifrost_artifact";
-		id: string;
-		filename: string;
-		content_type: string;
-		size_bytes: number;
-	} | null;
-	agent_switch?: ChatAgentSwitch | null;
-	message_id?: string | null;
-	// message_start fields - real UUIDs sent before streaming begins
-	user_message_id?: string | null;
-	assistant_message_id?: string | null;
-	token_count_input?: number | null;
-	token_count_output?: number | null;
-	duration_ms?: number | null;
-	error?: string | null;
-	execution_id?: string | null;
-	title?: string | null;
-	// AskUserQuestion fields
-	questions?: AskUserQuestion[] | null;
-	request_id?: string | null;
-	// Message boundary fields (for assistant_message_end)
-	stop_reason?: "tool_use" | "end_turn" | null;
-	// Todo list fields (for todo_update)
-	todos?: TodoItem[] | null;
-	// Client-generated ID echoed back for dedup
-	local_id?: string | null;
 }
 
 // Pool/worker message types for real-time diagnostics
@@ -457,6 +348,7 @@ type WebSocketMessage =
 	| { type: "pong" }
 	| { type: "execution_update"; executionId: string; [key: string]: unknown }
 	| { type: "execution_log"; executionId: string; [key: string]: unknown }
+	| { type: "service_log"; service_id: string; [key: string]: unknown }
 	| { type: "history_update"; [key: string]: unknown }
 	| { type: "notification_created"; notification: NotificationPayload }
 	| { type: "notification_updated"; notification: NotificationPayload }
@@ -478,43 +370,11 @@ type WebSocketMessage =
 				error: string | null;
 			}[];
 	  }
-	| { type: "git_log"; jobId: string; level: string; message: string }
-	| {
-			type: "git_progress";
-			jobId: string;
-			phase: string;
-			current: number;
-			total: number;
-			path?: string | null;
-	  }
-	| {
-			type: "git_complete";
-			jobId: string;
-			status: "success" | "error";
-			message: string;
-			[key: string]: unknown;
-	  }
-	| {
-			type: "git_op_complete";
-			jobId: string;
-			status: string;
-			resultType: string;
-			data?: Record<string, unknown>;
-			error?: string;
-	  }
-	| {
-			type: "devrun_state_update";
-			state: LocalRunnerStateUpdate | null;
-	  }
-	| {
-			type: "local_runner_state_update";
-			state: LocalRunnerStateUpdate | null;
-	  }
 	| {
 			type: "event_created" | "event_updated";
 			event: EventSourceEvent;
 	  }
-	| ChatStreamChunk
+	| ({ type: "chat_run_event" } & ChatStreamEnvelope)
 	| AppDraftUpdate
 	| AppCodeFileUpdate
 	| AppPublishedUpdate
@@ -542,33 +402,12 @@ interface NotificationPayload {
 
 type ExecutionUpdateCallback = (update: ExecutionUpdate) => void;
 type ExecutionLogCallback = (log: ExecutionLog) => void;
+type ServiceLogCallback = (log: ServiceLog) => void;
 type NewExecutionCallback = (execution: NewExecution) => void;
 type HistoryUpdateCallback = (update: HistoryUpdate) => void;
 type PackageProgressCallback = (p: PackageProgress) => void;
-// Git sync progress type
-export interface GitProgress {
-	phase: string;
-	current: number;
-	total: number;
-	path?: string | null;
-}
-
-// Git operation complete type
-export interface GitOpComplete {
-	status: string;
-	resultType: string;
-	data?: Record<string, unknown>;
-	error?: string;
-}
-
-type GitLogCallback = (log: PackageLog) => void;
-type GitProgressCallback = (progress: GitProgress) => void;
-type GitCompleteCallback = (
-	complete: PackageComplete & Record<string, unknown>,
-) => void;
-type LocalRunnerStateCallback = (state: LocalRunnerStateUpdate | null) => void;
 type EventSourceUpdateCallback = (update: EventSourceUpdate) => void;
-type ChatStreamCallback = (chunk: ChatStreamChunk) => void;
+type ChatStreamCallback = (event: ChatStreamEnvelope) => void;
 type AppDraftUpdateCallback = (update: AppDraftUpdate) => void;
 type AppCodeFileUpdateCallback = (update: AppCodeFileUpdate) => void;
 type AppPublishedUpdateCallback = (update: AppPublishedUpdate) => void;
@@ -612,17 +451,10 @@ class WebSocketService {
 		string,
 		Set<ExecutionLogCallback>
 	>();
+	private serviceLogCallbacks = new Map<string, Set<ServiceLogCallback>>();
 	private newExecutionCallbacks = new Set<NewExecutionCallback>();
 	private historyUpdateCallbacks = new Set<HistoryUpdateCallback>();
 	private packageProgressCallbacks = new Set<PackageProgressCallback>();
-	private gitLogCallbacks = new Map<string, Set<GitLogCallback>>();
-	private gitProgressCallbacks = new Map<string, Set<GitProgressCallback>>();
-	private gitCompleteCallbacks = new Map<string, Set<GitCompleteCallback>>();
-	private gitOpCompleteCallbacks = new Map<
-		string,
-		Set<(complete: GitOpComplete) => void>
-	>();
-	private localRunnerStateCallbacks = new Set<LocalRunnerStateCallback>();
 	private eventSourceUpdateCallbacks = new Map<
 		string,
 		Set<EventSourceUpdateCallback>
@@ -644,6 +476,8 @@ class WebSocketService {
 		string,
 		Set<PlatformJobUpdateCallback>
 	>();
+	private allPlatformJobUpdateCallbacks =
+		new Set<PlatformJobUpdateCallback>();
 	private poolMessageCallbacks = new Set<PoolMessageCallback>();
 	private fileActivityCallbacks = new Set<FileActivityCallback>();
 	private agentRunUpdateCallbacks: Set<AgentRunUpdateCallback> = new Set();
@@ -708,12 +542,12 @@ class WebSocketService {
 			const params = new URLSearchParams();
 			channels.forEach((ch) => params.append("channels", ch));
 
-			// For embed tokens, pass as query param since browser WebSocket
-			// API can't set custom headers. getActiveToken() prefers the
-			// per-tab embed token (sessionStorage) over the user token.
-			const embedToken = getActiveToken();
-			if (embedToken && isEmbedToken(embedToken)) {
-				params.set("token", embedToken);
+			// Embed tokens need a query parameter because the browser WebSocket API
+			// cannot set custom authorization headers. Browser impersonation uses
+			// its HttpOnly marker cookie, so its bearer never enters the URL.
+			const activeToken = getActiveToken();
+			if (activeToken && isEmbedToken(activeToken)) {
+				params.set("token", activeToken);
 			}
 
 			const wsUrl = `${protocol}//${host}/ws/connect?${params.toString()}`;
@@ -864,6 +698,10 @@ class WebSocketService {
 				this.dispatchExecutionLog(message);
 				break;
 
+			case "service_log":
+				this.dispatchServiceLog(message);
+				break;
+
 			case "history_update":
 				this.dispatchHistoryUpdate(message);
 				break;
@@ -883,6 +721,9 @@ class WebSocketService {
 				this.platformJobUpdateCallbacks
 					.get(message.job.id)
 					?.forEach((callback) => callback(message.job));
+				this.allPlatformJobUpdateCallbacks.forEach((callback) =>
+					callback(message.job),
+				);
 				break;
 
 			case "progress":
@@ -902,87 +743,6 @@ class WebSocketService {
 				);
 				break;
 
-			case "git_log": {
-				// Git sync log message - dispatch to job-specific subscribers
-				const gitLogJobId = message.jobId;
-				if (gitLogJobId) {
-					const callbacks = this.gitLogCallbacks.get(gitLogJobId);
-					callbacks?.forEach((cb) =>
-						cb({ level: message.level, message: message.message }),
-					);
-				}
-				break;
-			}
-
-			case "git_progress": {
-				// Git sync progress message - dispatch to job-specific subscribers
-				const gitProgressJobId = message.jobId;
-				if (gitProgressJobId) {
-					const callbacks =
-						this.gitProgressCallbacks.get(gitProgressJobId);
-					callbacks?.forEach((cb) =>
-						cb({
-							phase: message.phase,
-							current: message.current,
-							total: message.total,
-							path: message.path,
-						}),
-					);
-				}
-				break;
-			}
-
-			case "git_complete": {
-				// Git sync complete message - dispatch to job-specific subscribers
-				const gitCompleteJobId = message.jobId;
-				if (gitCompleteJobId) {
-					const {
-						type: _type,
-						jobId: _jobId,
-						...gitCompleteData
-					} = message;
-					const callbacks =
-						this.gitCompleteCallbacks.get(gitCompleteJobId);
-					callbacks?.forEach((cb) =>
-						cb(
-							gitCompleteData as Parameters<GitCompleteCallback>[0],
-						),
-					);
-				}
-				break;
-			}
-
-			case "git_op_complete": {
-				const gitOpJobId = message.jobId;
-				if (gitOpJobId) {
-					const callbacks =
-						this.gitOpCompleteCallbacks.get(gitOpJobId);
-					callbacks?.forEach((cb) =>
-						cb({
-							status: message.status,
-							resultType: message.resultType,
-							data: message.data,
-							error: message.error,
-						}),
-					);
-				}
-				break;
-			}
-
-			case "devrun_state_update":
-				// Dev run state update from CLI (legacy)
-				this.localRunnerStateCallbacks.forEach((cb) =>
-					cb(message.state),
-				);
-				break;
-
-			case "local_runner_state_update":
-				// Local runner state update from CLI
-				this.localRunnerStateCallbacks.forEach((cb) =>
-					cb(message.state),
-				);
-				break;
-
 			case "event_created":
 			case "event_updated":
 				// Event source updates (real-time events)
@@ -990,25 +750,11 @@ class WebSocketService {
 				break;
 
 			// Chat streaming message types
-			case "message_start":
-			case "delta":
-			case "tool_call":
-			case "tool_progress":
-			case "tool_result":
-			case "artifact_started":
-			case "artifact_ready":
-			case "artifact_failed":
-			case "agent_switch":
-			case "done":
-			case "error":
-			case "title_update":
-			case "ask_user_question":
-			case "assistant_message_start":
-			case "assistant_message_end":
-			case "todo_update":
-				this.dispatchChatStreamChunk(message as ChatStreamChunk);
+			case "chat_run_event":
+				this.dispatchChatStreamEnvelope(
+					message as { type: "chat_run_event" } & ChatStreamEnvelope,
+				);
 				break;
-
 			// App Builder live update message types
 			case "app_draft_update":
 				this.dispatchAppDraftUpdate(message as AppDraftUpdate);
@@ -1093,13 +839,19 @@ class WebSocketService {
 		callbacks?.forEach((cb) => cb(update));
 	}
 
-	private dispatchChatStreamChunk(chunk: ChatStreamChunk) {
-		const conversationId = chunk.conversation_id;
+	private dispatchChatStreamEnvelope(
+		envelope: { type: "chat_run_event" } & ChatStreamEnvelope,
+	) {
+		const conversationId = envelope.conversation_id;
 		if (!conversationId) return;
 
-		// Dispatch to single conversation callback (no duplicates possible)
-		const callback = this.chatStreamCallbacks.get(conversationId);
-		callback?.(chunk);
+		for (const [registeredConversationId, callback] of this
+			.chatStreamCallbacks) {
+			if (registeredConversationId === conversationId) {
+				callback(envelope);
+				return;
+			}
+		}
 	}
 
 	private dispatchAppDraftUpdate(update: AppDraftUpdate) {
@@ -1224,6 +976,25 @@ class WebSocketService {
 		callbacks?.forEach((cb) => cb(log));
 	}
 
+	private dispatchServiceLog(
+		message: { type: "service_log"; service_id: string } & Record<
+			string,
+			unknown
+		>,
+	) {
+		const log: ServiceLog = {
+			serviceId: message.service_id,
+			attemptId: (message["attempt_id"] as string) || "",
+			timestamp:
+				(message["timestamp"] as string) || new Date().toISOString(),
+			level: (message["level"] as string) || "info",
+			message: (message["message"] as string) || "",
+		};
+
+		const callbacks = this.serviceLogCallbacks.get(message.service_id);
+		callbacks?.forEach((cb) => cb(log));
+	}
+
 	/**
 	 * Handle notification message from backend
 	 */
@@ -1330,6 +1101,44 @@ class WebSocketService {
 	}
 
 	/**
+	 * Connect to a specific service (log streaming channel)
+	 */
+	async connectToService(serviceId: string): Promise<void> {
+		const channel = `service:${serviceId}`;
+		if (this.subscribedChannels.has(channel)) {
+			return;
+		}
+
+		if (this.ws?.readyState === WebSocket.OPEN) {
+			await this.subscribe(channel);
+			return;
+		}
+
+		await this.connect([channel]);
+	}
+
+	/**
+	 * Subscribe to live log lines for a specific service
+	 */
+	onServiceLog(
+		serviceId: string,
+		callback: ServiceLogCallback,
+	): () => void {
+		if (!this.serviceLogCallbacks.has(serviceId)) {
+			this.serviceLogCallbacks.set(serviceId, new Set());
+		}
+		this.serviceLogCallbacks.get(serviceId)!.add(callback);
+
+		// Return unsubscribe function
+		return () => {
+			this.serviceLogCallbacks.get(serviceId)?.delete(callback);
+			if (this.serviceLogCallbacks.get(serviceId)?.size === 0) {
+				this.serviceLogCallbacks.delete(serviceId);
+			}
+		};
+	}
+
+	/**
 	 * Subscribe to new execution notifications
 	 */
 	onNewExecution(callback: NewExecutionCallback): () => void {
@@ -1356,131 +1165,6 @@ class WebSocketService {
 		this.packageProgressCallbacks.add(callback);
 		return () => {
 			this.packageProgressCallbacks.delete(callback);
-		};
-	}
-
-	/**
-	 * Connect to a git sync channel for progress updates
-	 */
-	async connectToGitSync(connectionId: string): Promise<void> {
-		const channel = `git:${connectionId}`;
-		if (this.subscribedChannels.has(channel)) {
-			return;
-		}
-
-		if (this.ws?.readyState === WebSocket.OPEN) {
-			await this.subscribe(channel);
-			return;
-		}
-
-		await this.connect([channel]);
-	}
-
-	/**
-	 * Subscribe to git sync log messages for a specific connection
-	 */
-	onGitSyncLog(connectionId: string, callback: GitLogCallback): () => void {
-		if (!this.gitLogCallbacks.has(connectionId)) {
-			this.gitLogCallbacks.set(connectionId, new Set());
-		}
-		this.gitLogCallbacks.get(connectionId)!.add(callback);
-
-		// Return unsubscribe function
-		return () => {
-			this.gitLogCallbacks.get(connectionId)?.delete(callback);
-			if (this.gitLogCallbacks.get(connectionId)?.size === 0) {
-				this.gitLogCallbacks.delete(connectionId);
-			}
-		};
-	}
-
-	/**
-	 * Subscribe to git sync progress updates for a specific connection
-	 */
-	onGitSyncProgress(
-		connectionId: string,
-		callback: GitProgressCallback,
-	): () => void {
-		if (!this.gitProgressCallbacks.has(connectionId)) {
-			this.gitProgressCallbacks.set(connectionId, new Set());
-		}
-		this.gitProgressCallbacks.get(connectionId)!.add(callback);
-
-		// Return unsubscribe function
-		return () => {
-			this.gitProgressCallbacks.get(connectionId)?.delete(callback);
-			if (this.gitProgressCallbacks.get(connectionId)?.size === 0) {
-				this.gitProgressCallbacks.delete(connectionId);
-			}
-		};
-	}
-
-	/**
-	 * Subscribe to git sync completion for a specific connection
-	 */
-	onGitSyncComplete(
-		connectionId: string,
-		callback: GitCompleteCallback,
-	): () => void {
-		if (!this.gitCompleteCallbacks.has(connectionId)) {
-			this.gitCompleteCallbacks.set(connectionId, new Set());
-		}
-		this.gitCompleteCallbacks.get(connectionId)!.add(callback);
-
-		// Return unsubscribe function
-		return () => {
-			this.gitCompleteCallbacks.get(connectionId)?.delete(callback);
-			if (this.gitCompleteCallbacks.get(connectionId)?.size === 0) {
-				this.gitCompleteCallbacks.delete(connectionId);
-			}
-		};
-	}
-
-	/**
-	 * Subscribe to git operation progress updates for a specific job
-	 */
-	onGitProgress(jobId: string, callback: GitProgressCallback): () => void {
-		if (!this.gitProgressCallbacks.has(jobId)) {
-			this.gitProgressCallbacks.set(jobId, new Set());
-		}
-		this.gitProgressCallbacks.get(jobId)!.add(callback);
-
-		return () => {
-			this.gitProgressCallbacks.get(jobId)?.delete(callback);
-			if (this.gitProgressCallbacks.get(jobId)?.size === 0) {
-				this.gitProgressCallbacks.delete(jobId);
-			}
-		};
-	}
-
-	/**
-	 * Subscribe to git operation completion for a specific job
-	 */
-	onGitOpComplete(
-		jobId: string,
-		callback: (complete: GitOpComplete) => void,
-	): () => void {
-		if (!this.gitOpCompleteCallbacks.has(jobId)) {
-			this.gitOpCompleteCallbacks.set(jobId, new Set());
-		}
-		this.gitOpCompleteCallbacks.get(jobId)!.add(callback);
-
-		// Return unsubscribe function
-		return () => {
-			this.gitOpCompleteCallbacks.get(jobId)?.delete(callback);
-			if (this.gitOpCompleteCallbacks.get(jobId)?.size === 0) {
-				this.gitOpCompleteCallbacks.delete(jobId);
-			}
-		};
-	}
-
-	/**
-	 * Subscribe to local runner state updates
-	 */
-	onLocalRunnerState(callback: LocalRunnerStateCallback): () => void {
-		this.localRunnerStateCallbacks.add(callback);
-		return () => {
-			this.localRunnerStateCallbacks.delete(callback);
 		};
 	}
 
@@ -1530,7 +1214,10 @@ class WebSocketService {
 	 */
 	async connectToChat(conversationId: string): Promise<void> {
 		const channel = `chat:${conversationId}`;
-		if (this.subscribedChannels.has(channel)) {
+		if (
+			this.ws?.readyState === WebSocket.OPEN &&
+			this.subscribedChannels.has(channel)
+		) {
 			return;
 		}
 
@@ -1540,73 +1227,6 @@ class WebSocketService {
 		}
 
 		await this.connect([channel]);
-	}
-
-	/**
-	 * Send a chat message to a conversation
-	 */
-	sendChatMessage(
-		conversationId: string,
-		message: string,
-		localId?: string,
-		attachmentIds: string[] = [],
-		modelTier: "fast" | "balanced" | "pro" = "balanced",
-	): boolean {
-		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-			return false;
-		}
-
-		this.ws.send(
-			JSON.stringify({
-				type: "chat",
-				conversation_id: conversationId,
-				message,
-				local_id: localId,
-				attachment_ids: attachmentIds,
-				model_tier: modelTier,
-			}),
-		);
-		return true;
-	}
-
-	/**
-	 * Send an answer to an AskUserQuestion prompt from the SDK
-	 */
-	sendChatAnswer(
-		conversationId: string,
-		requestId: string,
-		answers: Record<string, string>,
-	): boolean {
-		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-			return false;
-		}
-
-		this.ws.send(
-			JSON.stringify({
-				type: "chat_answer",
-				conversation_id: conversationId,
-				request_id: requestId,
-				answers,
-			}),
-		);
-		return true;
-	}
-
-	/**
-	 * Send a stop signal to interrupt the current chat operation
-	 */
-	sendChatStop(conversationId: string): boolean {
-		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-			return false;
-		}
-
-		this.ws.send(
-			JSON.stringify({
-				type: "chat_stop",
-				conversation_id: conversationId,
-			}),
-		);
-		return true;
 	}
 
 	/**
@@ -1724,6 +1344,14 @@ class WebSocketService {
 			if (this.platformJobUpdateCallbacks.get(jobId)?.size === 0) {
 				this.platformJobUpdateCallbacks.delete(jobId);
 			}
+		};
+	}
+
+	/** Observe every visible platform-job update on subscribed channels. */
+	onAnyPlatformJobUpdate(callback: PlatformJobUpdateCallback): () => void {
+		this.allPlatformJobUpdateCallbacks.add(callback);
+		return () => {
+			this.allPlatformJobUpdateCallbacks.delete(callback);
 		};
 	}
 

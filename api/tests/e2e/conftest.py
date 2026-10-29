@@ -2,7 +2,7 @@
 E2E test configuration.
 
 E2E tests run against the full API stack (API + Jobs workers) with real
-PostgreSQL, RabbitMQ, and Redis services.
+PostgreSQL, Redis and S3 services.
 
 These tests require:
 - docker-compose.test.yml services running (via ./test.sh)
@@ -103,7 +103,12 @@ def _legacy_deploy_body_to_zip(client: httpx.Client, solution_id: str, headers, 
         name=solution["name"],
         version=solution.get("version"),
         organization_id=uuid.UUID(org_id) if org_id else None,
-        global_repo_access=bool(solution.get("global_repo_access", False)),
+        allow_outbound_access=bool(
+            solution.get(
+                "allow_outbound_access",
+                solution.get("global_repo_access", False),
+            )
+        ),
     )
     bundle = SolutionBundle(
         solution=sol,
@@ -165,6 +170,37 @@ def e2e_client():
     """
     with httpx.Client(base_url=E2E_API_URL, timeout=60.0) as client:
         yield _E2EClient(client)
+
+
+@pytest.fixture
+def private_client():
+    """Client with its own cookie jar, for tests that deliberately log in.
+
+    Use this instead of ``e2e_client`` when the test itself exercises login,
+    MFA, refresh or logout, which set auth cookies on the client that made the
+    call.
+    """
+    with httpx.Client(base_url=E2E_API_URL, timeout=60.0) as client:
+        yield client
+
+
+@pytest.fixture(autouse=True)
+def shared_client_has_no_ambient_auth(e2e_client):
+    """Fail any test or fixture that leaves cookies in the shared client.
+
+    Login, MFA and refresh responses set auth cookies, and the server accepts
+    those in place of an ``Authorization`` header. A cookie left in the shared
+    jar silently authenticates every later request that meant to be anonymous,
+    so results would depend on test order. Credential exchanges must use a
+    private client (see ``tests.e2e.fixtures.setup._anonymous_client``).
+    """
+    yield
+    leaked = sorted(cookie.name for cookie in e2e_client.cookies.jar)
+    e2e_client.cookies.clear()
+    assert not leaked, (
+        f"Shared e2e_client kept cookies {leaked}; do credential exchanges on a "
+        "private client so tests authenticate only through explicit headers"
+    )
 
 
 _UNSET = object()

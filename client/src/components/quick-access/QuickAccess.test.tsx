@@ -19,8 +19,7 @@ import { renderWithProviders, screen } from "@/test-utils";
 const navigateMock = vi.fn();
 
 vi.mock("react-router-dom", async (importOriginal) => {
-	const actual =
-		await importOriginal<typeof import("react-router-dom")>();
+	const actual = await importOriginal<typeof import("react-router-dom")>();
 	return {
 		...actual,
 		useNavigate: () => navigateMock,
@@ -38,8 +37,13 @@ vi.mock("@/stores/editorStore", () => ({
 		selector(editorStore),
 }));
 
-vi.mock("@/contexts/AuthContext", () => ({
-	useAuth: () => ({ isPlatformAdmin: true }),
+const authorization = { canAt: vi.fn(), canAnywhere: vi.fn() };
+vi.mock("@/services/authorization", () => ({
+	useAuthorization: () => authorization,
+}));
+
+vi.mock("framer-motion", () => ({
+	useReducedMotion: () => true,
 }));
 
 const formsRef: { data: Array<Record<string, unknown>> } = { data: [] };
@@ -72,6 +76,8 @@ import { QuickAccess } from "./QuickAccess";
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	authorization.canAt.mockReturnValue(true);
+	authorization.canAnywhere.mockReturnValue(true);
 	formsRef.data = [
 		{ id: "f-1", name: "Onboard User", description: "HR onboarding" },
 	];
@@ -81,11 +87,11 @@ beforeEach(() => {
 		],
 	};
 	searchFilesMock.mockResolvedValue({
-		results: [
+		files: [
 			{
 				file_path: "workflows/onboard.py",
-				line: 12,
-				match_text: "def onboard():",
+				match_count: 3,
+				first_line: 12,
 			},
 		],
 	});
@@ -131,8 +137,17 @@ describe("QuickAccess — searching", () => {
 		// Descriptions render
 		expect(screen.getByText("HR onboarding")).toBeInTheDocument();
 		expect(
-			screen.getByText("Line 12: def onboard():"),
+			screen.getByText("3 matches, first at line 12"),
 		).toBeInTheDocument();
+		// Only editable workspace source is offered, one entry per file
+		expect(searchFilesMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				query: "onboard",
+				source: "workspace",
+				output_mode: "files",
+				limit: 20,
+			}),
+		);
 		// Forms come before workflows before scripts (server-ranked order kept)
 		const items = screen.getAllByRole("option");
 		expect(items[0]).toHaveTextContent("Onboard User");
@@ -147,7 +162,7 @@ describe("QuickAccess — searching", () => {
 	it("shows the no-results state for a query with no matches", async () => {
 		formsRef.data = [];
 		workflowsRef.data = { workflows: [] };
-		searchFilesMock.mockResolvedValue({ results: [] });
+		searchFilesMock.mockResolvedValue({ files: [] });
 
 		renderWithProviders(<QuickAccess isOpen onClose={vi.fn()} />);
 		const input = screen.getByPlaceholderText(
@@ -158,6 +173,36 @@ describe("QuickAccess — searching", () => {
 		await screen.findByText("No results found", undefined, {
 			timeout: 3000,
 		});
+	});
+
+	it("surfaces a script-search error and retries the query", async () => {
+		searchFilesMock
+			.mockRejectedValueOnce(new Error("offline"))
+			.mockResolvedValueOnce({
+				files: [
+					{
+						file_path: "workflows/onboard.py",
+						match_count: 3,
+						first_line: 12,
+					},
+				],
+			});
+
+		renderWithProviders(<QuickAccess isOpen onClose={vi.fn()} />);
+		await typeQuery("onboard");
+
+		expect(
+			await screen.findByText(/file search is temporarily unavailable/i),
+		).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: /retry/i })).toHaveClass(
+			"min-h-11",
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+
+		await waitFor(() =>
+			expect(screen.getByText("onboard.py")).toBeInTheDocument(),
+		);
 	});
 });
 
@@ -225,5 +270,16 @@ describe("QuickAccess — selection and close", () => {
 		await waitFor(() => {
 			expect(onClose).toHaveBeenCalled();
 		});
+	});
+});
+
+it("does not search repository files when the caller cannot use the editor", async () => {
+	authorization.canAt.mockReturnValue(false);
+	renderWithProviders(<QuickAccess isOpen onClose={vi.fn()} />);
+	await typeQuery("onboard");
+	await screen.findByText("Onboard User");
+	expect(searchFilesMock).not.toHaveBeenCalled();
+	expect(authorization.canAt).toHaveBeenCalledWith("repository.readwrite", {
+		kind: "global",
 	});
 });

@@ -2,19 +2,32 @@ import {
 	AppWindow,
 	Building2,
 	Code2,
+	CircleSlash,
 	Eye,
 	Globe,
 	Pencil,
 	PlayCircle,
+	RefreshCw,
+	Check,
 	Trash2,
 } from "lucide-react";
+import type { MouseEvent } from "react";
 
-import { EntityLogo } from "@/components/EntityLogo";
+import { RecordActionsMenu } from "@/components/common/RecordActionsMenu";
+import { ResourceCatalogCard } from "@/components/catalog/ResourceCatalogCard";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { ResourceIcon } from "@/components/ResourceIcon";
 import { PageLoader } from "@/components/PageLoader";
 import { SolutionManagedBadge } from "@/components/solutions/SolutionManagedBadge";
+import {
+	ApplicationSdkStatusBadge,
+	canUpdateApplicationSdk,
+	type ApplicationSdkUpdateState,
+} from "@/components/applications/ApplicationSdkStatusBadge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
 	DataTable,
 	DataTableBody,
@@ -36,15 +49,24 @@ export type ApplicationListItem = components["schemas"]["ApplicationPublic"] & {
 export interface ApplicationListSurfaceProps {
 	apps: ApplicationListItem[];
 	viewMode: "grid" | "table";
+	/** Query string to preserve the originating page in native navigation links. */
+	navigationSearch?: string;
 	isLoading?: boolean;
 	isPlatformAdmin: boolean;
 	canManageApps: boolean;
+	canManageApp?: (app: ApplicationListItem) => boolean;
 	getOrgName: (orgId: string | null | undefined) => string;
 	onLaunch: (app: ApplicationListItem) => void;
 	onPreview?: (app: ApplicationListItem) => void;
 	onOpenSettings?: (app: ApplicationListItem) => void;
 	onOpenCode?: (app: ApplicationListItem) => void;
+	onUpdateSdk?: (app: ApplicationListItem) => void;
 	onDelete?: (app: ApplicationListItem) => void;
+	getSdkUpdateState?: (app: ApplicationListItem) => ApplicationSdkUpdateState;
+	selectionMode?: boolean;
+	selectedIds?: Set<string>;
+	onToggleSelection?: (app: ApplicationListItem) => void;
+	onToggleSelectAllVisible?: () => void;
 	onCreateEmpty?: () => void;
 	emptySearchActive?: boolean;
 }
@@ -54,25 +76,251 @@ function isV2App(app: ApplicationListItem): boolean {
 }
 
 function canLaunchApp(app: ApplicationListItem): boolean {
-	return app.is_published || isV2App(app);
+	return app.is_published;
+}
+
+function getApplicationPrimaryAction(
+	app: ApplicationListItem,
+	actions: Pick<ApplicationListSurfaceProps, "onLaunch" | "onPreview">,
+) {
+	if (canLaunchApp(app)) return () => actions.onLaunch(app);
+	if (!isV2App(app) && actions.onPreview)
+		return () => actions.onPreview?.(app);
+	return undefined;
+}
+
+function getApplicationPrimaryHref(
+	app: ApplicationListItem,
+	navigationSearch: string,
+) {
+	if (canLaunchApp(app)) return `/apps/${app.slug}${navigationSearch}`;
+	if (!isV2App(app)) return `/apps/${app.slug}/preview${navigationSearch}`;
+	return undefined;
+}
+
+function isModifiedOpenEvent(
+	event: Pick<
+		MouseEvent<HTMLElement>,
+		"button" | "ctrlKey" | "metaKey" | "shiftKey" | "altKey"
+	>,
+) {
+	return (
+		event.button !== 0 ||
+		event.ctrlKey ||
+		event.metaKey ||
+		event.shiftKey ||
+		event.altKey
+	);
+}
+
+function ApplicationActions({
+	app,
+	onLaunch,
+	onPreview,
+	onOpenSettings,
+	onOpenCode,
+	onUpdateSdk,
+	onDelete,
+	updateState = "idle",
+}: { app: ApplicationListItem } & Pick<
+	ApplicationListSurfaceProps,
+	| "onLaunch"
+	| "onPreview"
+	| "onOpenSettings"
+	| "onOpenCode"
+	| "onUpdateSdk"
+	| "onDelete"
+> & { updateState?: ApplicationSdkUpdateState }) {
+	const showPublished = canLaunchApp(app);
+	const showPreview =
+		!isV2App(app) && app.has_unpublished_changes && onPreview;
+	const sdkUpdateAllowed = canUpdateApplicationSdk(app, updateState);
+	const sdkStatusNeedsMenu =
+		updateState === "failed" ||
+		updateState === "queued" ||
+		updateState === "updating" ||
+		app.sdk_status === "update_available" ||
+		app.sdk_status === "update_required" ||
+		app.sdk_status === "unknown";
+	if (
+		!showPublished &&
+		!showPreview &&
+		!onOpenSettings &&
+		(!onOpenCode || isV2App(app)) &&
+		!sdkStatusNeedsMenu &&
+		!onDelete
+	)
+		return null;
+	return (
+		<RecordActionsMenu label={`${app.name} actions`}>
+			{showPublished && (
+				<DropdownMenuItem
+					className="min-h-11"
+					onSelect={() => onLaunch(app)}
+				>
+					<PlayCircle aria-hidden="true" className="size-4" />
+					Open Published
+				</DropdownMenuItem>
+			)}
+			{showPreview && (
+				<DropdownMenuItem
+					className="min-h-11"
+					onSelect={() => onPreview?.(app)}
+				>
+					<Eye aria-hidden="true" className="size-4" />
+					Preview
+				</DropdownMenuItem>
+			)}
+			{onOpenSettings && (
+				<DropdownMenuItem
+					className="min-h-11"
+					onSelect={() => onOpenSettings(app)}
+				>
+					<Pencil aria-hidden="true" className="size-4" />
+					Edit
+				</DropdownMenuItem>
+			)}
+			{!isV2App(app) && onOpenCode && (
+				<DropdownMenuItem
+					className="min-h-11"
+					onSelect={() => onOpenCode(app)}
+				>
+					<Code2 aria-hidden="true" className="size-4" />
+					Code editor
+				</DropdownMenuItem>
+			)}
+			{sdkStatusNeedsMenu && onUpdateSdk && (
+				<DropdownMenuItem
+					className="min-h-11"
+					disabled={!sdkUpdateAllowed}
+					onSelect={() => {
+						if (sdkUpdateAllowed) onUpdateSdk(app);
+					}}
+				>
+					{app.sdk_source_available ? (
+						<RefreshCw aria-hidden="true" className="size-4" />
+					) : (
+						<CircleSlash aria-hidden="true" className="size-4" />
+					)}
+					{!app.sdk_source_available
+						? "Source unavailable — cannot rebuild SDK"
+						: updateState === "queued"
+							? "SDK update queued…"
+							: updateState === "updating"
+								? "Updating SDK…"
+								: updateState === "failed"
+									? "Retry SDK update"
+									: app.sdk_status === "unknown"
+										? "Rebuild SDK"
+										: "Update SDK"}
+				</DropdownMenuItem>
+			)}
+			{onDelete && (
+				<DropdownMenuItem
+					variant="destructive"
+					className="min-h-11"
+					onSelect={() => onDelete(app)}
+				>
+					<Trash2 aria-hidden="true" className="size-4" />
+					Delete
+				</DropdownMenuItem>
+			)}
+		</RecordActionsMenu>
+	);
 }
 
 export function ApplicationListSurface({
 	apps,
 	viewMode,
+	navigationSearch = "",
 	isLoading = false,
 	isPlatformAdmin,
 	canManageApps,
+	canManageApp: canManageAppAt,
 	getOrgName,
 	onLaunch,
 	onPreview,
 	onOpenSettings,
 	onOpenCode,
+	onUpdateSdk,
 	onDelete,
+	getSdkUpdateState,
+	selectionMode = false,
+	selectedIds = new Set(),
+	onToggleSelection,
+	onToggleSelectAllVisible,
 	onCreateEmpty,
 	emptySearchActive = false,
 }: ApplicationListSurfaceProps) {
 	const terminology = useTerminology();
+	const canManageApp = (app: ApplicationListItem) =>
+		canManageAppAt?.(app) ?? canManageApps;
+	const isSelectable = (app: ApplicationListItem) =>
+		canManageApp(app) &&
+		canUpdateApplicationSdk(app, getSdkUpdateState?.(app) ?? "idle");
+	const selectableApps = apps.filter(isSelectable);
+	const allVisibleSelected =
+		selectableApps.length > 0 &&
+		selectableApps.every((app) => selectedIds.has(app.id));
+	const someVisibleSelected = selectableApps.some((app) =>
+		selectedIds.has(app.id),
+	);
+	const renderSdkBadge = (app: ApplicationListItem, showCurrent = false) => (
+		<ApplicationSdkStatusBadge
+			status={app.sdk_status}
+			showCurrent={showCurrent}
+			updateState={getSdkUpdateState?.(app) ?? "idle"}
+		/>
+	);
+	const renderSourceUnavailableBadge = (app: ApplicationListItem) => {
+		if (
+			app.sdk_source_available ||
+			!(
+				app.sdk_status === "update_available" ||
+				app.sdk_status === "update_required" ||
+				app.sdk_status === "unknown"
+			)
+		) {
+			return null;
+		}
+		return (
+			<Badge
+				variant="outline"
+				aria-label="Source unavailable"
+				className="gap-1 border-muted-foreground/30 bg-muted text-xs text-muted-foreground"
+			>
+				<CircleSlash aria-hidden="true" className="h-3 w-3" />
+				Source unavailable
+			</Badge>
+		);
+	};
+	const renderName = (app: ApplicationListItem) => {
+		const open = getApplicationPrimaryAction(app, { onLaunch, onPreview });
+		const href = open
+			? getApplicationPrimaryHref(app, navigationSearch)
+			: undefined;
+		if (!href) {
+			return (
+				<span className="min-h-11 min-w-0 text-left font-semibold [overflow-wrap:anywhere]">
+					{app.name}
+				</span>
+			);
+		}
+		return (
+			<a
+				href={href}
+				onClick={(event) => {
+					event.stopPropagation();
+					if (isModifiedOpenEvent(event)) return;
+					event.preventDefault();
+					open?.();
+				}}
+				className="min-h-11 min-w-0 text-left font-semibold [overflow-wrap:anywhere] hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+			>
+				{app.name}
+			</a>
+		);
+	};
 
 	if (isLoading) {
 		return <PageLoader message="Loading applications…" size="sm" />;
@@ -115,6 +363,24 @@ export function ApplicationListSurface({
 				<DataTable className="max-h-full">
 					<DataTableHeader>
 						<DataTableRow>
+							{selectionMode && (
+								<DataTableHead className="w-12">
+									<Checkbox
+										aria-label={`Select all visible ${term(terminology, "app", "formalPlural")} with SDK updates`}
+										checked={
+											allVisibleSelected
+												? true
+												: someVisibleSelected
+													? "indeterminate"
+													: false
+										}
+										disabled={selectableApps.length === 0}
+										onCheckedChange={() =>
+											onToggleSelectAllVisible?.()
+										}
+									/>
+								</DataTableHead>
+							)}
 							{isPlatformAdmin && (
 								<DataTableHead className="w-0 whitespace-nowrap">
 									Organization
@@ -125,19 +391,41 @@ export function ApplicationListSurface({
 							<DataTableHead className="w-0 whitespace-nowrap">
 								Status
 							</DataTableHead>
-							<DataTableHead className="w-0 whitespace-nowrap">
-								Version
-							</DataTableHead>
 							<DataTableHead className="w-0 whitespace-nowrap text-right" />
 						</DataTableRow>
 					</DataTableHeader>
 					<DataTableBody>
 						{apps.map((app) => {
+							const canManage = canManageApp(app);
+							const selectable = isSelectable(app);
 							const opensPreview =
-								!canLaunchApp(app) && Boolean(onPreview);
+								!isV2App(app) &&
+								!canLaunchApp(app) &&
+								Boolean(onPreview);
+							const updateState =
+								getSdkUpdateState?.(app) ?? "idle";
+							const sdkStatusNeedsMenu =
+								updateState === "failed" ||
+								updateState === "updating" ||
+								app.sdk_status === "update_available" ||
+								app.sdk_status === "update_required" ||
+								app.sdk_status === "unknown";
+							const open = getApplicationPrimaryAction(app, {
+								onLaunch,
+								onPreview,
+							});
+							const href = open
+								? getApplicationPrimaryHref(
+										app,
+										navigationSearch,
+									)
+								: undefined;
 							return (
 								<DataTableRow
 									key={app.id}
+									clickable={!selectionMode && Boolean(open)}
+									onClick={selectionMode ? undefined : open}
+									href={selectionMode ? undefined : href}
 									onPointerEnter={() =>
 										prefetchApplicationDetail(
 											app,
@@ -151,6 +439,28 @@ export function ApplicationListSurface({
 										)
 									}
 								>
+									{selectionMode && (
+										<DataTableCell
+											onClick={(event) =>
+												event.stopPropagation()
+											}
+										>
+											<Checkbox
+												aria-label={`Select ${app.name}`}
+												checked={selectedIds.has(
+													app.id,
+												)}
+												disabled={!selectable}
+												onCheckedChange={() => {
+													if (selectable) {
+														onToggleSelection?.(
+															app,
+														);
+													}
+												}}
+											/>
+										</DataTableCell>
+									)}
 									{isPlatformAdmin && (
 										<DataTableCell className="w-0 whitespace-nowrap">
 											{app.organization_id ? (
@@ -174,19 +484,15 @@ export function ApplicationListSurface({
 											)}
 										</DataTableCell>
 									)}
-									<DataTableCell className="font-medium">
-										<div className="flex items-center gap-2">
-											<EntityLogo
-												entityType="app"
-												entityId={app.id}
+									<DataTableCell className="min-w-0 font-medium">
+										<div className="flex min-w-0 flex-1 items-center gap-2">
+											<ResourceIcon
+												kind="app"
+												id={app.id}
 												logo={app.logo_url ?? null}
-												fallback={
-													<AppWindow className="h-3.5 w-3.5 text-muted-foreground" />
-												}
-												size={20}
-												className="h-5 w-5 shrink-0 rounded object-cover"
+												size="table"
 											/>
-											<span>{app.name}</span>
+											{renderName(app)}
 										</div>
 									</DataTableCell>
 									<DataTableCell className="max-w-xs truncate text-muted-foreground">
@@ -197,19 +503,21 @@ export function ApplicationListSurface({
 										)}
 									</DataTableCell>
 									<DataTableCell className="w-0 whitespace-nowrap">
-										<div className="flex gap-1">
+										<div className="flex flex-wrap gap-1">
 											{app.is_published && (
 												<Badge
-													variant="default"
-													className="text-xs"
+													variant="outline"
+													className="border-[var(--bf-success)]/20 bg-[var(--bf-success)]/10 text-[var(--bf-success)] text-xs"
 												>
-													Published
+													{isV2App(app)
+														? "Deployed"
+														: "Published"}
 												</Badge>
 											)}
 											{app.has_unpublished_changes && (
 												<Badge
 													variant="outline"
-													className="text-xs"
+													className="border-[var(--bf-warning)]/20 bg-[var(--bf-warning)]/10 text-[var(--bf-warning)] text-xs"
 												>
 													Draft
 												</Badge>
@@ -221,95 +529,55 @@ export function ApplicationListSurface({
 														className="text-xs"
 													>
 														{isV2App(app)
-															? "V2"
+															? "Not deployed"
 															: "Empty"}
 													</Badge>
 												)}
+											{renderSdkBadge(app, true)}
+											{renderSourceUnavailableBadge(app)}
 										</div>
 									</DataTableCell>
-									<DataTableCell className="w-0 whitespace-nowrap">
-										{app.is_published ? "Published" : "-"}
-									</DataTableCell>
-									<DataTableCell className="w-0 whitespace-nowrap text-right">
-										<div className="flex gap-1 justify-end">
-											<Button
-												size="sm"
-												onClick={() => onLaunch(app)}
-												disabled={!canLaunchApp(app)}
-												title={
-													!canLaunchApp(app)
-														? "No published version"
-														: `Open ${term(terminology, "app", "formalSingularLower")}`
-												}
-											>
-												<PlayCircle className="h-4 w-4" />
-											</Button>
-											{canManageApps &&
-												!isV2App(app) &&
-												app.has_unpublished_changes &&
-												onPreview && (
-													<Button
-														variant="ghost"
-														size="sm"
-														onClick={() =>
-															onPreview(app)
-														}
-														title="Preview draft"
-													>
-														<Eye className="h-4 w-4" />
-													</Button>
-												)}
+									<DataTableCell
+										className="w-0 whitespace-nowrap text-right"
+										onClick={(event) =>
+											event.stopPropagation()
+										}
+									>
+										<div className="flex justify-end gap-1">
 											{app.is_solution_managed && (
 												<SolutionManagedBadge
 													solutionId={app.solution_id}
 												/>
 											)}
-											{canManageApps &&
-												!app.is_solution_managed && (
-													<>
-														{onOpenSettings && (
-															<Button
-																variant="ghost"
-																size="sm"
-																onClick={() =>
-																	onOpenSettings(
-																		app,
-																	)
-																}
-																title="Settings"
-															>
-																<Pencil className="h-4 w-4" />
-															</Button>
-														)}
-														{onOpenCode && (
-															<Button
-																variant="ghost"
-																size="sm"
-																onClick={() =>
-																	onOpenCode(
-																		app,
-																	)
-																}
-																title="Code editor"
-															>
-																<Code2 className="h-4 w-4" />
-															</Button>
-														)}
-														{onDelete && (
-															<Button
-																variant="ghost"
-																size="sm"
-																onClick={() =>
-																	onDelete(
-																		app,
-																	)
-																}
-																title={`Delete ${term(terminology, "app", "formalSingularLower")}`}
-															>
-																<Trash2 className="h-4 w-4" />
-															</Button>
-														)}
-													</>
+											{canManage &&
+												(!app.is_solution_managed ||
+													sdkStatusNeedsMenu) && (
+													<ApplicationActions
+														app={app}
+														onLaunch={onLaunch}
+														onPreview={onPreview}
+														onOpenSettings={
+															app.is_solution_managed
+																? undefined
+																: onOpenSettings
+														}
+														onOpenCode={
+															app.is_solution_managed
+																? undefined
+																: onOpenCode
+														}
+														onUpdateSdk={
+															onUpdateSdk
+														}
+														onDelete={
+															app.is_solution_managed
+																? undefined
+																: onDelete
+														}
+														updateState={
+															updateState
+														}
+													/>
 												)}
 										</div>
 									</DataTableCell>
@@ -323,191 +591,188 @@ export function ApplicationListSurface({
 	}
 
 	return (
-		<div className="grid grid-cols-1 gap-4 sm:grid-cols-[repeat(auto-fill,minmax(320px,1fr))]">
+		<div className="grid grid-cols-1 gap-4 sm:grid-cols-[repeat(auto-fill,minmax(min(100%,320px),1fr))]">
 			{apps.map((app) => {
-				const opensPreview = !canLaunchApp(app) && Boolean(onPreview);
-				const defaultTarget = canLaunchApp(app)
-					? () => onLaunch(app)
-					: onPreview
-						? () => onPreview(app)
-						: undefined;
+				const canManage = canManageApp(app);
+				const selectable = isSelectable(app);
+				const selected = selectedIds.has(app.id);
+				const opensPreview =
+					!isV2App(app) && !canLaunchApp(app) && Boolean(onPreview);
+				const defaultTarget = getApplicationPrimaryAction(app, {
+					onLaunch,
+					onPreview,
+				});
+				const href = defaultTarget
+					? getApplicationPrimaryHref(app, navigationSearch)
+					: undefined;
 				const orgLabel = isPlatformAdmin
 					? app.organization_id
 						? getOrgName(app.organization_id)
 						: "Global"
 					: null;
-				return (
+				const card = (
 					<div
 						key={app.id}
-						role="button"
-						tabIndex={0}
 						onPointerEnter={() =>
 							prefetchApplicationDetail(app, opensPreview)
 						}
 						onFocus={() =>
 							prefetchApplicationDetail(app, opensPreview)
 						}
-						onClick={defaultTarget}
-						onKeyDown={(e) => {
-							if (
-								defaultTarget &&
-								(e.key === "Enter" || e.key === " ")
-							) {
-								e.preventDefault();
-								defaultTarget();
-							}
-						}}
-						className="group relative flex cursor-pointer flex-col overflow-hidden rounded-2xl bg-card shadow-sm ring-1 ring-foreground/5 transition-all hover:-translate-y-px hover:ring-foreground/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring dark:ring-foreground/10 dark:hover:ring-foreground/15"
 					>
-						<div className="border-b px-4 py-3">
-							<div className="flex items-start justify-between gap-3">
-								<div className="flex min-w-0 items-center gap-2">
-									<EntityLogo
-										entityType="app"
-										entityId={app.id}
-										logo={app.logo_url ?? null}
-										fallback={
-											<AppWindow className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-										}
-										size={20}
-										className="h-5 w-5 rounded object-cover shrink-0"
-									/>
-									<span className="truncate text-[14.5px] font-semibold">
-										{app.name}
+						<ResourceCatalogCard
+							icon={
+								<ResourceIcon
+									kind="app"
+									id={app.id}
+									logo={app.logo_url ?? null}
+									size="card"
+									className="border-sky-500/20 bg-sky-500/10 text-sky-700 dark:text-sky-300 [&_svg]:text-current"
+								/>
+							}
+							title={app.name}
+							href={href}
+							subtitle={
+								<>
+									{term(terminology, "app", "formalSingular")}
+									<span> · </span>
+									{isV2App(app) ? "Code app" : "Legacy app"}
+								</>
+							}
+							description={
+								app.description || (
+									<span className="italic text-muted-foreground/60">
+										No description
 									</span>
-								</div>
-								{app.is_solution_managed ? (
-									<SolutionManagedBadge
-										solutionId={app.solution_id}
-									/>
-								) : canManageApps ? (
-									<div className="flex shrink-0 gap-1">
-										{onOpenSettings && (
-											<Button
-												type="button"
-												variant="ghost"
-												size="icon"
-												className="h-6 w-6"
-												onClick={(e) => {
-													e.stopPropagation();
-													onOpenSettings(app);
-												}}
-												title="Settings"
-												aria-label="Settings"
-											>
-												<Pencil className="h-3.5 w-3.5" />
-											</Button>
-										)}
-										{onOpenCode && (
-											<Button
-												type="button"
-												variant="ghost"
-												size="icon"
-												className="h-6 w-6"
-												onClick={(e) => {
-													e.stopPropagation();
-													onOpenCode(app);
-												}}
-												title="Code editor"
-												aria-label="Code editor"
-											>
-												<Code2 className="h-3.5 w-3.5" />
-											</Button>
-										)}
+								)
+							}
+							action={
+								selectionMode ? undefined : (
+									<div className="flex items-center gap-1">
+										{app.is_solution_managed ? (
+											<SolutionManagedBadge
+												solutionId={app.solution_id}
+											/>
+										) : null}
+										{canManage ? (
+											<ApplicationActions
+												app={app}
+												onLaunch={onLaunch}
+												onPreview={onPreview}
+												onOpenSettings={
+													app.is_solution_managed
+														? undefined
+														: onOpenSettings
+												}
+												onOpenCode={
+													app.is_solution_managed
+														? undefined
+														: onOpenCode
+												}
+												onUpdateSdk={onUpdateSdk}
+												onDelete={
+													app.is_solution_managed
+														? undefined
+														: onDelete
+												}
+												updateState={
+													getSdkUpdateState?.(app) ??
+													"idle"
+												}
+											/>
+										) : null}
 									</div>
-								) : null}
-							</div>
-						</div>
-
-						<div className="relative flex-1 px-4 py-3 min-h-[72px]">
-							{app.description ? (
-								<p className="line-clamp-2 text-[13px] text-muted-foreground">
-									{app.description}
-								</p>
-							) : (
-								<p className="text-[13px] italic text-muted-foreground/50">
-									No description
-								</p>
-							)}
-
-							{!isV2App(app) && (
-								<div className="pointer-events-none absolute inset-0 flex flex-col items-start justify-center gap-1.5 bg-background/85 px-4 opacity-0 backdrop-blur-sm transition-opacity group-hover:opacity-100">
-									{app.is_published && (
-										<button
-											type="button"
-											className="pointer-events-auto text-left text-[13px] font-medium text-foreground hover:text-primary"
-											onClick={(e) => {
-												e.stopPropagation();
-												onLaunch(app);
-											}}
-										>
-											<PlayCircle className="-mt-0.5 mr-1.5 inline h-3.5 w-3.5" />
-											Open Published
-										</button>
-									)}
-									{canManageApps &&
-										app.has_unpublished_changes &&
-										onPreview && (
-											<button
-												type="button"
-												className="pointer-events-auto text-left text-[13px] font-medium text-foreground hover:text-primary"
-												onClick={(e) => {
-													e.stopPropagation();
-													onPreview(app);
-												}}
-											>
-												<Eye className="-mt-0.5 mr-1.5 inline h-3.5 w-3.5" />
-												Open Preview
-											</button>
+								)
+							}
+							footer={
+								orgLabel ? (
+									<p className="flex min-w-0 items-center gap-2">
+										{app.organization_id ? (
+											<Building2 className="size-3.5 shrink-0" />
+										) : (
+											<Globe className="size-3.5 shrink-0" />
 										)}
-								</div>
-							)}
-						</div>
-
-						<div className="flex items-center justify-between gap-2 border-t px-4 py-2.5">
-							<div className="flex items-center gap-1.5">
+										<span className="truncate">
+											{orgLabel}
+										</span>
+									</p>
+								) : undefined
+							}
+							onOpen={() => defaultTarget?.()}
+							disabled={selectionMode || !defaultTarget}
+							titleInteractive={!selectionMode}
+						>
+							<div className="flex min-w-0 flex-wrap items-center gap-1.5">
 								{app.is_published && (
 									<Badge
-										variant="default"
-										className="text-[10px] px-1.5 py-0"
+										variant="outline"
+										className="border-[var(--bf-success)]/20 bg-[var(--bf-success)]/10 px-1.5 py-0 text-xs text-[var(--bf-success)]"
 									>
-										Published
+										{isV2App(app)
+											? "Deployed"
+											: "Published"}
 									</Badge>
 								)}
 								{app.has_unpublished_changes && (
 									<Badge
 										variant="outline"
-										className="text-[10px] px-1.5 py-0"
+										className="border-[var(--bf-warning)]/20 bg-[var(--bf-warning)]/10 px-1.5 py-0 text-xs text-[var(--bf-warning)]"
 									>
 										Draft
 									</Badge>
 								)}
 								{!app.is_published &&
 									!app.has_unpublished_changes && (
-										<span className="text-[11px] text-muted-foreground">
-											{isV2App(app) ? "V2" : "Empty"}
-										</span>
+										<Badge
+											variant="secondary"
+											className="text-xs"
+										>
+											{isV2App(app)
+												? "Not deployed"
+												: "Empty"}
+										</Badge>
 									)}
+								{renderSdkBadge(app)}
+								{renderSourceUnavailableBadge(app)}
 							</div>
-							{orgLabel ? (
-								<Badge
-									variant={
-										app.organization_id
-											? "outline"
-											: "default"
-									}
-									className="text-[10px] px-1.5 py-0"
-								>
-									{app.organization_id ? (
-										<Building2 className="mr-1 h-3 w-3" />
-									) : (
-										<Globe className="mr-1 h-3 w-3" />
-									)}
-									{orgLabel}
-								</Badge>
-							) : null}
-						</div>
+						</ResourceCatalogCard>
 					</div>
+				);
+				if (!selectionMode) return card;
+				const toggle = () => {
+					if (selectable) onToggleSelection?.(app);
+				};
+				return (
+					<article
+						key={app.id}
+						role={selectable ? "button" : undefined}
+						tabIndex={selectable ? 0 : undefined}
+						aria-label={app.name}
+						aria-pressed={selectable ? selected : undefined}
+						aria-disabled={!selectable}
+						onClick={toggle}
+						onKeyDown={(event) => {
+							if (event.key === "Enter" || event.key === " ") {
+								event.preventDefault();
+								toggle();
+							}
+						}}
+						className={
+							selectable
+								? "relative cursor-pointer rounded-[var(--bf-radius-surface)] outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+								: "relative rounded-[var(--bf-radius-surface)] opacity-70"
+						}
+					>
+						{selected && (
+							<span
+								aria-label={`${app.name} selected`}
+								className="absolute right-3 top-3 z-10 grid size-6 place-items-center rounded-full bg-primary text-primary-foreground shadow-sm"
+							>
+								<Check aria-hidden="true" className="size-4" />
+							</span>
+						)}
+						{card}
+					</article>
 				);
 			})}
 		</div>

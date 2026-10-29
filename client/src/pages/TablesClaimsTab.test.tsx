@@ -5,6 +5,9 @@ const mockListClaims = vi.fn();
 const mockCreateClaim = vi.fn();
 const mockUpdateClaim = vi.fn();
 const mockDeleteClaim = vi.fn();
+const mockUseAuth = vi.fn();
+const mockUseAuthorization = vi.fn();
+const mockUseOrganizations = vi.fn();
 
 vi.mock("@/services/claims", () => ({
 	listClaims: (...args: unknown[]) => mockListClaims(...args),
@@ -14,19 +17,15 @@ vi.mock("@/services/claims", () => ({
 }));
 
 vi.mock("@/contexts/AuthContext", () => ({
-	useAuth: () => ({
-		isPlatformAdmin: true,
-		user: {
-			id: "dev-user",
-			email: "dev@gobifrost.com",
-			organizationId: "22222222-2222-4222-8222-222222222222",
-			isSuperuser: true,
-		},
-	}),
+	useAuth: () => mockUseAuth(),
+}));
+
+vi.mock("@/services/authorization", () => ({
+	useAuthorization: () => mockUseAuthorization(),
 }));
 
 vi.mock("@/hooks/useOrganizations", () => ({
-	useOrganizations: () => ({ data: [] }),
+	useOrganizations: (...args: unknown[]) => mockUseOrganizations(...args),
 }));
 
 import { TablesClaimsTab } from "./TablesClaimsTab";
@@ -36,9 +35,36 @@ beforeEach(() => {
 	mockCreateClaim.mockReset();
 	mockUpdateClaim.mockReset();
 	mockDeleteClaim.mockReset();
+	mockUseAuth.mockReturnValue({
+		isPlatformAdmin: true,
+		user: {
+			id: "dev-user",
+			email: "dev@gobifrost.com",
+			organizationId: "22222222-2222-4222-8222-222222222222",
+			isSuperuser: true,
+		},
+	});
+	mockUseAuthorization.mockReturnValue({
+		canAnywhere: () => true,
+		canAt: () => true,
+	});
+	mockUseOrganizations.mockReturnValue({ data: [] });
 });
 
 describe("TablesClaimsTab", () => {
+	it("uses a compact loading status while claims load", () => {
+		mockListClaims.mockReturnValue(new Promise(() => undefined));
+
+		renderWithProviders(<TablesClaimsTab />);
+
+		expect(
+			screen.getByRole("status", { name: "Loading custom claims" }),
+		).toHaveTextContent("Loading custom claims");
+		expect(
+			screen.queryByText("No custom claims yet"),
+		).not.toBeInTheDocument();
+	});
+
 	it("lists claims fetched from the service", async () => {
 		mockListClaims.mockResolvedValue({
 			claims: [
@@ -67,8 +93,7 @@ describe("TablesClaimsTab", () => {
 				claims: [
 					{
 						id: "11111111-1111-4111-8111-111111111111",
-						organization_id:
-							"22222222-2222-4222-8222-222222222222",
+						organization_id: "22222222-2222-4222-8222-222222222222",
 						name: "allowed_campus_ids",
 						type: "list",
 						description: null,
@@ -85,15 +110,17 @@ describe("TablesClaimsTab", () => {
 		const { user } = renderWithProviders(<TablesClaimsTab />);
 		await screen.findByText("allowed_campus_ids");
 
-		await user.click(screen.getByRole("button", { name: /delete claim/i }));
+		await user.click(
+			screen.getByRole("button", { name: "allowed_campus_ids actions" }),
+		);
+		await user.click(screen.getByRole("menuitem", { name: "Delete" }));
 		// Confirmation dialog appears — accept it.
 		await user.click(screen.getByRole("button", { name: /^delete$/i }));
 
 		await waitFor(() =>
-			expect(mockDeleteClaim).toHaveBeenCalledWith(
-				"allowed_campus_ids",
-				{ scope: "22222222-2222-4222-8222-222222222222" },
-			),
+			expect(mockDeleteClaim).toHaveBeenCalledWith("allowed_campus_ids", {
+				scope: "22222222-2222-4222-8222-222222222222",
+			}),
 		);
 		expect(mockListClaims).toHaveBeenCalledTimes(2);
 	});
@@ -130,13 +157,136 @@ describe("TablesClaimsTab", () => {
 		// Managed claim shows the badge; the loose claim does not.
 		expect(screen.getAllByTestId("solution-managed-badge")).toHaveLength(1);
 
-		// Loose claim keeps its Edit/Delete controls; the managed one does not,
-		// so exactly one of each control is rendered (for the loose row).
 		expect(
-			screen.getAllByRole("button", { name: /edit claim/i }),
-		).toHaveLength(1);
+			screen.getByRole("button", { name: "loose_claim actions" }),
+		).toBeVisible();
 		expect(
-			screen.getAllByRole("button", { name: /delete claim/i }),
-		).toHaveLength(1);
+			screen.queryByRole("button", { name: "managed_claim actions" }),
+		).not.toBeInTheDocument();
+	});
+
+	it("uses claim grants for create and row actions, excluding other organizations", async () => {
+		mockUseAuth.mockReturnValue({
+			isPlatformAdmin: false,
+			user: {
+				id: "role-user",
+				email: "role@example.com",
+				organizationId: "org-allowed",
+				isSuperuser: false,
+			},
+		});
+		mockUseAuthorization.mockReturnValue({
+			canAnywhere: (permission: string) =>
+				permission === "claims.read" || permission === "claims.readwrite",
+			canAt: (permission: string, target: { kind: string; id?: string }) =>
+				permission === "claims.readwrite" &&
+				target.kind === "org" &&
+				target.id === "org-allowed",
+		});
+		mockListClaims.mockResolvedValue({
+			claims: [
+				{
+					id: "claim-allowed",
+					organization_id: "org-allowed",
+					name: "allowed_claim",
+					type: "list",
+					query: { table: "records", select: "id" },
+				},
+				{
+					id: "claim-blocked",
+					organization_id: "org-blocked",
+					name: "blocked_claim",
+					type: "list",
+					query: { table: "records", select: "id" },
+				},
+			],
+		});
+
+		renderWithProviders(<TablesClaimsTab />);
+
+		await screen.findByText("allowed_claim");
+		expect(screen.getByRole("button", { name: "Add Claim" })).toBeVisible();
+		expect(
+			screen.getByRole("button", { name: "allowed_claim actions" }),
+		).toBeVisible();
+		expect(
+			screen.queryByRole("button", { name: "blocked_claim actions" }),
+		).not.toBeInTheDocument();
+	});
+
+	it("keeps claims read-only without a claim write grant", async () => {
+		mockUseAuth.mockReturnValue({
+			isPlatformAdmin: false,
+			user: {
+				id: "reader-user",
+				email: "reader@example.com",
+				organizationId: "org-reader",
+				isSuperuser: false,
+			},
+		});
+		mockUseAuthorization.mockReturnValue({
+			canAnywhere: (permission: string) => permission === "claims.read",
+			canAt: () => false,
+		});
+		mockListClaims.mockResolvedValue({
+			claims: [
+				{
+					id: "claim-reader",
+					organization_id: "org-reader",
+					name: "read_only_claim",
+					type: "list",
+					query: { table: "records", select: "id" },
+				},
+			],
+		});
+
+		renderWithProviders(<TablesClaimsTab />);
+
+		await screen.findByText("read_only_claim");
+		expect(
+			screen.queryByRole("button", { name: "Add Claim" }),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByRole("button", { name: "read_only_claim actions" }),
+		).not.toBeInTheDocument();
+	});
+	it("offers retry after an initial failure without showing a false empty state", async () => {
+		mockListClaims
+			.mockRejectedValueOnce(new Error("Synthetic failure"))
+			.mockResolvedValueOnce({ claims: [] });
+		const { user } = renderWithProviders(<TablesClaimsTab />);
+		await screen.findByText("Custom claims could not be loaded");
+		expect(
+			screen.queryByText("No custom claims yet"),
+		).not.toBeInTheDocument();
+		await user.click(screen.getByRole("button", { name: "Retry claims" }));
+		await screen.findByText("No custom claims yet");
+		expect(
+			screen.queryByText("Custom claims could not be loaded"),
+		).not.toBeInTheDocument();
+	});
+	it("retains loaded claims after a failed refresh", async () => {
+		mockListClaims
+			.mockResolvedValueOnce({
+				claims: [
+					{
+						id: "claim-1",
+						name: "review_access",
+						organization_id: null,
+						type: "list",
+						query: { table: "records", select: "id" },
+					},
+				],
+			})
+			.mockRejectedValueOnce(new Error("Synthetic failure"));
+		const { user } = renderWithProviders(<TablesClaimsTab />);
+		await screen.findByText("review_access");
+		await user.click(
+			screen.getByRole("button", { name: "Refresh claims" }),
+		);
+		await screen.findByText(
+			"Showing the last loaded claims. Refresh to get the latest changes.",
+		);
+		expect(screen.getByText("review_access")).toBeVisible();
 	});
 });

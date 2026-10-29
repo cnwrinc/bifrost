@@ -1,14 +1,33 @@
 """
-bifrost/executions.py - Execution history SDK (API-only)
+bifrost/executions.py - Execution history SDK
 
 Provides Python API for execution history operations (list, get, get_current_logs).
-All operations go through HTTP API endpoints.
+
+``list`` and ``get`` send the ordinary HTTP request through the shared
+``BifrostClient``: over the worker's private Unix socket when the engine
+injected one, and over the network API otherwise. The worker parent owns the
+pooled database; an engine child holds neither, and a local attempt never
+falls back to the network API. ``get_current_logs`` uses the same authenticated transport and execution visibility checks.
 """
 
 from __future__ import annotations
 
 from .client import get_client, raise_for_status_with_detail
 from .models import ExecutionLog, WorkflowExecution
+
+
+class ExecutionList(list[WorkflowExecution]):
+    """List of workflow executions with optional pagination metadata."""
+
+    continuation_token: str | None
+
+    def __init__(
+        self,
+        executions: list[WorkflowExecution] | None = None,
+        continuation_token: str | None = None,
+    ) -> None:
+        super().__init__(executions or [])
+        self.continuation_token = continuation_token
 
 
 class executions:
@@ -26,8 +45,11 @@ class executions:
         status: str | None = None,
         start_date: str | None = None,
         end_date: str | None = None,
-        limit: int = 50
-    ) -> list[WorkflowExecution]:
+        limit: int = 50,
+        *,
+        workflow_id: str | None = None,
+        continuation_token: str | None = None,
+    ) -> ExecutionList:
         """
         List workflow executions with filtering.
 
@@ -35,14 +57,17 @@ class executions:
         Regular users see only their own executions.
 
         Args:
+            workflow_id: Filter by workflow UUID (optional)
             workflow_name: Filter by workflow name (optional)
             status: Filter by status (optional)
             start_date: Filter by start date in ISO format (optional)
             end_date: Filter by end date in ISO format (optional)
+            continuation_token: Pagination token for the next page (optional)
             limit: Maximum number of results (default: 50, max: 1000)
 
         Returns:
-            list[WorkflowExecution]: List of execution SUMMARIES. Summaries
+            ExecutionList: List-compatible execution SUMMARIES. Read its
+            ``continuation_token`` attribute to request the next page. Summaries
             carry metadata only — ``input_data``, ``result``, ``logs``, and
             ``variables`` are always None here; call ``executions.get(id)``
             for a specific execution's payload. Summary attributes:
@@ -57,7 +82,6 @@ class executions:
                 - error_message: str | None - Error if failed
                 - duration_ms: int | None - Execution duration
                 - started_at, completed_at: datetime | None
-                - session_id: str | None - CLI session ID
                 - peak_memory_bytes, cpu_total_seconds: Resource metrics
 
         Raises:
@@ -74,22 +98,32 @@ class executions:
 
         # Build query parameters
         params = {}
-        if workflow_name:
-            params["workflowName"] = workflow_name
+        if workflow_id:
+            params["workflow_id"] = workflow_id
+        elif workflow_name:
+            params["workflow_name"] = workflow_name
         if status:
             params["status"] = status
         if start_date:
-            params["startDate"] = start_date
+            params["start_date"] = start_date
         if end_date:
-            params["endDate"] = end_date
+            params["end_date"] = end_date
+        if continuation_token:
+            params["continuation_token"] = continuation_token
         params["limit"] = min(limit, 1000)
 
-        response = await client.get("/api/executions", params=params)
+        response = await client.engine_request("GET", "/api/executions", params=params)
         raise_for_status_with_detail(response)
         data = response.json()
         # API returns ExecutionsListResponse with executions array
         executions_data = data.get("executions", [])
-        return [WorkflowExecution.model_validate(exec_data) for exec_data in executions_data]
+        return ExecutionList(
+            [
+                WorkflowExecution.model_validate(exec_data)
+                for exec_data in executions_data
+            ],
+            continuation_token=data.get("continuation_token"),
+        )
 
     @staticmethod
     async def get(execution_id: str) -> WorkflowExecution:
@@ -117,7 +151,9 @@ class executions:
             >>> print(exec_details.result)
         """
         client = get_client()
-        response = await client.get(f"/api/executions/{execution_id}")
+        response = await client.engine_request(
+            "GET", f"/api/executions/{execution_id}"
+        )
         if response.status_code == 404:
             raise ValueError(f"Execution not found: {execution_id}")
         elif response.status_code == 403:
@@ -134,9 +170,8 @@ class executions:
         """
         Get logs accumulated so far for the current (or specified) execution.
 
-        This reads logs directly from Redis Stream, allowing workflows to
-        retrieve their own logs accumulated during execution. Useful for
-        debugging, progress tracking, or passing execution context to sub-workflows.
+        The API checks execution visibility and filters diagnostic lines by
+        the caller's named permissions.
 
         Args:
             execution_id: Execution ID to get logs for. If not provided,
@@ -165,16 +200,11 @@ class executions:
             >>> # Get logs for a specific execution
             >>> logs = await executions.get_current_logs(execution_id="exec-123")
         """
-        from ._logging import read_logs_from_stream
-
-        # If no execution_id provided, get from current context
         if execution_id is None:
             from ._context import get_execution_context
-            ctx = get_execution_context()
-            execution_id = ctx.execution_id
-
-        return await read_logs_from_stream(
-            execution_id=execution_id,
-            start=start,
-            count=count,
+            execution_id = get_execution_context().execution_id
+        response = await get_client().engine_request(
+            "GET", f"/api/sdk/runtime/logs/{execution_id}", params={"start": start, "count": count},
         )
+        raise_for_status_with_detail(response)
+        return [ExecutionLog.model_validate(row) for row in response.json()]

@@ -1,6 +1,7 @@
 """CLI build-time artifact generation."""
 
 import tarfile
+import tomllib
 from pathlib import Path
 
 from shared.cli_artifact import build_cli_artifact, cli_artifact_filename, to_pep440
@@ -27,11 +28,17 @@ def test_build_cli_artifact_stamps_and_filters_package(tmp_path: Path) -> None:
         init = archive.extractfile("bifrost/__init__.py")
         assert pyproject is not None
         assert init is not None
-        assert 'version = "1.2.3"' in pyproject.read().decode()
+        pyproject_text = pyproject.read().decode()
+        assert 'version = "1.2.3"' in pyproject_text
+        metadata = tomllib.loads(pyproject_text)
+        assert any(
+            requirement.startswith("packaging")
+            for requirement in metadata["project"]["dependencies"]
+        )
+        assert "pydantic>=2.12.0" in metadata["project"]["dependencies"]
         assert '__version__ = "v1.2.3"' in init.read().decode()
 
     assert "bifrost/lucide_icon_names.json" in names
-    assert "bifrost/_write_buffer.py" not in names
     assert "bifrost/_logging.py" not in names
 
 

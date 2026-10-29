@@ -11,18 +11,19 @@
  *   same-origin requests with cookie/CSRF auth (the platform serves the app,
  *   so the session cookie is present). Unchanged behavior.
  * - **v2 standalone apps:** `<BifrostProvider>` installs a transport pointing
- *   at the configured `baseUrl` with a bearer token (and optional org header),
- *   so `tables.*`/`useTable` reach the real Bifrost API even when the app is
- *   served by its own dev server (`npm run dev`) on a different origin.
+ *   at the configured `baseUrl` with an authenticated fetch and a lazy token
+ *   reader for WebSocket reconnects, so `tables.*`/`useTable` reach the real
+ *   Bifrost API even when the app is served by its own dev server.
  */
 export interface BifrostTransport {
   baseUrl: string;
   /**
-   * Raw bearer token. HTTP calls carry it via `headers.Authorization`; the
-   * websocket client needs it separately because `WebSocket` cannot send
-   * headers — the server accepts a `token` query param on `/ws/connect`.
+	 * Initial bearer token. Updated providers prefer `getToken`; this remains as
+	 * the local-development and older-provider fallback.
    */
   token?: string;
+	/** Read the current token at connection time (deployed V2 apps rotate it). */
+	getToken?: () => string | undefined;
   fetchImpl?: typeof fetch;
   headers?: Record<string, string>;
 }
@@ -46,4 +47,26 @@ export function setBifrostTransport(next: BifrostTransport): () => void {
 /** Read the currently installed transport (default: same-origin, no headers). */
 export function getBifrostTransport(): BifrostTransport {
   return transport;
+}
+
+/**
+ * Session bridge the host platform installs (`lib/api-client.ts`). Lets the
+ * data SDK, including a standalone v2 app's own SDK copy, share the host's
+ * live token and single-flight refresh without importing host internals.
+ * Absent outside the platform document (tests, external embeds).
+ */
+export interface PlatformAuthBridge {
+	getAccessToken: () => string | null;
+	canRefreshAccessToken: () => boolean;
+	refreshAccessToken: () => Promise<boolean>;
+	handleAuthenticationFailure: () => void;
+}
+
+type PlatformAuthGlobal = typeof globalThis & {
+	__BIFROST_PLATFORM_AUTH_V1__?: PlatformAuthBridge;
+};
+
+/** Read the host session bridge at call time (it is installed at host boot). */
+export function getPlatformAuth(): PlatformAuthBridge | undefined {
+	return (globalThis as PlatformAuthGlobal).__BIFROST_PLATFORM_AUTH_V1__;
 }

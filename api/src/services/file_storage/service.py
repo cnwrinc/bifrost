@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import Settings, get_settings
 from src.core.log_safety import log_safe
+from shared.file_paths import SCOPE_SKIP, scope_to_org_id
 from .models import (
     WriteResult,
     WorkflowIdConflictInfo,
@@ -30,37 +31,9 @@ from .entity_resolution import EntityResolutionService
 from .deactivation import DeactivationProtectionService
 from .file_ops import FileOperationsService
 from .folder_ops import FolderOperationsService
-from .reindex import WorkspaceReindexService
 from .indexers import WorkflowIndexer
 
 logger = logging.getLogger(__name__)
-
-# Sentinel — returned by _scope_to_org_id to signal "no metadata to write".
-_SCOPE_SKIP = object()
-
-
-def _scope_to_org_id(location: str, scope: str | None) -> "UUID | None | object":
-    """Coerce a storage-scope string to the org UUID for FileMetadata writes.
-
-    Returns:
-        ``None``       — global (org IS NULL)
-        ``UUID(scope)`` — org-scoped write
-        ``_SCOPE_SKIP`` — caller should skip metadata write (missing scope)
-
-    This is the NON-solution path.  Solution writes use their own path so
-    the install UUID never ends up in organization_id (C2).
-    """
-    if location == "workspace":
-        return None
-    if scope is None:
-        return _SCOPE_SKIP
-    if scope == "global":
-        return None
-    try:
-        return UUID(scope)
-    except ValueError:
-        return _SCOPE_SKIP
-
 
 class FileStorageService:
     """
@@ -113,17 +86,6 @@ class FileStorageService:
             s3_client=self._s3_storage,
             remove_metadata_fn=self._remove_metadata,
             write_file_fn=self._file_ops.write_file,
-        )
-
-        self._reindex_service = WorkspaceReindexService(
-            db=db,
-            settings=self.settings,
-            s3_client=self._s3_storage,
-            entity_resolution=self._entity_resolution,
-            file_hash_fn=S3StorageClient.compute_hash,
-            content_type_fn=S3StorageClient.guess_content_type,
-            extract_metadata_fn=self._extract_metadata,
-            index_python_file_fn=self._workflow_indexer.index_python_file,
         )
 
     # ========================================================================
@@ -200,23 +162,6 @@ class FileStorageService:
         )
 
     # ========================================================================
-    # Reindexing Operations (delegate to WorkspaceReindexService)
-    # ========================================================================
-
-    async def sync_index_from_s3(self) -> int:
-        """Sync index from S3 bucket contents."""
-        return await self._reindex_service.sync_index_from_s3()
-
-    async def reindex_workspace_files(
-        self,
-        local_path: Path,
-    ) -> dict[str, int | list[str]]:
-        """Reindex workspace files from local filesystem."""
-        return await self._reindex_service.reindex_workspace_files(
-            local_path=local_path,
-        )
-
-    # ========================================================================
     # S3 Direct Operations (delegate to S3StorageClient)
     # ========================================================================
 
@@ -237,11 +182,16 @@ class FileStorageService:
         self,
         path: str,
         expires_in: int = 600,
+        *,
+        response_content_type: str | None = None,
+        response_content_disposition: str | None = None,
     ) -> str:
         """Generate a presigned GET URL for direct S3 download."""
         return await self._s3_storage.generate_presigned_download_url(
             path=path,
             expires_in=expires_in,
+            response_content_type=response_content_type,
+            response_content_disposition=response_content_disposition,
         )
 
     async def record_signed_upload_metadata(
@@ -267,10 +217,9 @@ class FileStorageService:
         (existing behaviour for non-solution writes).
         """
         if location == "workspace":
-            await self._file_ops.record_signed_upload_metadata(
-                path,
-                updated_by=updated_by,
-            )
+            from src.services.file_index_service import FileIndexService
+
+            await FileIndexService(self.db).index_existing_object(path, updated_by=updated_by)
 
         from src.services.file_policy_service import FilePolicyService
 
@@ -279,8 +228,8 @@ class FileStorageService:
         if solution_id is not None:
             organization_id = org_id
         else:
-            organization_id = _scope_to_org_id(location, scope)
-            if organization_id is _SCOPE_SKIP:
+            organization_id = scope_to_org_id(location, scope)
+            if organization_id is SCOPE_SKIP:
                 return
 
         service = FilePolicyService(self.db)
@@ -325,8 +274,8 @@ class FileStorageService:
         if solution_id is not None:
             organization_id = org_id
         else:
-            organization_id = _scope_to_org_id(location, scope)
-            if organization_id is _SCOPE_SKIP:
+            organization_id = scope_to_org_id(location, scope)
+            if organization_id is SCOPE_SKIP:
                 return
 
         service = FilePolicyService(self.db)
@@ -563,7 +512,7 @@ class FileStorageService:
                 if not decorator_info:
                     continue
                 decorator_name, kwargs = decorator_info
-                if decorator_name in ("workflow", "tool", "data_provider"):
+                if decorator_name in ("workflow", "tool", "data_provider", "service"):
                     func_name = node.name
                     new_function_names.add(func_name)
                     display_name = kwargs.get("name") or func_name
@@ -572,6 +521,8 @@ class FileStorageService:
                         dtype = "tool"
                     elif decorator_name == "data_provider":
                         dtype = "data_provider"
+                    elif decorator_name == "service":
+                        dtype = "service"
                     else:
                         dtype = "workflow"
                     new_decorator_info[func_name] = (dtype, display_name)

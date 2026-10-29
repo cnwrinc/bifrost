@@ -8,9 +8,11 @@ This service is query-time (not precomputed) since the dependency canvas
 is rarely accessed and complexity is bounded by the depth limit.
 """
 
+from __future__ import annotations
+
 import logging
 from collections import deque
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from sqlalchemy import select
@@ -22,9 +24,13 @@ from src.models.orm import (
     AgentTool,
     Application,
     Form,
+    FormField,
     Workflow,
 )
 from src.models.orm.file_index import FileIndex
+
+if TYPE_CHECKING:
+    from src.services.authorization.enforce import Caller
 
 logger = logging.getLogger(__name__)
 
@@ -157,8 +163,18 @@ class DependencyGraphService:
     in both directions (uses/used_by) up to a configurable depth.
     """
 
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, *, caller: Caller | None = None):
         self.db = db
+        self.caller = caller
+
+    def _in_original_reach(self, statement, model):
+        """Apply the original caller's reach before a graph row is exposed."""
+        if self.caller is None:
+            return statement
+        from src.services.authorization.enforce import user_reach
+
+        predicate = user_reach(self.caller).where(model.organization_id)
+        return statement if predicate is None else statement.where(predicate)
 
     async def _build_workflow_lookup(self) -> dict[str, UUID]:
         """Build lookup mapping any ref format -> workflow UUID.
@@ -166,8 +182,12 @@ class DependencyGraphService:
         Handles: UUID string, workflow name, path::function_name portable ref
         """
         result = await self.db.execute(
-            select(Workflow.id, Workflow.name, Workflow.path, Workflow.function_name)
-            .where(Workflow.is_active.is_(True))
+            self._in_original_reach(
+                select(
+                    Workflow.id, Workflow.name, Workflow.path, Workflow.function_name
+                ).where(Workflow.is_active.is_(True)),
+                Workflow,
+            )
         )
         lookup: dict[str, UUID] = {}
         for wf_id, wf_name, wf_path, wf_fn_name in result.all():
@@ -228,7 +248,13 @@ class DependencyGraphService:
             for dep_type, dep_id, relationship in dependencies:
                 dep_key = f"{dep_type}:{dep_id}"
 
-                # Add edge
+                dependency_node = await self._fetch_entity_node(dep_type, dep_id)
+                if dependency_node is None:
+                    continue
+
+                # An edge is visible only when both endpoint rows passed the SQL
+                # reach gate. Do this before adding it to avoid leaking a hidden
+                # dependency identifier through graph topology.
                 if relationship == "uses":
                     graph.add_edge(node_key, dep_key, "uses")
                 else:  # used_by
@@ -248,6 +274,9 @@ class DependencyGraphService:
         """Check if an application uses a specific workflow by scanning file_index."""
         from src.services.app_dependencies import parse_dependencies
 
+        if not app.repo_path:
+            return False
+
         prefix = app.repo_prefix
         result = await self.db.execute(
             select(FileIndex.content).where(
@@ -258,7 +287,9 @@ class DependencyGraphService:
 
         # Build portable ref for the target workflow
         wf_meta = await self.db.execute(
-            select(Workflow.path, Workflow.function_name).where(Workflow.id == workflow_id)
+            select(Workflow.path, Workflow.function_name, Workflow.name).where(
+                Workflow.id == workflow_id
+            )
         )
         row = wf_meta.one_or_none()
         portable_ref = f"{row[0]}::{row[1]}" if row and row[0] and row[1] else None
@@ -266,7 +297,11 @@ class DependencyGraphService:
         for (content,) in result.all():
             if content:
                 refs = parse_dependencies(content)
-                if wf_id_str in refs or (portable_ref and portable_ref in refs):
+                if (
+                    wf_id_str in refs
+                    or (portable_ref and portable_ref in refs)
+                    or (row and row[2] in refs)
+                ):
                     return True
         return False
 
@@ -277,9 +312,9 @@ class DependencyGraphService:
     ) -> GraphNode | None:
         """Fetch entity details and create a GraphNode."""
         if entity_type == "workflow":
-            result = await self.db.execute(
-                select(Workflow).where(Workflow.id == entity_id)
-            )
+            result = await self.db.execute(self._in_original_reach(
+                select(Workflow).where(Workflow.id == entity_id), Workflow
+            ))
             entity = result.scalar_one_or_none()
             if entity:
                 return GraphNode(
@@ -290,9 +325,9 @@ class DependencyGraphService:
                 )
 
         elif entity_type == "form":
-            result = await self.db.execute(
-                select(Form).where(Form.id == entity_id)
-            )
+            result = await self.db.execute(self._in_original_reach(
+                select(Form).where(Form.id == entity_id), Form
+            ))
             entity = result.scalar_one_or_none()
             if entity:
                 return GraphNode(
@@ -303,9 +338,9 @@ class DependencyGraphService:
                 )
 
         elif entity_type == "app":
-            result = await self.db.execute(
-                select(Application).where(Application.id == entity_id)
-            )
+            result = await self.db.execute(self._in_original_reach(
+                select(Application).where(Application.id == entity_id), Application
+            ))
             entity = result.scalar_one_or_none()
             if entity:
                 return GraphNode(
@@ -316,9 +351,9 @@ class DependencyGraphService:
                 )
 
         elif entity_type == "agent":
-            result = await self.db.execute(
-                select(Agent).where(Agent.id == entity_id)
-            )
+            result = await self.db.execute(self._in_original_reach(
+                select(Agent).where(Agent.id == entity_id), Agent
+            ))
             entity = result.scalar_one_or_none()
             if entity:
                 return GraphNode(
@@ -346,31 +381,50 @@ class DependencyGraphService:
         if entity_type == "workflow":
             # Workflows are USED BY forms, apps, and agents
             # Query entities directly for reverse lookups
+            workflow_lookup = await self._build_workflow_lookup()
 
             # Check forms that reference this workflow
             forms_result = await self.db.execute(
-                select(Form.id).where(
-                    Form.is_active.is_(True),
-                    (
-                        (Form.workflow_id == str(entity_id))
-                        | (Form.launch_workflow_id == str(entity_id))
+                self._in_original_reach(
+                    select(Form.id, Form.workflow_id, Form.launch_workflow_id).where(
+                        Form.is_active.is_(True)
                     ),
+                    Form,
                 )
             )
-            for form_id in forms_result.scalars().all():
+            for form_id, workflow_ref, launch_ref in forms_result.all():
+                for ref in (workflow_ref, launch_ref):
+                    if ref and workflow_lookup.get(str(ref)) == entity_id:
+                        dependencies.append(("form", form_id, "used_by"))
+                        break
+
+            field_result = await self.db.execute(
+                self._in_original_reach(
+                    select(FormField.form_id)
+                    .join(Form, Form.id == FormField.form_id)
+                    .where(FormField.data_provider_id == entity_id),
+                    Form,
+                )
+            )
+            for form_id in field_result.scalars().all():
                 dependencies.append(("form", form_id, "used_by"))
 
             # Check apps that might reference this workflow (via code file dependencies)
             # This is expensive but dependency graph is rarely called
-            apps_result = await self.db.execute(select(Application))
+            apps_result = await self.db.execute(
+                self._in_original_reach(select(Application), Application)
+            )
             for app in apps_result.scalars().all():
                 if await self._app_uses_workflow(app, entity_id):
                     dependencies.append(("app", app.id, "used_by"))
 
             # Check agents directly (via agent_tools)
             result = await self.db.execute(
-                select(AgentTool.agent_id).where(
-                    AgentTool.workflow_id == entity_id
+                self._in_original_reach(
+                    select(AgentTool.agent_id)
+                    .join(Agent, Agent.id == AgentTool.agent_id)
+                    .where(AgentTool.workflow_id == entity_id),
+                    Agent,
                 )
             )
             agent_ids = result.scalars().all()
@@ -380,29 +434,27 @@ class DependencyGraphService:
         elif entity_type == "form":
             # Forms USE workflows
             result = await self.db.execute(
-                select(Form)
-                .options(selectinload(Form.fields))
-                .where(Form.id == entity_id)
+                self._in_original_reach(
+                    select(Form)
+                    .options(selectinload(Form.fields))
+                    .where(Form.id == entity_id),
+                    Form,
+                )
             )
             form = result.scalar_one_or_none()
             if form:
+                workflow_lookup = await self._build_workflow_lookup()
                 # Main workflow
                 if form.workflow_id:
-                    try:
-                        wf_id = UUID(form.workflow_id)
+                    wf_id = workflow_lookup.get(str(form.workflow_id))
+                    if wf_id:
                         dependencies.append(("workflow", wf_id, "uses"))
-                    except ValueError as e:
-                        # Non-UUID portable ref — skip
-                        logger.debug(f"form.workflow_id not a UUID, skipping: {e}")
 
                 # Launch workflow
                 if form.launch_workflow_id:
-                    try:
-                        wf_id = UUID(form.launch_workflow_id)
+                    wf_id = workflow_lookup.get(str(form.launch_workflow_id))
+                    if wf_id:
                         dependencies.append(("workflow", wf_id, "uses"))
-                    except ValueError as e:
-                        # Non-UUID portable ref — skip
-                        logger.debug(f"form.launch_workflow_id not a UUID, skipping: {e}")
 
                 # Data provider workflows from fields
                 for field in form.fields:
@@ -417,10 +469,12 @@ class DependencyGraphService:
             from src.services.app_dependencies import parse_dependencies
 
             app_result = await self.db.execute(
-                select(Application).where(Application.id == entity_id)
+                self._in_original_reach(
+                    select(Application).where(Application.id == entity_id), Application
+                )
             )
             app = app_result.scalar_one_or_none()
-            if app:
+            if app and app.repo_path:
                 prefix = app.repo_prefix
                 fi_result = await self.db.execute(
                     select(FileIndex.content).where(
@@ -442,8 +496,11 @@ class DependencyGraphService:
         elif entity_type == "agent":
             # Agents USE workflows (via agent_tools)
             result = await self.db.execute(
-                select(AgentTool.workflow_id).where(
-                    AgentTool.agent_id == entity_id
+                self._in_original_reach(
+                    select(AgentTool.workflow_id)
+                    .join(Agent, Agent.id == AgentTool.agent_id)
+                    .where(AgentTool.agent_id == entity_id),
+                    Agent,
                 )
             )
             workflow_ids = result.scalars().all()
@@ -460,3 +517,147 @@ class DependencyGraphService:
                 unique_deps.append(dep)
 
         return unique_deps
+
+
+async def compute_relationship_availability(
+    db: AsyncSession,
+    *,
+    caller: Caller | None = None,
+    workflow_ids: list[UUID] | None = None,
+    form_ids: list[UUID] | None = None,
+    agent_ids: list[UUID] | None = None,
+    app_ids: list[UUID] | None = None,
+) -> dict[str, bool]:
+    """Return whether each requested entity has at least one graph relationship.
+
+    This mirrors the persisted relationship sources used by
+    DependencyGraphService without running one graph query per row.
+    """
+    from sqlalchemy import or_
+    from src.services.app_dependencies import parse_dependencies
+
+    workflow_ids = workflow_ids or []
+    form_ids = form_ids or []
+    agent_ids = agent_ids or []
+    app_ids = app_ids or []
+
+    requested_workflows = set(workflow_ids)
+    requested_forms = set(form_ids)
+    requested_agents = set(agent_ids)
+    requested_apps = set(app_ids)
+    availability: dict[str, bool] = {
+        **{f"workflow:{workflow_id}": False for workflow_id in requested_workflows},
+        **{f"form:{form_id}": False for form_id in requested_forms},
+        **{f"agent:{agent_id}": False for agent_id in requested_agents},
+        **{f"app:{app_id}": False for app_id in requested_apps},
+    }
+    if not availability:
+        return {}
+
+    if caller is not None:
+        service = DependencyGraphService(db, caller=caller)
+        for entity_type, entity_ids in (
+            ("workflow", requested_workflows),
+            ("form", requested_forms),
+            ("agent", requested_agents),
+            ("app", requested_apps),
+        ):
+            for entity_id in entity_ids:
+                graph = await service.build_graph(entity_type, entity_id)
+                availability[f"{entity_type}:{entity_id}"] = bool(graph.edges)
+        return availability
+
+    lookup = await DependencyGraphService(db)._build_workflow_lookup()
+
+    def resolve_workflow_ref(ref: object) -> UUID | None:
+        if ref is None:
+            return None
+        if isinstance(ref, UUID):
+            return ref
+        return lookup.get(str(ref))
+
+    if requested_forms or requested_workflows:
+        form_query = select(Form.id, Form.workflow_id, Form.launch_workflow_id).where(
+            Form.is_active.is_(True)
+        )
+        if requested_forms and not requested_workflows:
+            form_query = form_query.where(Form.id.in_(requested_forms))
+        form_result = await db.execute(form_query)
+        for form_id, workflow_ref, launch_ref in form_result.all():
+            for ref in (workflow_ref, launch_ref):
+                workflow_id = resolve_workflow_ref(ref)
+                if workflow_id is None:
+                    continue
+                if form_id in requested_forms:
+                    availability[f"form:{form_id}"] = True
+                if workflow_id in requested_workflows:
+                    availability[f"workflow:{workflow_id}"] = True
+
+        field_query = select(FormField.form_id, FormField.data_provider_id).where(
+            FormField.data_provider_id.isnot(None)
+        )
+        if requested_forms and not requested_workflows:
+            field_query = field_query.where(FormField.form_id.in_(requested_forms))
+        field_result = await db.execute(field_query)
+        for form_id, workflow_ref in field_result.all():
+            workflow_id = resolve_workflow_ref(workflow_ref)
+            if workflow_id is None:
+                continue
+            if form_id in requested_forms:
+                availability[f"form:{form_id}"] = True
+            if workflow_id in requested_workflows:
+                availability[f"workflow:{workflow_id}"] = True
+
+    if requested_agents or requested_workflows:
+        tool_query = select(AgentTool.agent_id, AgentTool.workflow_id)
+        predicates = []
+        if requested_agents:
+            predicates.append(AgentTool.agent_id.in_(requested_agents))
+        if requested_workflows:
+            predicates.append(AgentTool.workflow_id.in_(requested_workflows))
+        if predicates:
+            tool_query = tool_query.where(
+                predicates[0] if len(predicates) == 1 else predicates[0] | predicates[1]
+            )
+        tool_result = await db.execute(tool_query)
+        for agent_id, workflow_id in tool_result.all():
+            if agent_id in requested_agents:
+                availability[f"agent:{agent_id}"] = True
+            if workflow_id in requested_workflows:
+                availability[f"workflow:{workflow_id}"] = True
+
+    if requested_apps or requested_workflows:
+        app_query = select(Application.id, Application.repo_path)
+        if requested_apps and not requested_workflows:
+            app_query = app_query.where(Application.id.in_(requested_apps))
+        apps_result = await db.execute(app_query)
+        app_prefixes = {
+            app_id: f"{repo_path.rstrip('/')}/"
+            for app_id, repo_path in apps_result.all()
+            if repo_path
+        }
+        if app_prefixes:
+            file_predicates = [
+                FileIndex.path.startswith(prefix) for prefix in app_prefixes.values()
+            ]
+            files_result = await db.execute(
+                select(FileIndex.path, FileIndex.content).where(or_(*file_predicates))
+            )
+            refs_by_app: dict[UUID, set[str]] = {
+                app_id: set() for app_id in app_prefixes
+            }
+            for path, content in files_result.all():
+                if not content:
+                    continue
+                for app_id, prefix in app_prefixes.items():
+                    if path.startswith(prefix):
+                        refs_by_app[app_id].update(parse_dependencies(content))
+                        break
+            for app_id, refs in refs_by_app.items():
+                matched_workflows = {lookup[ref] for ref in refs if ref in lookup}
+                if app_id in requested_apps and matched_workflows:
+                    availability[f"app:{app_id}"] = True
+                for workflow_id in matched_workflows & requested_workflows:
+                    availability[f"workflow:{workflow_id}"] = True
+
+    return availability

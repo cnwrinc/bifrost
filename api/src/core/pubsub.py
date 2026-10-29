@@ -21,14 +21,57 @@ from uuid import UUID
 if TYPE_CHECKING:
     from fastapi import WebSocket
 
+    from src.models.contracts.agents import ChatStreamChunk
     from src.models.orm.agent_runs import AgentRun
 
 from src.config import get_settings
+from src.core.cache.keys import (
+    chat_run_events_stream_key,
+    chat_run_events_version_key,
+)
 from src.core.cache.redis_client import get_redis
 from src.core.log_safety import log_safe
 from src.core.redis_reconnect import ResilientPubSubListener
 
 logger = logging.getLogger(__name__)
+
+
+def service_channel_for_log(channel: str, data: Any) -> str | None:
+    """Service-wide channel for an attempt-scoped log pubsub message.
+
+    Children publish to ``service-logs:{attempt_id}``; the Services UI
+    subscribes per service (``service:{service_id}``), so the API fans
+    each line out to its service channel. Returns None for anything that
+    is not a service log line (no bridge, no re-publish).
+    """
+    if not channel.startswith("service-logs:"):
+        return None
+    if not isinstance(data, dict):
+        return None
+    service_id = data.get("service_id")
+    if not service_id:
+        return None
+    return f"service:{service_id}"
+
+
+_PUBLISH_CHAT_RUN_EVENT_SCRIPT = """
+local sequence = redis.call('INCR', KEYS[2])
+local envelope = cjson.decode(ARGV[1])
+envelope['sequence'] = sequence
+local encoded = cjson.encode(envelope)
+redis.call(
+    'XADD', KEYS[1], 'MAXLEN', '~', ARGV[2], '*',
+    'event', encoded,
+    'sequence', tostring(sequence),
+    'kind', ARGV[3],
+    'status', ARGV[4],
+    'occurred_at', ARGV[5]
+)
+redis.call('EXPIRE', KEYS[1], ARGV[6])
+redis.call('EXPIRE', KEYS[2], ARGV[6])
+redis.call('PUBLISH', ARGV[7], encoded)
+return encoded
+"""
 
 
 @dataclass
@@ -55,6 +98,8 @@ class ConnectionManager:
             websocket: FastAPI WebSocket connection
             channels: List of channels to subscribe to
         """
+        if getattr(websocket, "_delivery_dispatcher", None) is None:
+            raise RuntimeError("WebSocket connection lacks delivery authorization")
         await websocket.accept()
 
         # Ensure Redis listener is running for cross-container messages
@@ -94,6 +139,19 @@ class ConnectionManager:
         if not published:
             await self._send_local(channel, message)
 
+    async def _bridge_service_log(self, channel: str, data: Any) -> None:
+        """Fan one attempt-scoped log line out to its service channel.
+
+        Delivered locally only: EVERY API instance pattern-receives the
+        original pubsub message, so each instance serves its own
+        subscribers exactly once with no extra Redis hop. (Re-publishing
+        here would duplicate every line once per API instance.) A
+        different channel name means bridged lines never re-bridge.
+        """
+        service_channel = service_channel_for_log(channel, data)
+        if service_channel is not None:
+            await self._send_local(service_channel, data)
+
     async def _send_local(self, channel: str, message: dict[str, Any]) -> None:
         """Send message to local WebSocket connections.
 
@@ -106,25 +164,12 @@ class ConnectionManager:
             return
 
         dead_connections = set()
-        is_table_channel = channel.startswith("table:")
-        is_file_channel = channel.startswith("files:")
-        message_json = json.dumps(message) if not (is_table_channel or is_file_channel) else None
-
         for websocket in self.connections[channel]:
             try:
-                if is_table_channel:
-                    dispatcher = getattr(websocket, "_table_dispatcher", None)
-                    if dispatcher is None:
-                        continue
-                    await dispatcher(channel, message)
-                elif is_file_channel:
-                    dispatcher = getattr(websocket, "_file_dispatcher", None)
-                    if dispatcher is None:
-                        continue
-                    await dispatcher(channel, message)
-                else:
-                    assert message_json is not None
-                    await websocket.send_text(message_json)
+                dispatcher = getattr(websocket, "_delivery_dispatcher", None)
+                if dispatcher is None:
+                    raise RuntimeError("WebSocket connection lacks delivery authorization")
+                await dispatcher(channel, message)
             except Exception:
                 dead_connections.add(websocket)
 
@@ -162,6 +207,7 @@ class ConnectionManager:
                 # Strip "bifrost:" prefix from channel
                 local_channel = channel.replace("bifrost:", "")
                 await self._send_local(local_channel, data)
+                await self._bridge_service_log(local_channel, data)
 
             self._pubsub_listener = ResilientPubSubListener(
                 redis_url=settings.redis_url,
@@ -301,7 +347,7 @@ async def publish_agent_run_update(
     message = {
         "type": "agent_run_update",
         "run_id": str(run.id),
-        "agent_id": str(run.agent_id),
+        "agent_id": str(run.agent_id) if run.agent_id else None,
         "agent_name": agent_name,
         "status": run.status,
         "trigger_type": run.trigger_type,
@@ -359,6 +405,110 @@ async def publish_agent_run_step(
     await manager.broadcast(f"agent-run:{run_id}", message)
 
 
+def serialize_chat_stream_chunk(chunk: ChatStreamChunk) -> dict[str, Any]:
+    """Serialize a sparse chunk without altering nested contract payloads."""
+    payload = chunk.model_dump(mode="json")
+    return {
+        field: value
+        for field, value in payload.items()
+        if value is not None or field in chunk.model_fields_set
+    }
+
+
+async def publish_chat_run_event(
+    conversation_id: str | UUID,
+    run_id: str | UUID,
+    kind: str,
+    status: str,
+    payload: ChatStreamChunk,
+) -> dict[str, Any]:
+    """Publish a versioned, replayable chat run event."""
+    from uuid import uuid4
+
+    from src.services.chat_errors import public_chat_error_message
+
+    event_id = uuid4()
+    occurred_at = datetime.now(timezone.utc)
+    conversation_id_str = str(conversation_id)
+    run_id_str = str(run_id)
+    chunk = payload
+    if chunk.type == "error":
+        chunk = chunk.model_copy(
+            update={"error": public_chat_error_message(chunk.run_status or status)}
+        )
+    envelope: dict[str, Any] = {
+        "type": "chat_run_event",
+        "protocol_version": 1,
+        "event_id": str(event_id),
+        "sequence": 0,
+        "conversation_id": conversation_id_str,
+        "run_id": run_id_str,
+        "occurred_at": occurred_at.isoformat(),
+        "kind": kind,
+        "status": status,
+        "payload": serialize_chat_stream_chunk(chunk),
+    }
+
+    stream_key = chat_run_events_stream_key(conversation_id_str)
+    version_key = chat_run_events_version_key(conversation_id_str)
+
+    async with get_redis() as redis:
+        encoded = await redis.eval(  # type: ignore[misc]
+            _PUBLISH_CHAT_RUN_EVENT_SCRIPT,
+            2,
+            stream_key,
+            version_key,
+            json.dumps(envelope),
+            "20000",
+            kind,
+            status,
+            occurred_at.isoformat(),
+            "86400",
+            f"bifrost:chat:{conversation_id_str}",
+        )
+
+    if isinstance(encoded, bytes):
+        encoded = encoded.decode()
+    return json.loads(encoded)
+
+
+async def replay_chat_run_events(
+    conversation_id: str | UUID,
+    *,
+    after_sequence: int | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Replay retained chat run events from the Redis stream."""
+    from src.services.chat_errors import public_chat_error_message
+
+    conversation_id_str = str(conversation_id)
+    stream_key = chat_run_events_stream_key(conversation_id_str)
+    events: list[dict[str, Any]] = []
+    async with get_redis() as redis:
+        entries = await redis.xrange(stream_key, min="-", max="+")
+    for _entry_id, data in entries:
+        raw = data.get("event")
+        if not raw:
+            continue
+        event = json.loads(raw)
+        payload = event.get("payload")
+        if isinstance(payload, dict) and payload.get("type") == "error":
+            event["payload"] = {
+                **payload,
+                "error": public_chat_error_message(
+                    payload.get("run_status") or event.get("status")
+                ),
+            }
+        sequence = int(event.get("sequence") or data.get("sequence") or 0)
+        if after_sequence is not None and sequence <= after_sequence:
+            continue
+        events.append(event)
+    events.sort(key=lambda item: int(item.get("sequence") or 0))
+    if len(events) > limit:
+        events = events[-limit:]
+    return events
+
+
 async def publish_user_notification(
     user_id: str | UUID,
     notification_type: str,
@@ -384,75 +534,6 @@ async def publish_user_notification(
         **(data or {})
     }
     await manager.broadcast(f"user:{user_id}", notification)
-
-
-async def publish_system_event(
-    event_type: str,
-    data: dict[str, Any]
-) -> None:
-    """
-    Publish system-wide event.
-
-    Args:
-        event_type: Event type
-        data: Event data
-    """
-    event = {
-        "type": "system_event",
-        "eventType": event_type,
-        **data
-    }
-    await manager.broadcast("system", event)
-
-
-# =============================================================================
-# Local Runner Pub/Sub (CLI<->Web Communication)
-# =============================================================================
-
-
-async def publish_local_runner_state_update(
-    user_id: str | UUID,
-    state: dict[str, Any] | None,
-) -> None:
-    """
-    Publish local runner state update.
-
-    Notifies the web UI when CLI registers workflows or state changes.
-
-    Args:
-        user_id: User ID
-        state: Current local runner state (None if no active session)
-    """
-    message = {
-        "type": "local_runner_state_update",
-        "state": state,
-    }
-    await manager.broadcast(f"local-runner:{user_id}", message)
-
-
-async def publish_cli_session_update(
-    user_id: str | UUID,
-    session_id: str,
-    state: dict[str, Any] | None,
-) -> None:
-    """
-    Publish CLI session state update.
-
-    Notifies the web UI when CLI session state changes.
-
-    Args:
-        user_id: User ID
-        session_id: CLI session ID
-        state: Current CLI session state (None if session deleted)
-    """
-    message = {
-        "type": "cli_session_update",
-        "session_id": session_id,
-        "state": state,
-    }
-    # Broadcast to both session-specific and user-level channels
-    await manager.broadcast(f"cli-session:{session_id}", message)
-    await manager.broadcast(f"cli-sessions:{user_id}", message)
 
 
 # =============================================================================
@@ -579,165 +660,6 @@ async def publish_app_published(
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     await manager.broadcast(channel, message)
-
-
-# =============================================================================
-# Git Desktop Operations
-# =============================================================================
-
-
-async def publish_git_operation(
-    job_id: str,
-    org_id: str,
-    user_id: str,
-    user_email: str,
-    op_type: str,
-    **kwargs: Any,
-) -> str:
-    """
-    Queue a durable git desktop operation for any scheduler replica.
-
-    Args:
-        job_id: Unique job ID for tracking
-        org_id: Organization ID
-        user_id: User who initiated the operation
-        user_email: Email of the user
-        op_type: Operation type (git_fetch, git_commit, git_pull, git_push, git_status, git_resolve, git_diff)
-        **kwargs: Additional operation-specific data
-    """
-    from uuid import UUID, uuid4
-
-    from src.core.database import get_db_context
-    from src.jobs.platform.git_operation import (
-        GIT_OPERATION_DEFINITION,
-        GitOperationPayload,
-    )
-    from src.services.platform_jobs import enqueue_platform_job, publish_platform_job_update
-
-    try:
-        resolved_job_id = UUID(job_id)
-    except ValueError:
-        resolved_job_id = uuid4()
-    organization_id = UUID(org_id) if org_id else None
-    async with get_db_context() as db:
-        job, _ = await enqueue_platform_job(
-            db,
-            GIT_OPERATION_DEFINITION,
-            GitOperationPayload(
-                operation=op_type,
-                organization_id=organization_id,
-                options=kwargs,
-            ),
-            dedupe_key=str(resolved_job_id),
-            resource_lock_key="workspace",
-            priority=500,
-            organization_id=organization_id,
-            requested_by_user_id=user_id,
-            requested_by_email=user_email,
-            requested_by_name=user_email,
-            resource_type="workspace",
-            resource_id="git",
-            title=op_type.replace("_", " ").title(),
-            action_url="/git",
-            job_id=resolved_job_id,
-        )
-        await db.commit()
-    await publish_platform_job_update(job)
-    return str(job.id)
-
-
-async def publish_git_progress(
-    job_id: str,
-    phase: str,
-    current: int = 0,
-    total: int = 0,
-) -> None:
-    """
-    Publish a git operation progress update to the frontend.
-
-    Args:
-        job_id: Unique job ID (matches the job that triggered the operation)
-        phase: Human-readable phase string (e.g. "Fetching remote...")
-        current: Current entity index (1-based) for progress percentage
-        total: Total entities to import
-    """
-    message: dict[str, Any] = {
-        "type": "git_progress",
-        "jobId": job_id,
-        "phase": phase,
-        "current": current,
-        "total": total,
-    }
-    await manager.broadcast(f"git:{job_id}", message)
-
-
-async def publish_git_op_completed(
-    job_id: str,
-    status: str,
-    result_type: str,
-    data: dict[str, Any] | None = None,
-    error: str | None = None,
-    preview: dict[str, Any] | None = None,
-    pulled: int = 0,
-    pushed: int = 0,
-    commit_sha: str | None = None,
-    conflicts: list[dict[str, Any]] | None = None,
-) -> None:
-    """
-    Publish git operation completion.
-
-    Broadcasts to git:{job_id} channel with the result.
-    Also stores in Redis for HTTP polling (5-minute TTL).
-
-    Args:
-        job_id: Unique job ID
-        status: Completion status (success, failed, conflict)
-        result_type: Which operation completed (fetch, commit, pull, push, status, resolve, diff)
-        data: Result data dict
-        error: Error message if failed
-        preview: Sync preview data (for sync_preview ops, consumed by CLI)
-        pulled: Number of files pulled (for sync_execute ops)
-        pushed: Number of files pushed (for sync_execute ops)
-        commit_sha: Commit SHA if created (for sync_execute ops)
-        conflicts: List of merge conflict dicts (for sync ops with conflicts)
-    """
-    completion_message: dict[str, Any] = {
-        "type": "git_op_complete",
-        "jobId": job_id,
-        "status": status,
-        "resultType": result_type,
-    }
-    if data is not None:
-        completion_message["data"] = data
-    if error is not None:
-        completion_message["error"] = error
-    if preview is not None:
-        completion_message["preview"] = preview
-    if pulled:
-        completion_message["pulled"] = pulled
-    if pushed:
-        completion_message["pushed"] = pushed
-    if commit_sha is not None:
-        completion_message["commit_sha"] = commit_sha
-    if conflicts is not None:
-        completion_message["conflicts"] = conflicts
-
-    await manager.broadcast(f"git:{job_id}", completion_message)
-
-    # Store result in Redis for HTTP polling
-    try:
-        from src.core.redis_client import get_redis_client
-
-        redis_client = get_redis_client()
-        if redis_client:
-            result_key = f"bifrost:job:{job_id}"
-            await redis_client.setex(
-                result_key,
-                300,  # 5 minutes TTL
-                json.dumps(completion_message),
-            )
-    except Exception as e:
-        logger.warning(f"Failed to store job result in Redis: {e}")
 
 
 # =============================================================================
@@ -896,16 +818,12 @@ async def publish_pool_progress(
 async def publish_file_activity(
     user_id: str,
     user_name: str,
-    activity_type: str,  # "file_push" | "file_delete" | "entity_change" | "watch_start" | "watch_stop"
+    activity_type: str,  # "file_push" | "file_delete" | "watch_start" | "watch_stop"
     prefix: str = "",
     file_count: int = 0,
     is_watch: bool = False,
     paths: list[str] | None = None,
     session_id: str | None = None,
-    entity_type: str | None = None,
-    entity_id: str | None = None,
-    action: str | None = None,
-    data: dict | None = None,
 ) -> None:
     """Broadcast file activity to admin-only file-activity channel."""
     payload: dict = {
@@ -921,14 +839,6 @@ async def publish_file_activity(
         payload["paths"] = paths
     if session_id is not None:
         payload["session_id"] = session_id
-    if entity_type is not None:
-        payload["entity_type"] = entity_type
-    if entity_id is not None:
-        payload["entity_id"] = entity_id
-    if action is not None:
-        payload["action"] = action
-    if data is not None:
-        payload["data"] = data
     await manager.broadcast("file-activity", payload)
 
 
@@ -982,6 +892,15 @@ async def publish_policy_changed(table_id: str) -> None:
     """
     channel = f"table:{table_id}"
     await publisher.publish(channel, payload={"type": "policy_changed", "table_id": table_id})
+
+
+async def publish_table_invalidated(table_id: str) -> None:
+    """Notify subscribers to reload table-backed views after a batch mutation."""
+    channel = f"table:{table_id}"
+    await publisher.publish(
+        channel,
+        payload={"type": "table_invalidated", "table_id": table_id},
+    )
 
 
 # =============================================================================

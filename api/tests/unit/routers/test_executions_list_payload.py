@@ -23,15 +23,15 @@ def _summary_row() -> SimpleNamespace:
         started_at=datetime.now(timezone.utc),
         completed_at=datetime.now(timezone.utc),
         scheduled_at=None,
-        session_id=None,
+        created_at=datetime.now(timezone.utc),
     )
 
 
 def test_summary_does_not_access_large_payload_fields() -> None:
     """History serialization must work with result/input columns unloaded."""
-    from src.routers.executions import ExecutionRepository
+    from shared.sdk_execution_reads import to_execution_summary
 
-    summary = ExecutionRepository._to_summary(_summary_row())  # type: ignore[arg-type]
+    summary = to_execution_summary(_summary_row())
 
     assert summary.duration_ms == 118
     assert summary.result_type == "json"
@@ -45,9 +45,9 @@ def test_summary_omits_payload_fields_entirely() -> None:
     summary-vs-detail split explicit for SDK and API consumers.
     """
     from src.models.contracts.executions import ExecutionSummary
-    from src.routers.executions import ExecutionRepository
+    from shared.sdk_execution_reads import to_execution_summary
 
-    summary = ExecutionRepository._to_summary(_summary_row())  # type: ignore[arg-type]
+    summary = to_execution_summary(_summary_row())
 
     assert isinstance(summary, ExecutionSummary)
     payload = summary.model_dump()

@@ -17,6 +17,10 @@ import {
 	type StreamingLog,
 	type ExecutionStatus,
 } from "@/stores/executionStreamStore";
+import {
+	mergeExecutionHistoryPage,
+	type ExecutionHistoryPage,
+} from "@/hooks/executionHistoryCache";
 
 interface UseExecutionStreamOptions {
 	/**
@@ -245,8 +249,8 @@ export function useNewExecutions(options: { enabled?: boolean } = {}) {
  * when new executions are created or existing ones complete.
  *
  * Channel logic:
- * - Platform admins: Subscribe to `history:GLOBAL` (see all executions)
- * - Regular users: Subscribe to `history:user:{userId}` (see only their own)
+ * - Callers with Read All Executions: subscribe to `history:GLOBAL`
+ * - Other callers: subscribe to `history:user:{userId}` for their own runs
  *
  * Org filtering: If a platform admin filters to a specific org, updates are filtered
  * client-side to only show executions from that org.
@@ -255,25 +259,24 @@ export function useExecutionHistory(
 	options: {
 		scope: string;
 		enabled?: boolean;
-		isPlatformAdmin?: boolean;
+		includeOthers?: boolean;
 		userId?: string;
 	} = { scope: "GLOBAL" },
 ) {
-	const { scope, enabled = true, isPlatformAdmin = false, userId } = options;
+	const { scope, enabled = true, includeOthers = false, userId } = options;
 	const [isConnected, setIsConnected] = useState(false);
 	const queryClient = useQueryClient();
 
-	// Determine the channel to subscribe to:
-	// - Platform admins: always history:GLOBAL
-	// - Regular users: history:user:{userId}
-	const channel = isPlatformAdmin
+	// The global stream carries other users' runs. The server authorizes each
+	// delivery using the caller's current authorization and organization reach.
+	const channel = includeOthers
 		? "history:GLOBAL"
 		: userId
 			? `history:user:${userId}`
 			: null;
 
-	// For platform admins with org filter, track which org to filter for
-	const orgFilter = isPlatformAdmin && scope !== "GLOBAL" ? scope : null;
+	// Keep a selected org filter local to the current history query.
+	const orgFilter = includeOthers && scope !== "GLOBAL" ? scope : null;
 
 	useEffect(() => {
 		if (!enabled || !channel) {
@@ -308,12 +311,10 @@ export function useExecutionHistory(
 
 						// Optimistically update ALL executions queries (handles different filters/pages)
 						// Query key is ["get", "/api/executions", { params: ... }]
-						const caches = queryClient.getQueriesData<{
-							executions: Array<Record<string, unknown>>;
-							continuation_token: string | null;
-						}>({
-							queryKey: ["get", "/api/executions"],
-						});
+						const caches =
+							queryClient.getQueriesData<ExecutionHistoryPage>({
+								queryKey: ["get", "/api/executions"],
+							});
 
 						caches.forEach(([queryKey, oldData]) => {
 							// Skip if no data or not an executions list response
@@ -330,6 +331,8 @@ export function useExecutionHistory(
 												status?: string;
 												startDate?: string;
 												endDate?: string;
+												workflowId?: string;
+												workflow_name?: string;
 											};
 										};
 								  }
@@ -340,62 +343,21 @@ export function useExecutionHistory(
 								return;
 							}
 
-							const existingIndex = oldData.executions.findIndex(
-								(exec) =>
-									exec["execution_id"] ===
-									update["execution_id"],
+							const queryParams = params?.params?.query || {};
+							const hasFilters = Boolean(
+								queryParams.status ||
+								queryParams.startDate ||
+								queryParams.endDate ||
+								queryParams.workflowId ||
+								queryParams.workflow_name,
 							);
-
-							if (existingIndex >= 0) {
-								// Update existing execution - React will handle reconciliation via key={execution_id}
-								const newExecutions = [...oldData.executions];
-								newExecutions[existingIndex] = {
-									...newExecutions[existingIndex],
-									status: update.status,
-									// Only update started_at if we have a value (handles Pending -> Running transition)
-									...(update.started_at && {
-										started_at: update.started_at,
-									}),
-									completed_at: update.completed_at,
-									duration_ms: update.duration_ms,
-								};
-
-								queryClient.setQueryData(queryKey, {
-									...oldData,
-									executions: newExecutions,
-								});
-							} else {
-								// New execution - add to beginning of list (only if no filters active)
-								// Check if query has status/date filters that might exclude this execution
-								const queryParams = params?.params?.query || {};
-								const hasFilters =
-									queryParams.status ||
-									queryParams.startDate ||
-									queryParams.endDate;
-
-								if (!hasFilters) {
-									queryClient.setQueryData(queryKey, {
-										...oldData,
-										executions: [
-											{
-												execution_id:
-													update.execution_id,
-												workflow_name:
-													update.workflow_name,
-												status: update.status,
-												executed_by: update.executed_by,
-												executed_by_name:
-													update.executed_by_name,
-												org_id: update.org_id,
-												started_at: update.started_at,
-												completed_at:
-													update.completed_at,
-												duration_ms: update.duration_ms,
-											},
-											...oldData.executions,
-										],
-									});
-								}
+							const nextData = mergeExecutionHistoryPage(
+								oldData,
+								update,
+								!hasFilters,
+							);
+							if (nextData !== oldData) {
+								queryClient.setQueryData(queryKey, nextData);
 							}
 						});
 					},

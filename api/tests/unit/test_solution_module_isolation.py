@@ -4,7 +4,7 @@ Per-execution import root namespaces module RESOLUTION, but Python caches
 imported modules in ``sys.modules`` by bare name (``modules.foo``). Without
 eviction, after Solution A's execution imports ``modules.foo`` from
 ``_solutions/A/...``, a reused worker running Solution B would get A's cached
-``modules.foo`` instead of B's. ``_clear_workspace_modules`` must evict a
+``modules.foo`` instead of B's. ``clear_workspace_modules`` must evict a
 solution-rooted module when the active solution differs from the one that
 loaded it.
 """
@@ -19,7 +19,24 @@ import pytest
 pytestmark = pytest.mark.e2e
 
 
-def _fake_solution_module(name: str, rel_path: str, content_hash: str):
+@pytest.fixture(autouse=True)
+def _restore_virtual_import_hook():
+    """Importing worker installs the production hook; do not leak it to later tests."""
+    from src.services.execution import virtual_import
+
+    meta_path_before = list(sys.meta_path)
+    finder_before = virtual_import._finder
+    yield
+    sys.meta_path[:] = meta_path_before
+    virtual_import._finder = finder_before
+
+
+def _fake_solution_module(
+    name: str,
+    rel_path: str,
+    content_hash: str,
+    storage_path: str,
+):
     """A module object as VirtualModuleLoader ACTUALLY creates it: __file__ is the
     BARE relative path (e.g. 'modules/foo.py'), NOT a _solutions/{id}/-rooted one.
     (An earlier version of this fixture used a fictional _solutions/-rooted
@@ -31,6 +48,7 @@ def _fake_solution_module(name: str, rel_path: str, content_hash: str):
     m = types.ModuleType(name)
     m.__file__ = rel_path
     m.__content_hash__ = content_hash  # type: ignore[attr-defined]  # dynamic attr the loader sets
+    m.__storage_path__ = storage_path  # type: ignore[attr-defined]
     # A minimal loader instance of the right type (only isinstance is checked).
     m.__loader__ = VirtualModuleLoader.__new__(VirtualModuleLoader)
     return m
@@ -46,23 +64,30 @@ def _clean_sys_modules():
 
 def test_switching_solution_evicts_other_solutions_module(_clean_sys_modules, monkeypatch):
     import src.core.module_cache_sync as mcs
-    import src.services.execution.simple_worker as sw
+    from src.services.execution.workspace_modules import clear_workspace_modules
 
     sid_b = str(uuid.uuid4())
 
-    # Solution A imported modules.foo (bare __file__, as the loader produces).
-    sys.modules["modules.foo"] = _fake_solution_module("modules.foo", "modules/foo.py", "hashA")
-
-    # The module index is _repo/-keyed and doesn't know solution module paths, so
-    # name_to_path can't map modules.foo → the eviction's "can't map a name to a
-    # file path → clear to be safe" branch fires. THIS is the real isolation
-    # mechanism (not the removed _solutions/-prefix block). Stub an empty index.
-    monkeypatch.setattr(mcs, "get_module_index_sync", lambda: [])
+    sid_a = str(uuid.uuid4())
+    sys.modules["modules.foo"] = _fake_solution_module(
+        "modules.foo",
+        "modules/foo.py",
+        "same-hash",
+        f"_solutions/{sid_a}/modules/foo.py",
+    )
+    monkeypatch.setattr(
+        mcs,
+        "get_module_sync",
+        lambda _p: {
+            "hash": "same-hash",
+            "storage_path": f"_solutions/{sid_b}/modules/foo.py",
+        },
+    )
 
     # Now Solution B is the active execution.
     mcs.set_solution_context(sid_b, global_repo_access=False)
     try:
-        sw._clear_workspace_modules()
+        clear_workspace_modules()
     finally:
         mcs._solution_ctx.value = None
 
@@ -74,20 +99,25 @@ def test_switching_solution_evicts_other_solutions_module(_clean_sys_modules, mo
 
 def test_same_solution_keeps_its_module(_clean_sys_modules, monkeypatch):
     import src.core.module_cache_sync as mcs
-    import src.services.execution.simple_worker as sw
+    from src.services.execution.workspace_modules import clear_workspace_modules
 
     sid = str(uuid.uuid4())
-    sys.modules["modules.foo"] = _fake_solution_module("modules.foo", "modules/foo.py", "hashA")
-    # Index maps the name to its path AND the cached hash MATCHES → the
-    # content-change sweep KEEPS it (unchanged content isn't re-exec'd). This is
-    # the perf path: a module the index knows and whose content is unchanged
-    # survives, so the next import is a no-op.
-    monkeypatch.setattr(mcs, "get_module_index_sync", lambda: ["modules/foo.py"])
-    monkeypatch.setattr(mcs, "get_module_sync", lambda _p: {"hash": "hashA"})
+    storage_path = f"_solutions/{sid}/modules/foo.py"
+    sys.modules["modules.foo"] = _fake_solution_module(
+        "modules.foo",
+        "modules/foo.py",
+        "hashA",
+        storage_path,
+    )
+    monkeypatch.setattr(
+        mcs,
+        "get_module_sync",
+        lambda _p: {"hash": "hashA", "storage_path": storage_path},
+    )
 
     mcs.set_solution_context(sid, global_repo_access=False)
     try:
-        sw._clear_workspace_modules()
+        clear_workspace_modules()
     finally:
         mcs._solution_ctx.value = None
 
@@ -95,52 +125,80 @@ def test_same_solution_keeps_its_module(_clean_sys_modules, monkeypatch):
     assert "modules.foo" in sys.modules
 
 
-async def test_execute_async_sets_solution_context_before_clearing_modules(monkeypatch):
-    """Codex #9: the persistent-worker path must activate the execution's
-    Solution context BEFORE evicting workspace modules, or the cross-solution
-    eviction runs blind and a prior install's same-name module survives. Assert
-    set_solution_context runs before _clear_workspace_modules, with the context's
-    own solution_id."""
+async def test_execute_async_delegates_once_to_shared_execution_core(monkeypatch):
+    """The fork adapter delegates once; the shared core owns execution setup."""
     import src.services.execution.simple_worker as sw
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    context: dict[str, object] = {"solution_id": str(uuid.uuid4())}
+
+    async def _fake_run(_eid, _ctx):
+        calls.append((_eid, _ctx))
+        return {"status": "Success", "result": {}, "metrics": {}}
+
+    monkeypatch.setattr(sw, "_get_pss_bytes", lambda: 0)
+    import src.services.execution.worker as worker_mod
+    monkeypatch.setattr(worker_mod, "run_execution", _fake_run)
+
+    await sw._execute_async("exec-1", "worker-1", context)
+
+    assert calls == [("exec-1", context)]
+
+
+async def test_run_execution_refreshes_modules_and_clears_context_on_failure(monkeypatch):
+    """The shared core refreshes modules and cleans up when refresh fails."""
     import src.core.module_cache_sync as mcs
+    import src.services.execution.worker as worker
 
     sid = str(uuid.uuid4())
     calls: list[tuple[str, object]] = []
 
-    async def _fake_read_context(_eid):
-        return {"solution_id": sid, "solution_global_repo_access": False}
+    monkeypatch.setattr(worker, "_set_process_engine_credentials", lambda _ctx: True)
+    monkeypatch.setattr(worker, "_get_resource_usage", lambda: (0, 0.0, 0.0))
+    monkeypatch.setattr(worker, "_capture_metrics", lambda *_args: types.SimpleNamespace(
+        peak_memory_bytes=0,
+        peak_process_rss_bytes=0,
+        cpu_user_seconds=0.0,
+        cpu_system_seconds=0.0,
+        cpu_total_seconds=0.0,
+    ))
+    monkeypatch.setattr(
+        mcs,
+        "set_solution_context",
+        lambda solution_id, global_repo_access=False: calls.append(
+            ("set_context", solution_id)
+        ),
+    )
+    monkeypatch.setattr(
+        mcs,
+        "clear_solution_context",
+        lambda: calls.append(("clear_context", None)),
+    )
 
-    def _fake_set_ctx(solution_id, global_repo_access=False):
-        calls.append(("set_context", solution_id))
-
-    def _fake_clear():
+    def _fail_refresh():
         calls.append(("clear_modules", None))
+        raise RuntimeError("refresh failed")
 
-    def _fake_clear_ctx():
-        calls.append(("clear_context", None))
+    monkeypatch.setattr(worker, "_clear_workspace_modules", _fail_refresh)
 
-    async def _fake_run(_eid, _ctx):
-        calls.append(("run", None))
-        return {"status": "Success", "result": {}, "metrics": {}}
-
-    monkeypatch.setattr(sw, "_read_context_from_redis", _fake_read_context)
-    monkeypatch.setattr(mcs, "set_solution_context", _fake_set_ctx)
-    monkeypatch.setattr(mcs, "clear_solution_context", _fake_clear_ctx)
-    monkeypatch.setattr(sw, "_clear_workspace_modules", _fake_clear)
-    monkeypatch.setattr(sw, "_get_pss_bytes", lambda: 0)
-    # _run_execution is imported inside the function from worker; patch there.
-    import src.services.execution.worker as worker_mod
-    monkeypatch.setattr(worker_mod, "_run_execution", _fake_run)
-
-    await sw._execute_async("exec-1", "worker-1")
-
-    order = [name for name, _ in calls]
-    assert order.index("set_context") < order.index("clear_modules"), (
-        f"context must be set before clearing modules; got {order}"
+    result = await worker.run_execution(
+        "exec-direct",
+        {
+            "solution_id": sid,
+            "solution_global_repo_access": False,
+            "caller": {
+                "user_id": str(uuid.uuid4()),
+                "email": "user@example.com",
+                "name": "User",
+            },
+        },
     )
-    assert order.index("clear_modules") < order.index("clear_context")
-    assert order.index("clear_context") < order.index("run"), (
-        f"eviction-only context must be clear before credential bootstrap; got {order}"
-    )
-    # The context activated is THIS execution's install.
-    assert ("set_context", sid) in calls
+
+    assert result["status"] == "Failed"
+    assert result["error_type"] == "RuntimeError"
+    assert calls == [
+        ("set_context", sid),
+        ("clear_modules", None),
+        ("clear_context", None),
+    ]

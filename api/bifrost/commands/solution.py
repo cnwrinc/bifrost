@@ -33,11 +33,15 @@ from typing import Any
 from uuid import UUID, uuid5
 
 import click
+import httpx
 import yaml
 
 from bifrost.client import BifrostClient
+from bifrost.commands.base import output_result
 from bifrost.credentials import resolve_environment_url
 from bifrost.org_target import org_option, resolve_org_target
+from bifrost.platform_jobs import poll_platform_job
+from bifrost.refs import RefResolver
 from bifrost.solution_jobs import DEPLOY_JOB_TIMEOUT_SECONDS
 from bifrost.solution_binding import (
     SolutionBindingError,
@@ -54,26 +58,6 @@ from bifrost.solution_descriptor import (
     load_descriptor,
 )
 
-# The scaffold's sample workflow. It lives at the SOLUTION ROOT (not under the
-# app dir) so its ``path::fn`` ref resolves the same way everywhere: workflow
-# refs are workspace-root-relative, so the app's ``functions/hello.py::main``
-# means ``<solution-root>/functions/hello.py``. ``bifrost solution start``
-# discovers it from the root and runs it locally, so the scaffold's button works
-# on first run with no deploy.
-_SAMPLE_WORKFLOW_PATH = "functions/hello.py"
-_SAMPLE_WORKFLOW_REF = f"{_SAMPLE_WORKFLOW_PATH}::main"
-_SAMPLE_WORKFLOW_SOURCE = '''\
-from bifrost import workflow
-
-
-@workflow
-async def main():
-    """The scaffold's sample function — `bifrost solution start` runs this
-    locally so the app's first-run button works with no deploy."""
-    return {"message": "Hello from your Bifrost solution"}
-'''
-
-
 @click.group(name="solution", help="Manage Solution installs (installable surfaces).")
 def solution_group() -> None:
     pass
@@ -84,7 +68,8 @@ def _write_solution_descriptor(
     slug: str,
     name: str | None,
     version: str,
-    global_repo_access: bool,
+    allow_outbound_access: bool,
+    allow_inbound_access: bool = True,
 ) -> pathlib.Path:
     workspace.mkdir(parents=True, exist_ok=True)
     descriptor = workspace / DESCRIPTOR_FILENAME
@@ -96,7 +81,8 @@ def _write_solution_descriptor(
                 "slug": slug,
                 "name": name or slug,
                 "version": version,
-                "global_repo_access": global_repo_access,
+                "allow_outbound_access": allow_outbound_access,
+                "allow_inbound_access": allow_inbound_access,
             },
             sort_keys=False,
         )
@@ -113,7 +99,8 @@ async def _post_create_install_for_descriptor(
         "slug": descriptor.slug,
         "name": descriptor.name,
         "organization_id": target_org_id,
-        "global_repo_access": descriptor.global_repo_access,
+        "allow_outbound_access": descriptor.allow_outbound_access,
+        "allow_inbound_access": descriptor.allow_inbound_access,
         "git_connected": descriptor.git_connected,
         "git_repo_url": descriptor.git_repo_url,
         "repo_subpath": descriptor.repo_subpath,
@@ -131,14 +118,15 @@ def _create_solution_workspace(
     slug: str,
     name: str | None,
     version: str,
-    global_repo_access: bool,
+    allow_outbound_access: bool,
+    allow_inbound_access: bool,
     org: str | None,
     is_global: bool,
     api_url: str | None,
 ) -> None:
     workspace = pathlib.Path(path)
     descriptor_path = _write_solution_descriptor(
-        workspace, slug, name, version, global_repo_access
+        workspace, slug, name, version, allow_outbound_access, allow_inbound_access
     )
     descriptor = load_descriptor(workspace)
     remote_created = False
@@ -181,7 +169,12 @@ def _create_solution_workspace(
 @click.option("--name", default=None, help="Display name (defaults to slug).")
 @click.option("--version", "version", default="0.1.0", show_default=True,
               help="Bundle version recorded on the install at deploy time.")
-@click.option("--global-repo-access/--no-global-repo-access", default=False, show_default=True)
+@click.option("--allow-outbound-access/--no-allow-outbound-access", "allow_outbound_access",
+              default=None, help="Let the install fall back to shared _repo resources.")
+@click.option("--global-repo-access/--no-global-repo-access", "legacy_global_repo_access",
+              default=None, hidden=True, help="Deprecated: use --allow-outbound-access.")
+@click.option("--allow-inbound-access/--no-allow-inbound-access", "allow_inbound_access",
+              default=None, help="Let other installs target this one via per-call solution refs.")
 @click.option("--url", "api_url", default=None, help="Bifrost instance URL (default: current profile).")
 @org_option
 def create_cmd(
@@ -189,15 +182,41 @@ def create_cmd(
     slug: str,
     name: str | None,
     version: str,
-    global_repo_access: bool,
+    allow_outbound_access: bool | None,
+    legacy_global_repo_access: bool | None,
+    allow_inbound_access: bool | None,
     org: str | None,
     is_global: bool,
     api_url: str | None,
 ) -> None:
     """Create a local descriptor and an empty remote install."""
     _create_solution_workspace(
-        path, slug, name, version, global_repo_access, org, is_global, api_url
+        path, slug, name, version,
+        _resolve_outbound_flag(allow_outbound_access, legacy_global_repo_access),
+        _resolve_inbound_flag(allow_inbound_access),
+        org, is_global, api_url,
     )
+
+
+def _resolve_outbound_flag(new: bool | None, legacy: bool | None) -> bool:
+    """Merge the canonical and deprecated outbound flags (new wins, default off)."""
+    if new is not None:
+        return new
+    if legacy is not None:
+        return legacy
+    return False
+
+
+def _resolve_inbound_flag(value: bool | None) -> bool:
+    """Resolve the inbound flag; absent means "allowed" (the install default)."""
+    return True if value is None else value
+
+
+def _resolve_optional_outbound_flag(new: bool | None, legacy: bool | None) -> bool | None:
+    """Merge outbound flags for PATCH; ``None`` means "leave unchanged"."""
+    if new is not None:
+        return new
+    return legacy
 
 
 @solution_group.command(
@@ -209,7 +228,12 @@ def create_cmd(
 @click.option("--name", default=None, help="Display name (defaults to slug).")
 @click.option("--version", "version", default="0.1.0", show_default=True,
               help="Bundle version recorded on the install at deploy time.")
-@click.option("--global-repo-access/--no-global-repo-access", default=False, show_default=True)
+@click.option("--allow-outbound-access/--no-allow-outbound-access", "allow_outbound_access",
+              default=None, help="Let the install fall back to shared _repo resources.")
+@click.option("--global-repo-access/--no-global-repo-access", "legacy_global_repo_access",
+              default=None, hidden=True, help="Deprecated: use --allow-outbound-access.")
+@click.option("--allow-inbound-access/--no-allow-inbound-access", "allow_inbound_access",
+              default=None, help="Let other installs target this one via per-call solution refs.")
 @click.option("--url", "api_url", default=None, help="Bifrost instance URL (default: current profile).")
 @org_option
 def init_cmd(
@@ -217,15 +241,248 @@ def init_cmd(
     slug: str,
     name: str | None,
     version: str,
-    global_repo_access: bool,
+    allow_outbound_access: bool | None,
+    legacy_global_repo_access: bool | None,
+    allow_inbound_access: bool | None,
     org: str | None,
     is_global: bool,
     api_url: str | None,
 ) -> None:
     """Backward-compatible alias for ``bifrost solution create``."""
     _create_solution_workspace(
-        path, slug, name, version, global_repo_access, org, is_global, api_url
+        path, slug, name, version,
+        _resolve_outbound_flag(allow_outbound_access, legacy_global_repo_access),
+        _resolve_inbound_flag(allow_inbound_access),
+        org, is_global, api_url,
     )
+
+
+@solution_group.command(
+    name="update",
+    help="Edit install-local fields (name, scope, access gates) of an existing install.",
+)
+@click.argument("path", type=click.Path(file_okay=False), default=".")
+@click.option("--solution", "solution_ref", default=None,
+              help="Install id or unique slug (default: workspace binding or descriptor slug).")
+@click.option("--name", default=None, help="New display name.")
+@click.option("--allow-outbound-access/--no-allow-outbound-access", "allow_outbound_access",
+              default=None, help="Let the install fall back to shared _repo resources.")
+@click.option("--global-repo-access/--no-global-repo-access", "legacy_global_repo_access",
+              default=None, hidden=True, help="Deprecated: use --allow-outbound-access.")
+@click.option("--allow-inbound-access/--no-allow-inbound-access", "allow_inbound_access",
+              default=None, help="Let other installs target this one via per-call solution refs.")
+@click.option("--url", "api_url", default=None, help="Bifrost instance URL (default: current profile).")
+@org_option
+def update_cmd(
+    path: str,
+    solution_ref: str | None,
+    name: str | None,
+    allow_outbound_access: bool | None,
+    legacy_global_repo_access: bool | None,
+    allow_inbound_access: bool | None,
+    org: str | None,
+    is_global: bool,
+    api_url: str | None,
+) -> None:
+    """PATCH install-local fields; fields not passed are left unchanged.
+
+    Install selection follows the binding/``--solution``/descriptor-slug rule
+    (like ``bind``/``deploy``). ``--org``/``--global`` set the install's NEW
+    scope — they do not select it.
+    """
+    workspace = _workspace_from_path_arg(path)
+    if not is_solution_workspace(workspace):
+        raise click.ClickException(
+            f"No {DESCRIPTOR_FILENAME} in {workspace} - not a Solution workspace. "
+            f"Run `bifrost solution init` first."
+        )
+    descriptor = load_descriptor(workspace)
+
+    body: dict[str, Any] = {}
+    if name is not None:
+        body["name"] = name
+    outbound = _resolve_optional_outbound_flag(
+        allow_outbound_access, legacy_global_repo_access
+    )
+    if outbound is not None:
+        body["allow_outbound_access"] = outbound
+    if allow_inbound_access is not None:
+        body["allow_inbound_access"] = allow_inbound_access
+    scope_selected = org is not None or is_global
+
+    if not body and not scope_selected:
+        raise click.UsageError(
+            "Nothing to update: pass --name, --org/--global, "
+            "--allow-outbound-access, or --allow-inbound-access."
+        )
+
+    async def _run() -> None:
+        client = _client_for_solution_workspace(workspace, api_url)
+        if scope_selected:
+            body["organization_id"] = await _resolve_install_org(client, org, is_global)
+        binding = await _resolve_solution_install(
+            client, workspace, descriptor, solution_ref
+        )
+        resp = await client.patch(f"/api/solutions/{binding.solution_id}", json=body)
+        if resp.status_code != 200:
+            raise click.ClickException(
+                f"Failed to update install ({resp.status_code}): {resp.text[:200]}"
+            )
+        updated = resp.json()
+        scope = updated.get("organization_id")
+        click.echo(
+            f"Updated Solution install {binding.solution_id} "
+            f"(name={updated.get('name')!r}, "
+            f"allow_outbound_access={updated.get('allow_outbound_access')}, "
+            f"allow_inbound_access={updated.get('allow_inbound_access')}, "
+            f"scope={'global' if not scope else scope})."
+        )
+
+    asyncio.run(_run())
+
+
+async def _resolve_solution_git_ref(client: BifrostClient, solution_ref: str) -> dict[str, Any]:
+    """Resolve an install id or unambiguous slug for managed Git operations."""
+    response = await client.get("/api/solutions")
+    if response.status_code != 200:
+        raise click.ClickException(
+            f"Failed to list Solution installs ({response.status_code}): {response.text[:200]}"
+        )
+    installs = response.json().get("solutions", [])
+    matches = [install for install in installs if install.get("id") == solution_ref]
+    if not matches:
+        matches = [install for install in installs if install.get("slug") == solution_ref]
+    if not matches:
+        raise click.ClickException(f"No Solution install found for {solution_ref!r}.")
+    if len(matches) > 1:
+        ids = ", ".join(str(install.get("id")) for install in matches)
+        raise click.ClickException(
+            f"Solution slug {solution_ref!r} is ambiguous; use an install id: {ids}"
+        )
+    return matches[0]
+
+
+@solution_group.command(
+    name="install-repo",
+    help="Install a Solution from a repository and make Git its sole writer.",
+)
+@click.argument("repository_url")
+@click.option("--subpath", "repo_subpath", default=None, help="Solution workspace path inside the repository.")
+@click.option("--ref", "git_ref", default="main", show_default=True, help="Git ref to install.")
+def install_repo_cmd(repository_url: str, repo_subpath: str | None, git_ref: str) -> None:
+    """Install from Git; local ``solution deploy`` is refused afterwards."""
+
+    async def _run() -> int:
+        client = BifrostClient.get_instance(require_auth=True)
+        response = await client.post(
+            "/api/solutions/install/from-repo",
+            json={
+                "repo_url": repository_url,
+                "repo_subpath": repo_subpath,
+                "git_ref": git_ref,
+            },
+        )
+        if response.status_code != 202:
+            raise click.ClickException(
+                f"Repository install failed ({response.status_code}): {response.text[:200]}"
+            )
+        job_id = response.json().get("deploy_job_id")
+        if not isinstance(job_id, str):
+            raise click.ClickException("Repository install did not return a deploy job id.")
+        click.echo(f"Installing Git-connected Solution (job {job_id})...")
+        return await _poll_deploy_job(client, job_id, action="Install")
+
+    rc = asyncio.run(_run())
+    if rc:
+        raise SystemExit(rc)
+
+
+@solution_group.group(name="git", help="Connect or disconnect a managed Solution repository.")
+def solution_git_group() -> None:
+    pass
+
+
+@solution_git_group.command(name="connect")
+@click.argument("solution_ref")
+@click.argument("repository_url")
+@click.option("--subpath", "repo_subpath", default=None, help="Solution workspace path inside the repository.")
+@click.option("--ref", "git_ref", default="main", show_default=True, help="Git ref to update from.")
+def solution_git_connect_cmd(
+    solution_ref: str, repository_url: str, repo_subpath: str | None, git_ref: str
+) -> None:
+    """Connect an existing install; repository updates become its sole writer."""
+
+    async def _run() -> None:
+        client = BifrostClient.get_instance(require_auth=True)
+        solution = await _resolve_solution_git_ref(client, solution_ref)
+        response = await client.patch(
+            f"/api/solutions/{solution['id']}",
+            json={
+                "git_connected": True,
+                "git_repo_url": repository_url,
+                "repo_subpath": repo_subpath,
+                "git_ref": git_ref,
+            },
+        )
+        if response.status_code != 200:
+            raise click.ClickException(
+                f"Failed to connect Solution Git ({response.status_code}): {response.text[:200]}"
+            )
+        click.echo(
+            f"Connected Solution install {solution['id']} to Git. "
+            "Repository sync is now its only writer."
+        )
+
+    asyncio.run(_run())
+
+
+@solution_git_group.command(name="disconnect")
+@click.argument("solution_ref")
+def solution_git_disconnect_cmd(solution_ref: str) -> None:
+    """Disconnect Git so future updates are manual Solution deployments."""
+
+    async def _run() -> None:
+        client = BifrostClient.get_instance(require_auth=True)
+        solution = await _resolve_solution_git_ref(client, solution_ref)
+        response = await client.patch(
+            f"/api/solutions/{solution['id']}", json={"git_connected": False}
+        )
+        if response.status_code != 200:
+            raise click.ClickException(
+                f"Failed to disconnect Solution Git ({response.status_code}): {response.text[:200]}"
+            )
+        click.echo(
+            f"Disconnected Solution install {solution['id']}. "
+            "Future updates require an explicit deploy."
+        )
+
+    asyncio.run(_run())
+
+
+@solution_group.command(name="sync", help="Update a Git-connected Solution from its configured ref.")
+@click.argument("solution_ref")
+def solution_sync_cmd(solution_ref: str) -> None:
+    """Ask the server's sole Git writer to update the selected Solution."""
+
+    async def _run() -> None:
+        client = BifrostClient.get_instance(require_auth=True)
+        solution = await _resolve_solution_git_ref(client, solution_ref)
+        response = await client.post(f"/api/solutions/{solution['id']}/sync", json={})
+        if response.status_code not in {200, 202}:
+            raise click.ClickException(
+                f"Solution Git sync failed ({response.status_code}): {response.text[:200]}"
+            )
+        result = response.json()
+        job_id = result.get("job_id") or result.get("deploy_job_id")
+        if isinstance(job_id, str):
+            completed = await poll_platform_job(client, job_id, label="Syncing Solution")
+            output_result(completed)
+            return
+        # The current endpoint executes synchronously despite returning 202.
+        # Preserve its REST contract rather than inventing a second job system.
+        output_result(result)
+
+    asyncio.run(_run())
 
 
 def _workspace_from_path_arg(path: str) -> pathlib.Path:
@@ -341,33 +598,6 @@ def _scaffold_app(slug: str, path: str | None) -> pathlib.Path:
     # Register the app in .bifrost/apps.yaml so `bifrost deploy` finds it (the
     # deployer reads this manifest). Without this the scaffold would be source
     # with no way to deploy — a papercut. Keyed by a fresh UUID (app identity).
-
-    # Write the sample workflow at the SOLUTION ROOT (not under the app dir), so
-    # its ``path::fn`` ref (``functions/hello.py::main``) resolves the same way
-    # everywhere — refs are workspace-root-relative. ``solution start`` discovers
-    # it from the root and runs the app's first-run button locally. Don't clobber
-    # an existing file (a re-scaffold of a second app must not overwrite edits).
-    sample_dest = root / _SAMPLE_WORKFLOW_PATH
-    if not sample_dest.exists():
-        sample_dest.parent.mkdir(parents=True, exist_ok=True)
-        sample_dest.write_text(_SAMPLE_WORKFLOW_SOURCE)
-        # Index the sample in .bifrost/workflows.yaml so `bifrost deploy` creates
-        # a Workflow ROW for it — without this, deploy bundles the source but the
-        # app's `functions/hello.py::main` ref 404s on a deployed install (the
-        # source has no row to resolve). Keyed by a fresh UUID (workflow identity).
-        wf_manifest = root / ".bifrost" / "workflows.yaml"
-        wf_manifest.parent.mkdir(parents=True, exist_ok=True)
-        wf_data = yaml.safe_load(wf_manifest.read_text()) if wf_manifest.is_file() else None
-        wf_data = wf_data or {"workflows": {}}
-        wf_id = str(_uuid.uuid4())
-        wf_data.setdefault("workflows", {})[wf_id] = {
-            "id": wf_id,
-            "name": "hello",
-            "path": _SAMPLE_WORKFLOW_PATH,
-            "function_name": "main",
-        }
-        wf_manifest.write_text(yaml.safe_dump(wf_data, sort_keys=False))
-
     manifest = root / ".bifrost" / "apps.yaml"
     manifest.parent.mkdir(parents=True, exist_ok=True)
     data = yaml.safe_load(manifest.read_text()) if manifest.is_file() else None
@@ -384,8 +614,6 @@ def _scaffold_app(slug: str, path: str | None) -> pathlib.Path:
 
     click.echo(f"Scaffolded standalone_v2 app at {app_dir}")
     click.echo(f"Registered it in {manifest} (id {app_id}).")
-    if sample_dest.exists():
-        click.echo(f"Sample workflow at {sample_dest} (ref {_SAMPLE_WORKFLOW_REF}).")
     return app_dir
 
 
@@ -531,6 +759,8 @@ export interface BifrostAppBootstrap {
   token: string;
   orgScope: string | null;
   appId: string | null;
+  /** Owning Solution supplied by the platform host. */
+  solutionId?: string | null;
   onLogout: () => void;
   theme: "light" | "dark";
 }
@@ -554,6 +784,7 @@ export function mount(mountEl: HTMLElement, bootstrap: BifrostAppBootstrap) {
         token={bootstrap.token}
         orgScope={bootstrap.orgScope}
         appId={bootstrap.appId}
+        solutionId={bootstrap.solutionId}
         theme={bootstrap.theme}
         supportsTheme
         onLogout={bootstrap.onLogout}
@@ -587,54 +818,89 @@ if (import.meta.env.DEV) {
 }
 """
     app_tsx = """\
-import { Routes, Route, Link } from "react-router-dom";
-import { BifrostHeader, useWorkflowMutation } from "bifrost";
+import { Link, NavLink, Outlet, Route, Routes } from "react-router-dom";
+import { BifrostHeader } from "bifrost";
+
+// One list drives the navigation. To add a section, add an entry here and a
+// matching <Route> below. Paths are relative to the App's base URL.
+const NAV = [
+  { to: "/", label: "Home", end: true },
+  { to: "/about", label: "About" },
+];
+
+// The shell renders once: the header, then `main` as the only scroller. The
+// header shows NAV as a tab row on wide screens and inside its menu button on
+// phones; NavLink marks the active section. Pages render into <Outlet />.
+function Shell() {
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-background text-foreground">
+      <BifrostHeader title="My App" nav={{ items: NAV, link: NavLink }} />
+      <main className="min-h-0 flex-1 overflow-auto">
+        <Outlet />
+      </main>
+    </div>
+  );
+}
 
 function Home() {
-  // Workflow hooks (pick by intent — same mental model as React Query):
-  //   useWorkflowQuery(ref)    → READ: auto-runs on mount, has { data, refresh }.
-  //   useWorkflowMutation(ref) → ACTION: runs on mutate(), has { mutate }.
-  // This sample is a button (an action), so it uses the mutation hook. The ref
-  // is a portable `path::function` ref (e.g. "functions/hello.py::main",
-  // shipped with this scaffold) or a workflow name — both resolve to THIS
-  // install's own workflow when deployed, and `bifrost solution start` runs
-  // both from your local files. (Avoid raw UUID refs: deploy remaps entity
-  // ids per install, so a hardcoded UUID won't resolve on a deployed install.)
-  const wf = useWorkflowMutation<{ message: string }>("functions/hello.py::main");
+  // This button is a placeholder: wire it to one of your workflows.
+  // Workflow hooks from "bifrost" (pick by intent, like React Query):
+  //   useWorkflowQuery(ref)    → READ: runs on mount; returns { data, refresh }.
+  //   useWorkflowMutation(ref) → ACTION: runs on mutate(); returns
+  //                              { mutate, loading, error, data }.
+  // A ref is a portable `path::function` ref (e.g. "workflows/my_workflow.py::main")
+  // or a workflow name. Avoid raw UUID refs: deploy remaps entity ids per
+  // install, so a hardcoded UUID won't resolve once deployed.
+  //
+  // A button is an action, so it uses the mutation hook:
+  //   const wf = useWorkflowMutation<{ message: string }>("workflows/my_workflow.py::main");
+  //   <button onClick={() => wf.mutate({})} disabled={wf.loading}>…</button>
+  //   {wf.error && <p role="alert" className="text-sm text-destructive">{wf.error.message}</p>}
+  //   {wf.data && <pre>{JSON.stringify(wf.data, null, 2)}</pre>}
   return (
-    <main style={{ padding: 24 }}>
-      <h1>Hello from your Bifrost app</h1>
-      <p>
-        <Link to="/about">About</Link>
-      </p>
-      <button onClick={() => wf.mutate({})} disabled={wf.loading}>
-        {wf.loading ? "Running…" : "Run workflow"}
+    <section className="mx-auto w-full max-w-3xl space-y-4 p-4 md:p-6">
+      <h1 className="text-lg font-semibold">Hello from your Bifrost app</h1>
+      <button
+        type="button"
+        className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+      >
+        Run workflow
       </button>
-      {wf.error && <pre style={{ color: "crimson" }}>{wf.error.message}</pre>}
-      {wf.data && <pre>{JSON.stringify(wf.data, null, 2)}</pre>}
-    </main>
+    </section>
   );
 }
 
 function About() {
   return (
-    <main style={{ padding: 24 }}>
-      <h1>About</h1>
-      <p>This route is at /about — refresh works because the URL is real.</p>
-      <Link to="/">Home</Link>
-    </main>
+    <section className="mx-auto w-full max-w-3xl space-y-2 p-4 md:p-6">
+      <h1 className="text-lg font-semibold">About</h1>
+      <p className="text-sm text-muted-foreground">
+        This route is at /about. Refresh works because the URL is real.
+      </p>
+    </section>
+  );
+}
+
+function NotFound() {
+  return (
+    <section className="mx-auto w-full max-w-3xl space-y-2 p-4 md:p-6">
+      <h1 className="text-lg font-semibold">Page not found</h1>
+      <Link to="/" className="text-sm text-primary hover:underline">
+        Back to Home
+      </Link>
+    </section>
   );
 }
 
 export default function App() {
   return (
-    <>
-      <BifrostHeader title="My App" />
-      <Routes>
-        <Route path="/" element={<Home />} />
-        <Route path="/about" element={<About />} />
-      </Routes>
-    </>
+    <Routes>
+      <Route element={<Shell />}>
+        <Route index element={<Home />} />
+        <Route path="about" element={<About />} />
+        <Route path="*" element={<NotFound />} />
+      </Route>
+    </Routes>
   );
 }
 """
@@ -893,25 +1159,27 @@ def _bifrost_manifest(workspace: pathlib.Path, name: str) -> pathlib.Path | None
     return pathlib.Path(target)
 
 
-def _app_source_dirs(workspace: pathlib.Path) -> set[str]:
+def _app_source_dirs(workspace: pathlib.Path, *, definition=None) -> set[str]:
     """Relative (POSIX) app source dirs from .bifrost/apps.yaml, to exclude from
     the Python-source sweep (apps are bundled by _collect_apps)."""
-    root = os.path.realpath(workspace)
-    manifest = os.path.realpath(os.path.join(root, ".bifrost", "apps.yaml"))
-    if not manifest.startswith(root + os.sep):
-        return set()
-    manifest_path = pathlib.Path(manifest)
-    if not manifest_path.is_file():
-        return set()
-    data = yaml.safe_load(manifest_path.read_text()) or {}
-    out: set[str] = set()
-    for body in (data.get("apps", {}) or {}).values():
-        if isinstance(body, dict) and body.get("path"):
-            out.add(str(body["path"]).strip("/"))
-    return out
+    from bifrost.solution_definition import read_solution_definition
+
+    return {
+        str(body["path"]).strip("/")
+        for body in (definition or read_solution_definition(workspace)).entries("apps")
+        if body.get("path")
+    }
 
 
-def _collect_python_files(workspace: pathlib.Path) -> dict[str, str]:
+def _validate_solution_python_files(python_files: dict[str, str]) -> None:
+    """Validate decorator settings in source that will enter a Solution bundle."""
+    from bifrost.decorator_validation import validate_python_decorators
+
+    for path, source in sorted(python_files.items()):
+        validate_python_decorators(source, path=path)
+
+
+def _collect_python_files(workspace: pathlib.Path, *, definition=None) -> dict[str, str]:
     """Collect installable Python source (relative path → text), layout-agnostic.
 
     Scans the whole solution root for ``.py``, excluding generated/dep/manifest
@@ -920,7 +1188,7 @@ def _collect_python_files(workspace: pathlib.Path) -> dict[str, str]:
     where the scaffold writes / where ``solution start`` resolves, else a workflow
     deploys with a row but no code (shakeout HIGH).
     """
-    app_dirs = _app_source_dirs(workspace)
+    app_dirs = _app_source_dirs(workspace, definition=definition)
     files: dict[str, str] = {}
     ws_root = os.path.realpath(workspace)
     for dirpath, _dirnames, filenames in os.walk(ws_root):
@@ -940,17 +1208,20 @@ def _collect_python_files(workspace: pathlib.Path) -> dict[str, str]:
             rel_posix = pathlib.PurePath(rel).as_posix()
             if any(rel_posix == d or rel_posix.startswith(d + "/") for d in app_dirs):
                 continue
-            files[rel_posix] = pathlib.Path(py_real).read_text(encoding="utf-8")
+            source = pathlib.Path(py_real).read_text(encoding="utf-8")
+            # Validate before putting source into the candidate map so every
+            # publisher using this canonical collector refuses it before any
+            # remote write or deploy mutation.
+            _validate_solution_python_files({rel_posix: source})
+            files[rel_posix] = source
     return files
 
 
-def _collect_workflows(workspace: pathlib.Path) -> list[dict]:
+def _collect_workflows(workspace: pathlib.Path, *, definition=None) -> list[dict]:
     """Read workflow entries from .bifrost/workflows.yaml (the descriptor indexes it)."""
-    wf_file = _bifrost_manifest(workspace, "workflows.yaml")
-    if wf_file is None or not wf_file.is_file():
-        return []
-    data = yaml.safe_load(wf_file.read_text()) or {}
-    raw = data.get("workflows", {})
+    from bifrost.solution_definition import read_solution_definition
+
+    raw = (definition or read_solution_definition(workspace)).entries("workflows")
     entries: list[dict] = []
     ws_root = os.path.realpath(workspace)
     # workflows.yaml is keyed by workflow UUID; the display name is body["name"].
@@ -959,9 +1230,8 @@ def _collect_workflows(workspace: pathlib.Path) -> list[dict]:
     # category/tags as a full-replace, so dropping them here would silently reset
     # an exported workflow's endpoint + timeout on a disconnected redeploy (P2-e).
     # function_name/path are required by the deployer, so fail loudly if missing.
-    for key, body in raw.items():
-        if not isinstance(body, dict):
-            continue
+    for body in raw:
+        key = body["id"]
         # Carry the workflow's source text so the server's deploy preflight can
         # compare the manifest name against the decorated @workflow(name=...) —
         # the value the execution engine actually matches on. Missing/unreadable
@@ -1017,75 +1287,36 @@ def _unregistered_workflow_files(
     )
 
 
-def _collect_tables(workspace: pathlib.Path) -> list[dict]:
+def _collect_tables(workspace: pathlib.Path, *, definition=None) -> list[dict]:
     """Read table SCHEMA/POLICIES from .bifrost/tables.yaml (keyed by UUID).
 
     Only structure is deployed — row data is runtime state and never carried in
     a bundle (criterion 11).
     """
-    tbl_file = _bifrost_manifest(workspace, "tables.yaml")
-    if tbl_file is None or not tbl_file.is_file():
-        return []
-    data = yaml.safe_load(tbl_file.read_text()) or {}
-    raw = data.get("tables", {})
-    entries: list[dict] = []
-    for key, body in raw.items():
-        if not isinstance(body, dict):
-            continue
-        entry = {
-            "id": body.get("id", key),
-            "name": body.get("name") or key,
-            "description": body.get("description"),
-            "schema": body.get("schema"),
-        }
-        if "policies" in body:
-            entry["policies"] = body["policies"]
-        entries.append(entry)
-    return entries
+    from bifrost.solution_definition import read_solution_definition
+
+    return (definition or read_solution_definition(workspace)).install_entries("tables")
 
 
-def _collect_config_schemas(workspace: pathlib.Path) -> list[dict]:
+def _collect_config_schemas(workspace: pathlib.Path, *, definition=None) -> list[dict]:
     """Read config DECLARATIONS from .bifrost/configs.yaml (keyed by key/UUID).
 
     Declarations ONLY — there is no ``value`` field by design. Config values are
     instance-owned and supplied at install time; local dev reads them from .env.
     """
-    cfg_file = _bifrost_manifest(workspace, "configs.yaml")
-    if cfg_file is None or not cfg_file.is_file():
-        return []
-    data = yaml.safe_load(cfg_file.read_text()) or {}
-    raw = data.get("configs", {})
-    entries: list[dict] = []
-    for key, body in raw.items():
-        if not isinstance(body, dict):
-            continue
-        entries.append({
-            "id": body.get("id", key),
-            "key": body.get("key") or key,
-            "type": body.get("type", "string"),
-            "required": bool(body.get("required", False)),
-            "description": body.get("description"),
-            "default": body.get("default"),
-            "position": int(body.get("position", 0)),
-        })
-    return entries
+    from bifrost.solution_definition import read_solution_definition
+
+    return (definition or read_solution_definition(workspace)).config_entries()
 
 
-def _collect_file_locations(workspace: pathlib.Path) -> list[str]:
+def _collect_file_locations(workspace: pathlib.Path, *, definition=None) -> list[str]:
     """Read solution runtime file-location declarations from .bifrost/files.yaml."""
-    files_file = _bifrost_manifest(workspace, "files.yaml")
-    if files_file is None or not files_file.is_file():
-        return []
-    from bifrost.manifest import ManifestFiles
+    from bifrost.solution_definition import read_solution_definition
 
-    data = yaml.safe_load(files_file.read_text()) or {}
-    raw = data.get("locations") or []
-    if not isinstance(raw, list):
-        raise ValueError(".bifrost/files.yaml locations must be a list")
-    return ManifestFiles(locations=raw).locations
+    return (definition or read_solution_definition(workspace)).manifest.files.locations
 
 
-def _collect_file_policies(workspace: pathlib.Path) -> list[dict]:
+def _collect_file_policies(workspace: pathlib.Path, *, definition=None) -> list[dict]:
     """Read solution-tier file policies from .bifrost/file-policies.yaml (keyed by UUID).
 
     Each entry is a portable ``{id, location, path, policies}`` dict written by
@@ -1093,25 +1324,12 @@ def _collect_file_policies(workspace: pathlib.Path) -> list[dict]:
     re-stamps ``solution_id`` to the target install and upserts by natural key
     ``(solution_id, location, path)``.
     """
-    fp_file = _bifrost_manifest(workspace, "file-policies.yaml")
-    if fp_file is None or not fp_file.is_file():
-        return []
-    data = yaml.safe_load(fp_file.read_text()) or {}
-    raw = data.get("file_policies", {})
-    entries: list[dict] = []
-    for key, body in raw.items():
-        if not isinstance(body, dict):
-            continue
-        entries.append({
-            "id": body.get("id", key),
-            "location": body.get("location"),
-            "path": body.get("path", ""),
-            "policies": body.get("policies", []),
-        })
-    return entries
+    from bifrost.solution_definition import read_solution_definition
+
+    return (definition or read_solution_definition(workspace)).install_entries("file_policies")
 
 
-def _collect_connection_schemas(workspace: pathlib.Path) -> list[dict]:
+def _collect_connection_schemas(workspace: pathlib.Path, *, definition=None) -> list[dict]:
     """Read connection DECLARATIONS from .bifrost/connections.yaml (keyed by name).
 
     Each entry is a secret-scrubbed {integration_name, template, position} dict
@@ -1119,21 +1337,9 @@ def _collect_connection_schemas(workspace: pathlib.Path) -> list[dict]:
     server's deploy pre-creates an empty integration shell and persists a
     SolutionConnectionSchema row from each, so Setup surfaces the connection.
     """
-    conn_file = _bifrost_manifest(workspace, "connections.yaml")
-    if conn_file is None or not conn_file.is_file():
-        return []
-    data = yaml.safe_load(conn_file.read_text()) or {}
-    raw = data.get("connections", {})
-    entries: list[dict] = []
-    for name, body in raw.items():
-        if not isinstance(body, dict):
-            continue
-        entries.append({
-            "integration_name": body.get("integration_name") or name,
-            "template": body.get("template") or {},
-            "position": int(body.get("position", 0)),
-        })
-    return entries
+    from bifrost.solution_definition import read_solution_definition
+
+    return (definition or read_solution_definition(workspace)).connection_entries()
 
 
 def _collect_readme(workspace: pathlib.Path) -> str | None:
@@ -1144,55 +1350,30 @@ def _collect_readme(workspace: pathlib.Path) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
-def _collect_claims(workspace: pathlib.Path) -> list[dict]:
+def _collect_claims(workspace: pathlib.Path, *, definition=None) -> list[dict]:
     """Read Custom Claim definitions from .bifrost/claims.yaml (keyed by UUID)."""
-    claims_file = _bifrost_manifest(workspace, "claims.yaml")
-    if claims_file is None or not claims_file.is_file():
-        return []
-    data = yaml.safe_load(claims_file.read_text()) or {}
-    raw = data.get("claims", {})
-    entries: list[dict] = []
-    for key, body in raw.items():
-        if not isinstance(body, dict):
-            continue
-        entries.append({
-            "id": body.get("id", key),
-            "name": body.get("name") or key,
-            "description": body.get("description"),
-            "type": body.get("type", "list"),
-            "query": body["query"],
-        })
-    return entries
+    from bifrost.solution_definition import read_solution_definition
+
+    return (definition or read_solution_definition(workspace)).install_entries("claims")
 
 
-def _collect_manifest_entities(workspace: pathlib.Path, filename: str, key: str) -> list[dict]:
-    """Pass through inline manifest entries (forms/agents) keyed by UUID.
+def _collect_forms(workspace: pathlib.Path, *, definition=None) -> list[dict]:
+    from bifrost.solution_definition import read_solution_definition
 
-    The form/agent inline content (fields, system_prompt, etc.) lives in the
-    manifest body; deploy stamps solution_id + scope and full-replaces.
-    """
-    f = _bifrost_manifest(workspace, filename)
-    if f is None or not f.is_file():
-        return []
-    data = yaml.safe_load(f.read_text()) or {}
-    entries: list[dict] = []
-    for map_key, body in (data.get(key, {}) or {}).items():
-        if isinstance(body, dict):
-            entries.append({**body, "id": body.get("id", map_key)})
-    return entries
+    return (definition or read_solution_definition(workspace)).entries("forms")
 
 
-def _collect_forms(workspace: pathlib.Path) -> list[dict]:
-    return _collect_manifest_entities(workspace, "forms.yaml", "forms")
+def _collect_agents(workspace: pathlib.Path, *, definition=None) -> list[dict]:
+    from bifrost.solution_definition import read_solution_definition
+
+    return (definition or read_solution_definition(workspace)).entries("agents")
 
 
-def _collect_agents(workspace: pathlib.Path) -> list[dict]:
-    return _collect_manifest_entities(workspace, "agents.yaml", "agents")
-
-
-def _collect_events(workspace: pathlib.Path) -> list[dict]:
+def _collect_events(workspace: pathlib.Path, *, definition=None) -> list[dict]:
     """Read event/schedule triggers from .bifrost/events.yaml (keyed by EventSource UUID)."""
-    return _collect_manifest_entities(workspace, "events.yaml", "events")
+    from bifrost.solution_definition import read_solution_definition
+
+    return (definition or read_solution_definition(workspace)).entries("events")
 
 
 # Text source files sent inline as UTF-8 in ``src_files``. Everything else in
@@ -1220,7 +1401,7 @@ _LOGO_CONTENT_TYPES = {
 }
 
 
-def _collect_apps(workspace: pathlib.Path) -> list[dict]:
+def _collect_apps(workspace: pathlib.Path, *, definition=None) -> list[dict]:
     """Read app entries from .bifrost/apps.yaml (keyed by UUID) + their source.
 
     Each app's source dir (``path``, e.g. ``apps/dash``) is read into
@@ -1230,16 +1411,13 @@ def _collect_apps(workspace: pathlib.Path) -> list[dict]:
     """
     import base64
 
-    apps_file = _bifrost_manifest(workspace, "apps.yaml")
-    if apps_file is None or not apps_file.is_file():
-        return []
-    data = yaml.safe_load(apps_file.read_text()) or {}
-    raw = data.get("apps", {})
+    from bifrost.solution_definition import read_solution_definition
+
+    raw = (definition or read_solution_definition(workspace)).entries("apps")
     entries: list[dict] = []
     ws_root = os.path.realpath(workspace)
-    for key, body in raw.items():
-        if not isinstance(body, dict):
-            continue
+    for body in raw:
+        key = body["id"]
         # ``body["path"]`` is manifest-controlled; confine the app dir to the
         # workspace (realpath + startswith — the recognized traversal barrier)
         # so a crafted ``path: ../../etc`` can't read outside the bundle.
@@ -1307,6 +1485,10 @@ def _collect_apps(workspace: pathlib.Path) -> list[dict]:
             "id": body.get("id", key),
             "slug": body.get("slug") or key,
             "name": body.get("name") or key,
+            # The manifest-relative source dir. The workspace projection needs
+            # it (ManifestApp.path is required); the deployer keeps its
+            # apps/{slug} fallback for entries that predate it.
+            "path": body.get("path"),
             # description is deploy-owned: _upsert_apps full-replaces it, so
             # dropping it here would CLEAR the deployed app's description on every
             # deploy (non-round-tripping — Codex #16).
@@ -1330,6 +1512,10 @@ def _collect_apps(workspace: pathlib.Path) -> list[dict]:
             # UTF-8-encoding the base64 text (which would corrupt the asset).
             "dist_files": body.get("dist_files"),
             "bin_dist_files": body.get("bin_dist_files"),
+            # Set only on the deployment ZIP overlay after a local build reads
+            # the exact SDK package npm installed. It is not portable manifest
+            # content and is stripped from later exports.
+            "prebuilt_sdk_metadata": body.get("prebuilt_sdk_metadata"),
         })
     return entries
 
@@ -1423,6 +1609,33 @@ def _run_local_vite_build(
     )
 
 
+def _installed_sdk_build_metadata(app_dir: pathlib.Path) -> dict[str, str | int] | None:
+    """Return the complete SDK stamp from the package the local build installed."""
+    pkg_file = app_dir / "node_modules" / "bifrost" / "package.json"
+    try:
+        package = json.loads(pkg_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    stamp = package.get("bifrost")
+    package_version = package.get("version")
+    fingerprint = stamp.get("fingerprint") if isinstance(stamp, dict) else None
+    contract_version = stamp.get("contract") if isinstance(stamp, dict) else None
+    if (
+        not isinstance(package_version, str)
+        or not package_version
+        or not isinstance(fingerprint, str)
+        or not fingerprint
+        or not isinstance(contract_version, int)
+        or isinstance(contract_version, bool)
+    ):
+        return None
+    return {
+        "package_version": package_version,
+        "fingerprint": fingerprint,
+        "contract_version": contract_version,
+    }
+
+
 def _prebuild_apps(
     workspace: pathlib.Path,
     apps: list[dict],
@@ -1483,6 +1696,7 @@ def _prebuild_apps(
                     npx=npx,
                     base=f"/api/applications/{deployed_id}/dist/",
                 )
+                sdk_metadata = _installed_sdk_build_metadata(workdir)
                 dist_dir = workdir / "dist"
                 dist_paths = [p for p in dist_dir.rglob("*") if p.is_file()]
                 if not dist_paths:
@@ -1514,6 +1728,8 @@ def _prebuild_apps(
             "dist_files": dist_files,
             "bin_dist_files": bin_dist_files,
         }
+        if sdk_metadata is not None:
+            built[app_id_text]["prebuilt_sdk_metadata"] = sdk_metadata
     return built
 
 
@@ -1540,6 +1756,8 @@ def _apps_manifest_with_prebuilt_dist(
             continue
         body["dist_files"] = dist["dist_files"]
         body["bin_dist_files"] = dist["bin_dist_files"]
+        if "prebuilt_sdk_metadata" in dist:
+            body["prebuilt_sdk_metadata"] = dist["prebuilt_sdk_metadata"]
         remaining.discard(app_id)
     if remaining:
         raise click.ClickException(
@@ -1788,7 +2006,7 @@ def _entities_in_manifest(workspace: pathlib.Path) -> list[dict[str, str]]:
 
 
 @solution_group.command(
-    name="pull",
+    name="pull-manifests",
     help="Pull captured entities into the local .bifrost/ manifest (does not touch source code).",
 )
 @click.argument("path", type=click.Path(exists=True, file_okay=False), default=".")
@@ -1805,6 +2023,12 @@ def pull_cmd(path: str, solution_id: str | None, org: str | None, is_global: boo
     entities it materialized so the matching ``pending_captures`` rows clear.
     Safe for an agent to run (it only rewrites the generated manifest).
     """
+    if click.get_current_context().info_name == "pull":
+        click.echo(
+            "Warning: `bifrost solution pull` is deprecated; use "
+            "`bifrost solution pull-manifests`.",
+            err=True,
+        )
     workspace = _workspace_from_path_arg(path)
     if not is_solution_workspace(workspace):
         raise click.ClickException(
@@ -1884,6 +2108,11 @@ def pull_cmd(path: str, solution_id: str | None, org: str | None, is_global: boo
         raise SystemExit(rc)
 
 
+# Kept for released CLI scripts. Both spellings intentionally execute the same
+# command callback so the manifest-only behavior cannot drift.
+solution_group.add_command(pull_cmd, "pull")
+
+
 async def _poll_deploy_job(
     client,
     job_id: str,
@@ -1891,8 +2120,9 @@ async def _poll_deploy_job(
     interval: float = 3.0,
     action: str = "Deploy",
     timeout_seconds: float = DEPLOY_JOB_TIMEOUT_SECONDS,
+    interactive: bool | None = None,
 ) -> int:
-    """Poll a deploy/install job until terminal, printing a heartbeat each tick.
+    """Poll a deploy/install job until terminal with TTY-aware progress.
 
     The deploy and install endpoints run the (often >30s) work as a background job
     and return immediately, so the CLI polls for the result instead of holding one
@@ -1901,10 +2131,44 @@ async def _poll_deploy_job(
 
     ``action`` is the verb used in the messages ("Deploy" / "Install"); the
     grammar assumes ``<action>ing`` reads naturally ("Deploying" / "Installing").
+    Interactive terminals get an in-place spinner between the three-second HTTP
+    polls. Redirected/CI output only receives durable phase and terminal lines.
     """
     gerund = f"{action[:-1]}ing" if action.endswith("e") else f"{action}ing"
+    if interactive is None:
+        interactive = bool(click.get_text_stream("stdout").isatty())
     start = time.monotonic()
     last_phase: str | None = None
+
+    async def _wait_for_next_poll() -> None:
+        if interval <= 0:
+            return
+        if not interactive:
+            await asyncio.sleep(interval)
+            return
+
+        frames = "|/-\\"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + interval
+        width = 0
+        frame_index = 0
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return
+                elapsed = int(time.monotonic() - start)
+                message = f"{frames[frame_index % len(frames)]} {gerund}... {elapsed}s"
+                width = max(width, len(message))
+                click.echo(f"\r{message}", nl=False)
+                frame_index += 1
+                await asyncio.sleep(min(0.08, remaining))
+        finally:
+            click.echo(f"\r{' ' * width}\r", nl=False)
+
+    def _job_details_url() -> str:
+        return f"{client.api_url.rstrip('/')}/api/platform-jobs/{job_id}"
+
     while True:
         resp = await client.get(f"/api/solutions/deploy-jobs/{job_id}")
         if resp.status_code != 200:
@@ -1913,6 +2177,7 @@ async def _poll_deploy_job(
                 f"({resp.status_code}): {resp.text[:200]}",
                 err=True,
             )
+            click.echo(f"Job details: {_job_details_url()}", err=True)
             return 1
         body = resp.json()
         status = body.get("status")
@@ -1928,6 +2193,16 @@ async def _poll_deploy_job(
             return 0
         if status == "failed":
             error = body.get("error") or "unknown error"
+            error_code: str | None = None
+            try:
+                platform_response = await client.get(f"/api/platform-jobs/{job_id}")
+                if platform_response.status_code == 200:
+                    platform_error = platform_response.json().get("error") or {}
+                    if isinstance(platform_error, dict):
+                        error = platform_error.get("message") or error
+                        error_code = platform_error.get("code")
+            except Exception:  # noqa: BLE001 - diagnostics must not mask deploy error
+                pass
             # The build gates now surface as a failed job — re-attach the
             # deliberate-override hints so the operator knows how to proceed.
             if "older than installed" in error:
@@ -1943,7 +2218,9 @@ async def _poll_deploy_job(
                     f"{error}\nRe-run with --replace-secrets to overwrite "
                     "conflicting config values, or --replace-data for table data."
                 )
-            click.echo(f"{action} failed: {error}", err=True)
+            code_note = f" [{error_code}]" if error_code else ""
+            click.echo(f"{action} failed{code_note}: {error}", err=True)
+            click.echo(f"Job details: {_job_details_url()}", err=True)
             return 1
         phase = (body.get("result") or {}).get("phase")
         if isinstance(phase, str) and phase and phase != last_phase:
@@ -1956,10 +2233,9 @@ async def _poll_deploy_job(
                 f"(job {job_id}). Check the job status before retrying.",
                 err=True,
             )
+            click.echo(f"Job details: {_job_details_url()}", err=True)
             return 1
-        elapsed = int(elapsed_seconds)
-        click.echo(f"Still {gerund.lower()}... {elapsed}s")
-        await asyncio.sleep(interval)
+        await _wait_for_next_poll()
 
 
 # Vendoring modules/ + shared/ into a Solution can balloon the bundle; warn the
@@ -2111,14 +2387,18 @@ def deploy_cmd(
             f"No {DESCRIPTOR_FILENAME} in {workspace} — not a Solution workspace. "
             f"Run `bifrost solution init` first."
         )
-    descriptor = load_descriptor(workspace)
+    from bifrost.solution_definition import read_solution_definition
 
     click.echo("Scanning solution files...")
-    python_files = _collect_python_files(workspace)
-    workflows = _collect_workflows(workspace)
-    apps = _collect_apps(workspace)
-    forms = _collect_forms(workspace)
-    agents = _collect_agents(workspace)
+    definition = read_solution_definition(workspace)
+    descriptor = definition.descriptor
+    if descriptor is None:  # guarded by is_solution_workspace above
+        raise click.ClickException(f"No {DESCRIPTOR_FILENAME} in {workspace}")
+    python_files = _collect_python_files(workspace, definition=definition)
+    workflows = _collect_workflows(workspace, definition=definition)
+    apps = _collect_apps(workspace, definition=definition)
+    forms = _collect_forms(workspace, definition=definition)
+    agents = _collect_agents(workspace, definition=definition)
     click.echo(
         f"  found {len(python_files)} python file(s), {len(workflows)} workflow(s), "
         f"{len(apps)} app(s), {len(forms)} form(s), {len(agents)} agent(s)."
@@ -2148,11 +2428,11 @@ def deploy_cmd(
         target_id = binding.solution_id
 
         # Vendor referenced _repo/ shared modules into the bundle so the deployed
-        # Solution is self-contained (criterion 5). When global_repo_access is on
+        # Solution is self-contained (criterion 5). When allow_outbound_access is on
         # the install can reach _repo/ at runtime, so vendoring is skipped.
         bundle_python = python_files
         vendored: dict[str, str] = {}
-        if not descriptor.global_repo_access:
+        if not descriptor.allow_outbound_access:
             from bifrost.solution_vendoring import vendor_shared_deps
 
             # Vendoring scans imports and reads each referenced _repo/ module
@@ -2184,6 +2464,11 @@ def deploy_cmd(
             else:
                 click.echo("  no shared dependencies to vendor.")
 
+        # Vendored modules do not pass through the workspace collector. Validate
+        # the assembled map before app prebuild or artifact upload so server and
+        # local deployment accept the same Python candidate.
+        _validate_solution_python_files(bundle_python)
+
         source_apps = [
             app for app in apps if (app.get("src_files") or app.get("bin_files"))
         ]
@@ -2210,7 +2495,10 @@ def deploy_cmd(
             extra_text_files=extra_text_files,
         )
 
-        click.echo("Uploading workspace zip...")
+        if prebuilt:
+            click.echo("Uploading workspace artifact (source + locally built app dist)...")
+        else:
+            click.echo("Uploading workspace artifact...")
         # Deploy is async server-side; the POST returns a job id quickly. We give
         # the upload itself a generous timeout (large bundles) but never block on
         # the deploy work — that is observed via the poll loop below.
@@ -2540,6 +2828,23 @@ def _vite_child_env(
     return env
 
 
+async def _bind_dev_app(client, chosen, solution_id):
+    """Resolve portable app identity and establish user-bound install provenance."""
+    from dataclasses import replace
+
+    from bifrost.solution_dev.session import SolutionDevSession
+
+    session = SolutionDevSession(client, solution_id, chosen.app_id)
+    try:
+        await session.headers()
+    except httpx.HTTPError as exc:
+        raise click.ClickException(
+            f"Could not establish Solution development context: {exc}"
+        ) from exc
+    client._solution_dev_session = session
+    return replace(chosen, app_id=session.app_id)
+
+
 @solution_group.command(
     name="start",
     help=(
@@ -2607,6 +2912,8 @@ def start_cmd(
     except AppSelectionError as exc:
         raise click.ClickException(str(exc))
 
+    chosen = asyncio.run(_bind_dev_app(client, chosen, binding.solution_id))
+
     main_tsx = chosen.app_dir / "src" / "main.tsx"
     if main_tsx_needs_dev_fallback(main_tsx):
         click.echo(PATCH_HINT, err=True)
@@ -2621,7 +2928,7 @@ def start_cmd(
         user=client.user, org=org_info, solution_id=binding.solution_id
     )
 
-    host = FunctionHost(workspace)
+    host = FunctionHost(workspace, client=client)
     host.reload()
     refs = host.refs()
     click.echo(f"Discovered {len(refs)} local function(s):")
@@ -2760,7 +3067,7 @@ def start_cmd(
                 binding.solution_id,
                 bind_host,
                 proxy_origin,
-                descriptor.global_repo_access,
+                descriptor.allow_outbound_access,
             )
         )
     finally:
@@ -2946,71 +3253,9 @@ def capture_cmd(
         raise SystemExit(rc)
 
 
-# Composed shadcn "recipe" components (not a single `add`): primitives + a small
-# vendored wrapper. migrate-app vendors the combobox wrapper from this template.
-_COMBOBOX_WRAPPER = '''\
-import { useState } from "react";
-import { Check, ChevronsUpDown } from "lucide-react";
-
-import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
-import {
-  Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList,
-} from "@/components/ui/command";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-
-export interface ComboboxOption { value: string; label: string; }
-export interface ComboboxProps {
-  options: ComboboxOption[];
-  value?: string;
-  onValueChange?: (value: string) => void;
-  placeholder?: string;
-  searchPlaceholder?: string;
-  emptyText?: string;
-  className?: string;
-}
-
-export function Combobox({
-  options, value, onValueChange, placeholder = "Select…",
-  searchPlaceholder = "Search…", emptyText = "No results.", className,
-}: ComboboxProps) {
-  const [open, setOpen] = useState(false);
-  const selected = options.find((o) => o.value === value);
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button variant="outline" role="combobox" aria-expanded={open}
-          className={cn("w-full justify-between font-normal", className)}>
-          {selected ? selected.label : placeholder}
-          <ChevronsUpDown className="opacity-50" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-(--radix-popover-trigger-width) p-0">
-        <Command>
-          <CommandInput placeholder={searchPlaceholder} />
-          <CommandList>
-            <CommandEmpty>{emptyText}</CommandEmpty>
-            <CommandGroup>
-              {options.map((o) => (
-                <CommandItem key={o.value} value={o.label}
-                  onSelect={() => { onValueChange?.(o.value); setOpen(false); }}>
-                  <Check className={cn(value === o.value ? "opacity-100" : "opacity-0")} />
-                  {o.label}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
-}
-'''
-
-
 @solution_group.command(
     name="migrate-app",
-    help="Migrate a v1 inline app dir to a scaffolded standalone_v2 app: scaffold "
+    help="Migrate a v1 inline App directory to a scaffolded V2 App: scaffold "
     "+ port source + rewrite imports + install shadcn. STOPS before build/wire and "
     "prints a checklist of the judgment steps left to you.",
 )
@@ -3026,135 +3271,12 @@ def migrate_app_cmd(source: str, v2_slug: str, title: str | None) -> None:
     v1 layout (``pages/`` + ``components/``); anything else is reported, not
     guessed.
     """
-    import shutil as _shutil
-    import subprocess as _sp
-
     src_dir = pathlib.Path(source).resolve()
     title = title or v2_slug
-
-    # 1. Scaffold the v2 skeleton (Tailwind v4 + radix-rhea + theme already wired).
     app_dir = _scaffold_app(v2_slug, None)
+    from bifrost.app_migration import migrate_v1_source
 
-    # 2. Port v1 source. v1 layout = pages/ + components/ (+ _layout.tsx). Copy
-    #    what exists; report anything unexpected rather than guessing.
-    notes: list[str] = []
-    (app_dir / "src" / "pages").mkdir(parents=True, exist_ok=True)
-    (app_dir / "src" / "components").mkdir(parents=True, exist_ok=True)
-    # Port ALL source files under pages/ + components/ — not just .tsx. A page or
-    # component routinely imports a sibling .ts helper (e.g. metricDefinitions.ts),
-    # a .css, or a .tsx that's a util; dropping those silently breaks the build.
-    ported = 0
-    _SRC_EXT = {".tsx", ".ts", ".jsx", ".js", ".css", ".json"}
-    for sub in ("pages", "components"):
-        srcsub = src_dir / sub
-        if srcsub.is_dir():
-            for f in srcsub.rglob("*"):
-                if not f.is_file() or ".tmp." in f.name or f.suffix not in _SRC_EXT:
-                    continue
-                rel = f.relative_to(srcsub)
-                dest = app_dir / "src" / sub / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                _shutil.copy(f, dest)
-                ported += 1
-    # The v1 _layout.tsx defines the app's shared nav chrome (NavLink sections +
-    # <Outlet/>). It's NOT auto-wired — port it next to the pages so it's visible,
-    # and the checklist tells the human to turn it into the v2 RootLayout.
-    layout_src = src_dir / "_layout.tsx"
-    has_layout = layout_src.is_file()
-    if has_layout:
-        _shutil.copy(layout_src, app_dir / "src" / "_layout.tsx")
-        ported += 1
-    # Flag non-standard top-level files (e.g. app.yaml, extra dirs) NOT ported.
-    extras = [
-        p.name for p in src_dir.iterdir()
-        if p.name not in ("pages", "components", "_layout.tsx")
-        and not p.name.startswith(".")
-    ]
-    if extras:
-        notes.append(f"v1 app had non-standard top-level entries not auto-ported: {extras} — review by hand.")
-
-    # 3. Deterministic import rewrite (--v2) — compute the shadcn-add list + split.
-    from bifrost.migrate_v2 import (
-        compute_shadcn_adds,
-        is_ui_source,
-        rewrite_v2_imports,
-        scan_third_party_deps,
-    )
-    from bifrost.migrate_imports import load_lucide_icon_names
-
-    lucide = frozenset(load_lucide_icon_names())
-    tsx_files = [
-        p for p in sorted((app_dir / "src").rglob("*.tsx")) if not is_ui_source(p)
-    ]
-    sources = {p: p.read_text(encoding="utf-8") for p in tsx_files}
-    adds = compute_shadcn_adds(list(sources.values()))
-    for p, srctext in sources.items():
-        new = rewrite_v2_imports(srctext, lucide)
-        if new != srctext:
-            p.write_text(new, encoding="utf-8")
-    # Third-party deps the v1 app imports DIRECTLY (not from bifrost) — the rewrite
-    # leaves these alone, so they must be npm-installed or the build breaks on e.g.
-    # recharts. Scan the post-rewrite sources (so our own @/ + sonner additions
-    # don't count) across ALL ported source, not just tsx.
-    all_src = [p.read_text() for p in (app_dir / "src").rglob("*")
-               if p.is_file() and p.suffix in {".tsx", ".ts", ".jsx", ".js"}
-               and not is_ui_source(p)]
-    third_party = scan_third_party_deps(all_src)
-    # Collect TODO markers (unresolved v1 imports) + no-v2-equivalent hooks.
-    unresolved = [p.name for p, _ in sources.items() if "TODO(migrate)" in p.read_text()]
-    no_v2_hook = sorted({
-        h for txt in (p.read_text() for p in tsx_files)
-        for h in ("useUser", "useAppState", "RequireRole") if h in txt
-    })
-
-    # 4. Install shadcn components (real radix-rhea source) + recipe + third-party.
-    click.echo("Installing dependencies …")
-    _sp.run(["npm", "install"], cwd=app_dir, check=False, capture_output=True)
-    if adds:
-        click.echo(f"shadcn components: {' '.join(adds)}")
-        _sp.run(["npx", "shadcn@latest", "add", *adds, "--yes"],
-                cwd=app_dir, check=False, capture_output=True)
-        _sp.run(["npm", "install", "radix-ui", "sonner"],
-                cwd=app_dir, check=False, capture_output=True)
-        # Vendor the combobox recipe wrapper if the app uses it.
-        if "combobox" in adds:
-            (app_dir / "src" / "components" / "ui" / "combobox.tsx").write_text(_COMBOBOX_WRAPPER)
-    if third_party:
-        click.echo(f"third-party deps (direct v1 imports): {' '.join(third_party)}")
-        _sp.run(["npm", "install", *third_party], cwd=app_dir, check=False, capture_output=True)
-
-    # 5. STOP. Print the judgment checklist — never silently build/wire/deploy.
-    click.echo("")
-    click.echo(f"✓ Ported {ported} file(s), {len(adds)} shadcn component(s), "
-               f"{len(third_party)} third-party dep(s).")
-    click.echo("")
-    click.echo("NEXT (human judgment — migrate-app stops here ON PURPOSE):")
-    # Route wiring — the load-bearing step. v1 used FILE-BASED routing
-    # (pages/<path>.tsx → /<path>, [id].tsx → :id, _layout.tsx = shared chrome).
-    # v2 uses plain react-router, so the routes must be authored explicitly.
-    click.echo("  1. Wire src/App.tsx routes from the ported pages. v1 used FILE-BASED routing;")
-    click.echo("     recreate it with react-router: pages/foo.tsx → <Route path=\"foo\">, ")
-    click.echo("     pages/a/b.tsx → path=\"a/b\", pages/x/[id].tsx → path=\"x/:id\" (useParams()).")
-    click.echo(f"     Add <BifrostHeader title=\"{title}\"/> + <Toaster/> at the top.")
-    if has_layout:
-        click.echo("     src/_layout.tsx is the v1 shared nav chrome — make it the RootLayout: a")
-        click.echo("     parent <Route element={<RootLayout/>}> whose RootLayout renders the nav +")
-        click.echo("     <Outlet/>; nest the section pages under it. (It already uses <Outlet/>.)")
-    if unresolved:
-        click.echo(f"  2. Resolve TODO(migrate) imports in: {unresolved} (no auto-mapping found).")
-    if no_v2_hook:
-        click.echo(f"  3. Port v1-only hooks (NO v2 SDK equivalent): {no_v2_hook}. There is no")
-        click.echo("     useUser in v2 — use `useBifrostContext()` from \"bifrost\" for token/org/")
-        click.echo("     logout/theme; decode the JWT in ctx.token if you need the user's email.")
-    click.echo("  4. Workflow refs: rewrite any UUID refs to portable path::fn (and ensure "
-               "those workflows exist in the target env).")
-    for n in notes:
-        click.echo(f"  • {n}")
-    click.echo("  5. `npm run build` (must pass — a build error names the missing import), then")
-    click.echo("     `bifrost solution start` AND screenshot at least 2 routes (render ≠ build).")
-    click.echo("  6. Cutover: `bifrost solution swap-slugs <old> <new>`, then `bifrost solution "
-               "capture` LAST (capture is terminal — deploy after it wipes captures).")
-    click.echo(f"\nApp at {app_dir}")
+    migrate_v1_source(src_dir, app_dir, title=title, lifecycle="solution")
 
 
 @solution_group.command(
@@ -3172,43 +3294,13 @@ def swap_slugs_cmd(app_a: str, app_b: str) -> None:
     is a deploy-owned property for those).
     """
 
-    async def _run() -> int:
-        client = BifrostClient.get_instance(require_auth=True)
+    from bifrost.commands.app import swap_app_slugs
 
-        async def _resolve(ref: str) -> str:
-            # An id passes straight through; a slug resolves via GET /{slug}.
-            try:
-                import uuid as _uuid
-
-                _uuid.UUID(ref)
-                return ref
-            except (ValueError, AttributeError):
-                pass
-            resp = await client.get(f"/api/applications/{ref}")
-            if resp.status_code != 200:
-                raise click.ClickException(
-                    f"No application '{ref}' ({resp.status_code}): {resp.text[:160]}"
-                )
-            return resp.json()["id"]
-
-        a_id = await _resolve(app_a)
-        b_id = await _resolve(app_b)
-        resp = await client.post(
-            "/api/applications/swap-slugs", json={"app_a": a_id, "app_b": b_id}
+    asyncio.run(
+        swap_app_slugs(
+            BifrostClient.get_instance(require_auth=True), app_a, app_b
         )
-        if resp.status_code not in (200, 201):
-            raise click.ClickException(
-                f"Slug swap failed ({resp.status_code}): {resp.text[:300]}"
-            )
-        apps = resp.json().get("applications", [])
-        for app in apps:
-            click.echo(f"  {app['name']} → /apps/{app['slug']}")
-        click.echo("Slug swap complete.")
-        return 0
-
-    rc = asyncio.run(_run())
-    if rc:
-        raise SystemExit(rc)
+    )
 
 
 _SDK_DOWNLOAD_SUFFIX = "/api/sdk/download"
@@ -3444,6 +3536,71 @@ def sdk_update_cmd(path: str, app_slug: str | None, api_url: str | None) -> None
     click.echo(f"SDK updated: {old_fingerprint} -> {new_fingerprint}")
 
 
+@sdk_group.command("deployed-status")
+@click.argument("solution_ref")
+@click.pass_context
+def sdk_deployed_status_cmd(ctx: click.Context, solution_ref: str) -> None:
+    """Show deployed SDK status for Apps owned by a Solution install."""
+
+    async def run() -> dict[str, Any]:
+        client = BifrostClient.get_instance(require_auth=True)
+        solution_id = await RefResolver(client).resolve("solution", solution_ref)
+        response = await client.get(f"/api/solutions/{solution_id}/sdk/status")
+        response.raise_for_status()
+        return response.json()
+
+    output_result(asyncio.run(run()), ctx=ctx)
+
+
+@sdk_group.command("deployed-update")
+@click.argument("solution_ref")
+@click.pass_context
+def sdk_deployed_update_cmd(ctx: click.Context, solution_ref: str) -> None:
+    """Queue deployed SDK update jobs for Apps owned by a Solution install."""
+
+    async def run() -> dict[str, Any]:
+        client = BifrostClient.get_instance(require_auth=True)
+        solution_id = await RefResolver(client).resolve("solution", solution_ref)
+        response = await client.post(f"/api/solutions/{solution_id}/sdk/update")
+        response.raise_for_status()
+        body = response.json()
+
+        skipped = body.get("skipped", [])
+        for item in skipped:
+            click.echo(
+                f"Skipped {item.get('application_id')}: {item.get('reason')}",
+                err=True,
+            )
+
+        completed_jobs: list[dict[str, Any]] = []
+        failed_jobs: list[str] = []
+        for item in body.get("accepted", []):
+            job_id = str(item["job_id"])
+            click.echo(f"Queued Solution App SDK update job {job_id}", err=True)
+            try:
+                completed_jobs.append(
+                    await poll_platform_job(
+                        client,
+                        job_id,
+                        label="SDK update",
+                        failure_label="Solution App SDK update",
+                    )
+                )
+            except click.ClickException as exc:
+                failed_jobs.append(f"{job_id}: {exc.message}")
+
+        result = dict(body)
+        result["jobs"] = completed_jobs
+        if failed_jobs:
+            raise click.ClickException(
+                f"{len(failed_jobs)} Solution App SDK update job(s) failed: "
+                + "; ".join(failed_jobs)
+            )
+        return result
+
+    output_result(asyncio.run(run()), ctx=ctx)
+
+
 def _ensure_port_free(port: int) -> None:
     """Refuse to spawn vite onto a port something already serves.
 
@@ -3564,6 +3721,11 @@ def _dev_proxy_config(client, chosen, org_info, solution_id, global_repo_access)
         solution_id=solution_id,
         global_repo_access=global_repo_access,
         refresh_token=client.refresh_access_token,
+        dev_context_headers=(
+            client._solution_dev_session.headers
+            if getattr(client, "_solution_dev_session", None) is not None
+            else None
+        ),
     )
 
 
@@ -3606,6 +3768,189 @@ async def _serve(
         observer.stop()
         observer.join(timeout=2)
         await runner.cleanup()
+
+
+def _workspace_import_decisions(
+    preview: dict[str, Any], *, keep_all: bool, replace_all: bool,
+    decisions_path: pathlib.Path | None, json_output: bool,
+) -> list[dict[str, str]]:
+    conflicts = [item for item in preview.get("items", []) if item.get("classification") == "conflict"]
+    if keep_all and replace_all:
+        raise click.UsageError("--keep-all and --replace-all cannot be combined")
+    if decisions_path is not None:
+        raw = json.loads(decisions_path.read_text())
+        values = raw.get("decisions", raw) if isinstance(raw, dict) else raw
+        if not isinstance(values, list):
+            raise click.ClickException("--decisions must contain a JSON list or {\"decisions\": [...]} object")
+        supplied = {item.get("item_id"): item for item in values if isinstance(item, dict)}
+        if set(supplied) != {item["id"] for item in conflicts}:
+            raise click.ClickException("--decisions must explicitly cover every conflict")
+        return values
+    if keep_all or replace_all:
+        action = "keep" if keep_all else "replace"
+        return [{"item_id": item["id"], "action": action} for item in conflicts]
+    if not conflicts:
+        return []
+    if json_output or not click.get_text_stream("stdin").isatty():
+        raise click.ClickException("Use --keep-all, --replace-all, or --decisions for noninteractive workspace imports.")
+    click.echo("Warning: workspace import creates uncommitted changes; review references and run compatibility checks before committing.")
+    decisions: list[dict[str, str]] = []
+    remaining_action: str | None = None
+    for item in conflicts:
+        choice = remaining_action or click.prompt(
+            f"{item['kind']} {item['name']} [k]eep/[r]eplace/[K]eep all/[R]eplace all",
+            type=click.Choice(["k", "r", "K", "R"]),
+        )
+        if choice == "K":
+            remaining_action = "keep"
+            choice = "keep"
+        elif choice == "R":
+            remaining_action = "replace"
+            choice = "replace"
+        decisions.append({"item_id": item["id"], "action": "keep" if choice in {"k", "keep"} else "replace"})
+    return decisions
+
+
+def _print_workspace_import_preview(preview: dict[str, Any]) -> None:
+    """Render the staged workspace changes before any decisions are applied."""
+    items = preview.get("items", [])
+    conflicts = sum(item.get("classification") == "conflict" for item in items)
+    creates = sum(item.get("classification") == "create" for item in items)
+    unchanged = sum(item.get("classification") == "unchanged" for item in items)
+    if preview.get("source_kind") == "repo" or preview.get("repo_url"):
+        coords = " ".join(
+            part for part in (
+                f"repo {preview.get('repo_url')}" if preview.get("repo_url") else None,
+                f"ref {preview.get('git_ref')}" if preview.get("git_ref") else None,
+                f"path {preview.get('repo_subpath')}" if preview.get("repo_subpath") else None,
+                f"commit {preview.get('resolved_commit')}" if preview.get("resolved_commit") else None,
+            ) if part
+        )
+        if coords:
+            click.echo(f"Source: {coords} (one-time snapshot; no ongoing connection).")
+    scope = preview.get("organization_id")
+    click.echo(
+        f"Scope: {'organization ' + scope if scope else 'global workspace content'} "
+        "(files, integrations, and roles are always global)."
+    )
+    click.echo(
+        "Review compatibility: package definitions were designed together; "
+        "mixed keep/replace choices can change references."
+    )
+    click.echo(
+        "Workspace import preview: "
+        f"{conflicts} conflict{'s' if conflicts != 1 else ''}, "
+        f"{creates} create{'s' if creates != 1 else ''}, "
+        f"{unchanged} unchanged."
+    )
+    for warning in preview.get("warnings", []):
+        click.echo(f"Warning: {warning}")
+    click.echo("Warning: the result is unattached workspace content and creates uncommitted workspace Git changes.")
+    for item in items:
+        click.echo(
+            f"{item['classification']:<9} {item['kind']:<12} {item['name']}"
+        )
+        details = []
+        if item.get("match_key"):
+            details.append(f"matched by {item['match_key']}")
+        if item.get("target_id"):
+            details.append(f"replace preserves destination ID {item['target_id']}")
+        if details:
+            click.echo(f"  {'; '.join(details)}")
+
+
+@solution_group.command("import-workspace", help="Import a Solution package as unattached workspace content (one-time snapshot).")
+@click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path), required=False)
+@click.option("--repo", "repo_url", default=None, help="Solution git repository URL (snapshot import; mutually exclusive with ARCHIVE).")
+@click.option("--ref", "git_ref", default=None, help="Git ref to import (default branch when omitted).")
+@click.option("--path", "repo_subpath", default=None, help="Package subfolder within the repository.")
+@click.option("--org", "org_ref", default=None, help="Target organization name or UUID for scoped definitions. Omit for global workspace content.")
+@click.option("--global", "is_global", is_flag=True, help="Target global workspace content (the default).")
+@click.option("--keep-all", is_flag=True, help="Keep every conflicting destination item.")
+@click.option("--replace-all", is_flag=True, help="Replace every conflicting destination item.")
+@click.option("--decisions", type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path))
+@click.option("--preview", "preview_only", is_flag=True, help="Print the staged collision preview without queuing an import.")
+@click.option("--json", "json_output", is_flag=True, help="Emit raw preview and terminal job JSON.")
+def import_workspace_cmd(
+    archive: pathlib.Path | None, repo_url: str | None, git_ref: str | None,
+    repo_subpath: str | None, org_ref: str | None, is_global: bool,
+    keep_all: bool, replace_all: bool,
+    decisions: pathlib.Path | None, preview_only: bool, json_output: bool,
+) -> None:
+    """Preview, explicitly decide conflicts, and queue a workspace import."""
+    if archive is not None and repo_url is not None:
+        raise click.UsageError("ARCHIVE and --repo are mutually exclusive.")
+    if archive is None and repo_url is None:
+        raise click.UsageError("Provide ARCHIVE or --repo.")
+    if repo_url is None and (git_ref is not None or repo_subpath is not None):
+        raise click.UsageError("--ref and --path require --repo.")
+    async def _run() -> dict[str, Any]:
+        from bifrost.org_target import resolve_org_target
+
+        client = BifrostClient.get_instance(require_auth=True)
+        # Unlike entity commands (omit = your org), a workspace import defaults
+        # to global content; --org opts a single organization into scope.
+        try:
+            target = await resolve_org_target(org_ref, is_global, RefResolver(client))
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+        organization_id = target.organization_id
+        if repo_url is not None:
+            response = await client.post(
+                "/api/solutions/import-workspace/preview-repo",
+                json={
+                    "repo_url": repo_url,
+                    "git_ref": git_ref,
+                    "repo_subpath": repo_subpath,
+                    "organization_id": organization_id,
+                }, timeout=600,
+            )
+        else:
+            assert archive is not None
+            with archive.open("rb") as stream:
+                response = await client.post(
+                    "/api/solutions/import-workspace/preview",
+                    files={"file": (archive.name, stream, "application/zip")},
+                    data=(
+                        {"organization_id": organization_id}
+                        if organization_id is not None else {}
+                    ),
+                    timeout=600,
+                )
+        if response.status_code != 200:
+            raise click.ClickException(f"Workspace preview failed: {response.status_code} {response.text}")
+        preview = response.json()
+        if preview_only:
+            if not json_output:
+                _print_workspace_import_preview(preview)
+            return {"preview": preview}
+        if not json_output:
+            click.echo("Warning: package cohesion may change in workspace scope; review references and run compatibility checks.")
+        selected = _workspace_import_decisions(
+            preview, keep_all=keep_all, replace_all=replace_all,
+            decisions_path=decisions, json_output=json_output,
+        )
+        if not json_output:
+            for item in preview.get("items", []):
+                click.echo(f"{item['classification']:9} {item['kind']:12} {item['name']}")
+        queued = await client.post("/api/solutions/import-workspace", json={
+            "preview_token": preview["preview_token"], "decisions": selected,
+        })
+        if queued.status_code != 202:
+            raise click.ClickException(f"Workspace import enqueue failed: {queued.status_code} {queued.text}")
+        job = await poll_platform_job(
+            client, str(queued.json()["job_id"]), label="Workspace import",
+            timeout_operation="workspace import",
+        )
+        return {"preview": preview, "job": job}
+
+    result = asyncio.run(_run())
+    if json_output:
+        click.echo(json.dumps(result, default=str))
+    elif preview_only:
+        click.echo("Workspace import preview complete; no changes were queued.")
+    else:
+        click.echo("Workspace import completed with uncommitted workspace changes; review references and run compatibility checks before committing.")
 
 
 def handle_solution(args: list[str]) -> int:

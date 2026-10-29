@@ -101,13 +101,27 @@ class ManifestRole(EntityCodec, BaseModel):
         return ImportFields(direct={"id": self.id, "name": self.name})
 
 
+class ManifestWorkflowPermissionGrant(BaseModel):
+    """A permission a Solution workflow requests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    permission: str = Field(description="Permission, '<domain>.<read|readwrite|execute>'", **classify(FieldClass.CONTENT))
+
+
+class ManifestRequestedPermissions(BaseModel):
+    """A Solution workflow's requested permission mode and grants."""
+    mode: Literal["full", "restricted"] = Field(description="full | restricted", **classify(FieldClass.CONTENT))
+    grants: list[ManifestWorkflowPermissionGrant] = Field(default_factory=list, description="Grants; empty when mode is full", **classify(FieldClass.CONTENT))
+
+
 class ManifestWorkflow(EntityCodec, BaseModel):
     """Workflow entry in manifest."""
     id: str = Field(description="Workflow UUID", **classify(FieldClass.IDENTITY))
     name: str = Field(default="", description="MCP tool name; defaults to function_name on registration", **classify(FieldClass.CONTENT))
     path: str = Field(description="Relative path to Python file (e.g. 'workflows/onboard.py')", **classify(FieldClass.CONTENT, match_key=True))
-    function_name: str = Field(description="Python function name decorated with @workflow/@tool/@data_provider", **classify(FieldClass.CONTENT, match_key=True))
-    type: str = Field(default="workflow", description="workflow | tool | data_provider", **classify(FieldClass.CONTENT))
+    function_name: str = Field(description="Python function name decorated with @workflow/@tool/@data_provider/@service", **classify(FieldClass.CONTENT, match_key=True))
+    type: Literal["workflow", "tool", "data_provider", "service"] = Field(default="workflow", description="workflow | tool | data_provider | service", **classify(FieldClass.CONTENT))
     organization_id: str | None = Field(default=None, description="Org UUID (null = global)", **classify(FieldClass.ENVIRONMENT))
     # roles/role_names are ENVIRONMENT but install MUST carry them — they are the
     # access grant the deployer re-binds in the target org (capture also passes
@@ -131,6 +145,19 @@ class ManifestWorkflow(EntityCodec, BaseModel):
     )
     category: str = Field(default="General", description="Category for organization", **classify(FieldClass.CONTENT))
     tags: list[str] = Field(default_factory=list, description="Tags for filtering", **classify(FieldClass.CONTENT, install_view="keep_empty_list"))
+    # Portable, but not a `workflows` column: deploy writes it to
+    # solution_workflow_permission_requests. Git sync (plain _repo/) ignores it.
+    requested_permissions: ManifestRequestedPermissions | None = Field(
+        default=None,
+        description="Solution only: the permission mode and grants this workflow requests (needs admin approval on install)",
+        **classify(FieldClass.CONTENT),
+    )
+
+    def view(self, dest: Destination, *, extras: dict[str, Any] | None = None) -> dict:
+        out = super().view(dest, extras=extras)
+        if dest is Destination.GIT_SYNC:
+            out.pop("requested_permissions", None)
+        return out
 
     @classmethod
     def from_row(cls, wf, *, roles: list[str] | None = None) -> "ManifestWorkflow":
@@ -335,7 +362,7 @@ class ManifestAgent(EntityCodec, BaseModel):
     Import is INDEXER-ONLY (to_orm_values returns only indexer_content):
     - indexer_content: id, name (always), + description/system_prompt/channels/
       tool_ids/delegated_agent_ids/knowledge_sources/system_tools/mcp_connection_ids/
-      llm_model/llm_max_tokens (non-empty lists only, drop-none scalars) — fed to AgentIndexer.
+      llm_profile/llm_max_tokens (non-empty lists only, drop-none scalars) — fed to AgentIndexer.
     The importers resolve id/name/system_prompt on the metadata row and re-stamp
     access_level/max_iterations/max_token_budget (+ the max_run_timeout transport
     extra) directly AFTER the indexer; that direct-set + re-stamp is
@@ -380,7 +407,7 @@ class ManifestAgent(EntityCodec, BaseModel):
         # omits them (env-scoped grants deployed via _sync_agent_mcp_connections).
         **classify(FieldClass.REFERENCE, import_owner="indexer", install_view="drop"),
     )
-    llm_model: str | None = Field(default=None, description="Override LLM model (null = global default)", **classify(FieldClass.CONTENT, import_owner="indexer"))
+    llm_profile: str | None = Field(default=None, description="Model profile name (null = default profile assignment)", **classify(FieldClass.REFERENCE, import_owner="indexer"))
     llm_max_tokens: int | None = Field(default=None, description="Override LLM max tokens (null = global default)", **classify(FieldClass.CONTENT, import_owner="indexer"))
     # indexer-owned (carried in _agent_content_from_manifest / the AgentIndexer
     # YAML, per the spike's INDEXER_CONTENT_FIELDS); deploy/git-sync ALSO re-stamp
@@ -406,6 +433,10 @@ class ManifestAgent(EntityCodec, BaseModel):
         in (rather than read from relationships) so the caller controls
         eager-loading and ordering — matching the pattern used for workflow/form roles.
         """
+        # A transient agent may have no profile foreign key and a ``lazy=raise``
+        # relationship.  Do not touch that relationship in the null case.  A
+        # configured profile remains an explicit caller-loading contract.
+        llm_profile = agent.llm_profile.name if agent.llm_profile_id is not None else None
         return cls(
             id=str(agent.id),
             name=agent.name,
@@ -423,7 +454,7 @@ class ManifestAgent(EntityCodec, BaseModel):
             knowledge_sources=list(agent.knowledge_sources) if agent.knowledge_sources else [],
             system_tools=list(agent.system_tools) if agent.system_tools else [],
             mcp_connection_ids=[str(m) for m in (mcp_connection_ids or [])],
-            llm_model=agent.llm_model,
+            llm_profile=llm_profile,
             llm_max_tokens=agent.llm_max_tokens,
             max_iterations=agent.max_iterations,
             max_token_budget=agent.max_token_budget,
@@ -460,8 +491,8 @@ class ManifestAgent(EntityCodec, BaseModel):
             indexer["system_tools"] = list(self.system_tools)
         if self.mcp_connection_ids:
             indexer["mcp_connection_ids"] = list(self.mcp_connection_ids)
-        if self.llm_model is not None:
-            indexer["llm_model"] = self.llm_model
+        if self.llm_profile is not None:
+            indexer["llm_profile"] = self.llm_profile
         if self.llm_max_tokens is not None:
             indexer["llm_max_tokens"] = self.llm_max_tokens
         if self.max_iterations is not None:
@@ -674,6 +705,7 @@ class ManifestIntegration(EntityCodec, BaseModel):
     """Integration entry in manifest."""
     id: str = Field(description="Integration UUID", **classify(FieldClass.IDENTITY))
     name: str = Field(default="", description="Integration display name", **classify(FieldClass.CONTENT, match_key=True))
+    description: str | None = Field(default=None, description="Integration description", **classify(FieldClass.CONTENT))
     entity_id: str | None = Field(default=None, description="Field name for entity identifier", **classify(FieldClass.REFERENCE))
     entity_id_name: str | None = Field(default=None, description="Display label for entity ID field", **classify(FieldClass.CONTENT))
     default_entity_id: str | None = Field(default=None, description="Default entity ID value", **classify(FieldClass.REFERENCE))
@@ -695,6 +727,7 @@ class ManifestIntegration(EntityCodec, BaseModel):
         return cls(
             id=str(integ.id),
             name=integ.name,
+            description=integ.description,
             entity_id=integ.entity_id,
             entity_id_name=integ.entity_id_name,
             default_entity_id=integ.default_entity_id,
@@ -727,6 +760,7 @@ class ManifestIntegration(EntityCodec, BaseModel):
             direct={
                 "id": self.id,
                 "name": self.name,
+                "description": self.description,
                 "entity_id": self.entity_id,
                 "entity_id_name": self.entity_id_name,
                 "default_entity_id": self.default_entity_id,
@@ -742,6 +776,8 @@ class ManifestConfig(EntityCodec, BaseModel):
     key: str = Field(description="Config key name", **classify(FieldClass.CONTENT, match_key=True))
     config_type: str = Field(default="string", description="string | int | bool | json | secret", **classify(FieldClass.CONTENT))
     description: str | None = Field(default=None, description="Human-readable description", **classify(FieldClass.CONTENT))
+    required: bool = Field(default=False, description="Whether this config needs a value", **classify(FieldClass.CONTENT))
+    position: int = Field(default=0, description="Display order", **classify(FieldClass.CONTENT))
     organization_id: str | None = Field(default=None, description="Org UUID (null = global)", **classify(FieldClass.ENVIRONMENT, match_key=True))
     value: object | None = Field(default=None, description="Config value (null for secret type)", **classify(FieldClass.CONTENT, predicate="config_value"))
 
@@ -766,6 +802,8 @@ class ManifestConfig(EntityCodec, BaseModel):
             key=cfg.key,
             config_type=config_type,
             description=cfg.description,
+            required=cfg.required,
+            position=cfg.position,
             organization_id=str(cfg.organization_id) if cfg.organization_id else None,
             value=value,
         )
@@ -782,6 +820,8 @@ class ManifestConfig(EntityCodec, BaseModel):
                 "config_type": self.config_type,
                 "value": self.value,
                 "description": self.description,
+                "required": self.required,
+                "position": self.position,
             },
             indexer_content={},
             restamp={},
@@ -891,11 +931,13 @@ class ManifestFiles(BaseModel):
 
     locations: list[str] = Field(default_factory=list, **classify(FieldClass.CONTENT))
 
-    @field_validator("locations")
+    @field_validator("locations", mode="before")
     @classmethod
     def normalize_locations(cls, value: list[str]) -> list[str]:
         from shared.file_paths import validate_location_name
 
+        if not isinstance(value, list):
+            raise ValueError("locations must be a list")
         normalized: list[str] = []
         seen: set[str] = set()
         for raw in value:
@@ -944,7 +986,9 @@ class ManifestCustomClaim(EntityCodec, BaseModel):
     id: str = Field(description="Custom Claim UUID", **classify(FieldClass.IDENTITY))
     name: str = Field(description="Claim name, unique per org", **classify(FieldClass.CONTENT, match_key=True))
     description: str | None = Field(default=None, description="Human-readable description", **classify(FieldClass.CONTENT))
-    organization_id: str = Field(description="Org UUID", **classify(FieldClass.ENVIRONMENT, match_key=True))
+    # Null = global (unattached workspace content). Install and git-sync
+    # manifests always carry an org UUID; only the workspace projection clears it.
+    organization_id: str | None = Field(default=None, description="Org UUID (null = global)", **classify(FieldClass.ENVIRONMENT, match_key=True))
     type: Literal["list", "scalar"] = Field(default="list", description="list | scalar", **classify(FieldClass.CONTENT))
     query: ClaimQuery = Field(description="Source table query that resolves the claim", **classify(FieldClass.CONTENT))
 
@@ -1244,6 +1288,16 @@ class ManifestEventSource(EntityCodec, BaseModel):
     # Subscriptions
     subscriptions: list[ManifestEventSubscription] = Field(default_factory=list, description="Workflow subscriptions", **classify(FieldClass.CONTENT))
 
+    @field_validator("webhook_config")
+    @classmethod
+    def _without_signing_secret(cls, value: dict | None) -> dict | None:
+        """The HMAC signing secret is write-only instance state (encrypted in
+        the webhook source's state), so no manifest carries it. This also drops
+        the plaintext copy that manifests written before that change contain."""
+        if value is None:
+            return None
+        return {key: item for key, item in value.items() if key != "secret"}
+
     @classmethod
     def from_row(
         cls,
@@ -1491,12 +1545,9 @@ def parse_manifest(yaml_str: str) -> Manifest:
     """Parse a YAML string into a Manifest object."""
     if not yaml_str or not yaml_str.strip():
         return Manifest()
+    from bifrost.definition_validation import read_workspace_manifest
 
-    data = yaml.safe_load(yaml_str)
-    if not data or not isinstance(data, dict):
-        return Manifest()
-
-    return Manifest(**data)
+    return read_workspace_manifest(MANIFEST_LEGACY_FILE, yaml_str)
 
 
 def serialize_manifest(manifest: Manifest) -> str:
@@ -1580,16 +1631,16 @@ def parse_manifest_dir(files: dict[str, str]) -> Manifest:
     Missing files are treated as empty.
     """
     merged: dict[str, object] = {}
+    from bifrost.definition_validation import read_workspace_manifest
+
     for key, filename in MANIFEST_FILES.items():
         content = files.get(filename, "")
         if not content or not content.strip():
             continue
-        data = yaml.safe_load(content)
-        if data and isinstance(data, dict):
-            if key == "files":
-                merged[key] = data
-            else:
-                merged[key] = data.get(key)
+        decoded = read_workspace_manifest(filename, content)
+        value = getattr(decoded, key)
+        if value:
+            merged[key] = value
     return Manifest(**merged)  # type: ignore[arg-type]
 
 
@@ -1725,9 +1776,9 @@ def validate_manifest(manifest: Manifest) -> list[str]:
         if cfg.organization_id and cfg.organization_id not in org_ids:
             errors.append(f"Config '{key}' references unknown organization: {cfg.organization_id}")
 
-    # Claims: organization_id
+    # Claims: organization_id (null = global workspace content, always valid)
     for _key, claim in manifest.claims.items():
-        if claim.organization_id not in org_ids:
+        if claim.organization_id and claim.organization_id not in org_ids:
             errors.append(
                 f"Custom claim '{claim.name}' references unknown organization: "
                 f"{claim.organization_id}"

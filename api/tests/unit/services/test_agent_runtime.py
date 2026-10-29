@@ -11,8 +11,8 @@ import pytest
 from openai.types.chat import ChatCompletion
 from pydantic_ai import Agent as PydanticAgent
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai_harness.cache_stability import CacheStabilityMonitor
-from pydantic_ai_harness.compaction import LimitWarner, TieredCompaction
+from pydantic_ai_harness.compaction import TieredCompaction, WarnNearLimits
+from pydantic_ai_harness.warn_on_cache_busts import WarnOnCacheBusts
 from pydantic_ai.messages import (
     BinaryContent,
     ModelMessage,
@@ -165,6 +165,43 @@ def test_create_agent_model_supports_every_configured_provider(
 
     assert model.model_name == "test-model"
     assert model.system == expected_system
+    provider_client = model.provider.client
+    if provider == "google":
+        assert provider_client._api_client._async_httpx_client is not None
+    else:
+        assert provider_client.max_retries == 0
+
+
+def test_openai_uses_pydantic_default_model() -> None:
+    from pydantic_ai.models.openai import OpenAIResponsesModel
+
+    config = LLMConfig(
+        provider="openai",
+        model="gpt-5.6-luna",
+        api_key="test-key",
+        endpoint="https://foundry.example.test/openai/v1",
+    )
+
+    model = create_agent_model(config)
+
+    assert isinstance(model, OpenAIResponsesModel)
+    assert agent_model_settings(config, max_tokens=None, session_id="run-1").get(
+        "openai_store"
+    ) is False
+
+
+def test_openai_uses_detected_chat_completions_transport() -> None:
+    from pydantic_ai.models.openai import OpenAIChatModel
+
+    config = LLMConfig(
+        provider="openai",
+        model="chat-only-model",
+        api_key="test-key",
+        endpoint="https://models.example.test/v1",
+        openai_transport="chat_completions",
+    )
+
+    assert isinstance(create_agent_model(config), OpenAIChatModel)
 
 
 def test_create_agent_model_uses_native_openrouter_adapter() -> None:
@@ -182,6 +219,7 @@ def test_create_agent_model_uses_native_openrouter_adapter() -> None:
     assert isinstance(model, OpenRouterModel)
     assert model.model_name == "~deepseek/deepseek-v4-flash-latest"
     assert model.system == "openrouter"
+    assert model.provider.client.max_retries == 0
     settings = cast(OpenRouterModelSettings, model.settings)
     assert settings.get("openrouter_usage") == {"include": True}
 
@@ -202,6 +240,21 @@ def test_openrouter_runtime_uses_billing_identity_and_sticky_run_route() -> None
     ) == {
         "max_tokens": 4_096,
         "extra_body": {"session_id": "run-123"},
+    }
+
+
+def test_runtime_uses_provider_output_defaults_except_when_api_requires_limit() -> None:
+    openai = LLMConfig(provider="openai", model="gpt-5", api_key="test-key")
+    anthropic = LLMConfig(provider="anthropic", model="claude-sonnet", api_key="test-key")
+
+    assert agent_model_settings(openai, max_tokens=None, session_id="run-123") == {
+        "openai_store": False,
+    }
+    assert agent_model_settings(anthropic, max_tokens=None, session_id="run-123") == {
+        "max_tokens": 16_384,
+        "anthropic_cache": True,
+        "anthropic_cache_instructions": True,
+        "anthropic_cache_tool_definitions": True,
     }
 
 
@@ -309,18 +362,215 @@ def test_openrouter_stream_class_uses_bifrost_usage_mapper() -> None:
     assert stream.provider_details["cost"] == Decimal("0.000106904")
 
 
+OPENCODE_GO_ENDPOINT = "https://opencode.ai/zen/go/v1"
+
+
+def test_opencode_go_settings_carry_identity_headers() -> None:
+    config = LLMConfig(
+        provider="openai",
+        model="glm-5.3",
+        api_key="test-key",
+        endpoint=OPENCODE_GO_ENDPOINT,
+    )
+
+    assert provider_name_for_config(config) == "opencode_go"
+    settings = agent_model_settings(config, max_tokens=2_048, session_id="run-123")
+    headers = cast(dict[str, str], settings["extra_headers"])
+
+    assert settings["max_tokens"] == 2_048
+    assert headers["User-Agent"].startswith("Bifrost/")
+    assert headers["x-opencode-session"] == "run-123"
+    assert "openai_store" not in settings
+    assert "extra_body" not in settings
+
+
+def test_create_agent_model_uses_chat_completions_for_opencode_go() -> None:
+    from pydantic_ai.models.openai import OpenAIChatModel
+
+    config = LLMConfig(
+        provider="openai",
+        model="glm-5.3",
+        api_key="test-key",
+        endpoint=OPENCODE_GO_ENDPOINT,
+    )
+
+    model = create_agent_model(config)
+
+    assert isinstance(model, OpenAIChatModel)
+    assert model.provider.client.max_retries == 0
+
+
+def test_create_agent_model_uses_responses_for_opencode_go_responses_models() -> None:
+    from pydantic_ai.models.openai import OpenAIResponsesModel
+
+    config = LLMConfig(
+        provider="openai",
+        model="grok-4.7",
+        api_key="test-key",
+        endpoint=OPENCODE_GO_ENDPOINT,
+    )
+
+    model = create_agent_model(config)
+
+    assert isinstance(model, OpenAIResponsesModel)
+    settings = agent_model_settings(config, max_tokens=64, session_id="run-1")
+    assert "openai_store" not in settings
+    headers = cast(dict[str, str], settings["extra_headers"])
+    assert headers["x-opencode-session"] == "run-1"
+
+
+def test_create_agent_model_uses_anthropic_messages_for_opencode_go_messages_models() -> None:
+    from pydantic_ai.models.anthropic import AnthropicModel
+
+    config = LLMConfig(
+        provider="anthropic",
+        model="qwen3.8-flash",
+        api_key="test-key",
+        endpoint="https://opencode.ai/zen/go",
+    )
+
+    model = create_agent_model(config)
+
+    assert isinstance(model, AnthropicModel)
+    settings = agent_model_settings(config, max_tokens=64, session_id="run-1")
+    headers = cast(dict[str, str], settings["extra_headers"])
+    assert headers["x-opencode-session"] == "run-1"
+    assert headers["User-Agent"].startswith("Bifrost/")
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_messages_requests_target_the_messages_surface() -> None:
+    import httpx2
+
+    seen_requests: list[httpx2.Request] = []
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        seen_requests.append(request)
+        return httpx2.Response(
+            200,
+            json={
+                "id": "msg-test",
+                "type": "message",
+                "role": "assistant",
+                "model": "qwen3.8-flash",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            },
+        )
+
+    config = LLMConfig(
+        provider="anthropic",
+        model="qwen3.8-flash",
+        api_key="test-key",
+        endpoint="https://opencode.ai/zen/go",
+    )
+    settings = agent_model_settings(config, max_tokens=64, session_id="conv-msg")
+
+    http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    try:
+        with patch(
+            "src.services.agent_runtime.model_factory.get_ai_retry_http_client",
+            return_value=http_client,
+        ):
+            model = create_agent_model(config)
+            response = await model.request(
+                [ModelRequest(parts=[UserPromptPart(content="hello")])],
+                cast(ModelSettings, settings),
+                ModelRequestParameters(),
+            )
+    finally:
+        await http_client.aclose()
+
+    assert response.text == "hi"
+    assert len(seen_requests) == 1
+    request = seen_requests[0]
+    assert request.url.path == "/zen/go/v1/messages"
+    assert request.url.params.get("beta") == "true"
+    assert request.headers["x-api-key"] == "test-key"
+    assert request.headers["x-opencode-session"] == "conv-msg"
+    assert request.headers["User-Agent"].startswith("Bifrost/")
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_requests_send_identity_headers_on_the_wire() -> None:
+    import json
+
+    import httpx2
+
+    seen_requests: list[httpx2.Request] = []
+
+    async def handler(request: httpx2.Request) -> httpx2.Response:
+        seen_requests.append(request)
+        return httpx2.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 1_700_000_000,
+                "model": "deepseek-v4.1-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "hi"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 3,
+                    "total_tokens": 8,
+                },
+            },
+        )
+
+    config = LLMConfig(
+        provider="openai",
+        model="deepseek-v4.1-flash",
+        api_key="test-key",
+        endpoint=OPENCODE_GO_ENDPOINT,
+    )
+    settings = agent_model_settings(config, max_tokens=64, session_id="conv-9")
+
+    http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+    try:
+        with patch(
+            "src.services.agent_runtime.model_factory.get_ai_retry_http_client",
+            return_value=http_client,
+        ):
+            model = create_agent_model(config)
+            response = await model.request(
+                [ModelRequest(parts=[UserPromptPart(content="hello")])],
+                cast(ModelSettings, settings),
+                ModelRequestParameters(),
+            )
+    finally:
+        await http_client.aclose()
+
+    assert response.text == "hi"
+    assert len(seen_requests) == 1
+    request = seen_requests[0]
+    assert request.headers["x-opencode-session"] == "conv-9"
+    assert request.headers["User-Agent"].startswith("Bifrost/")
+    body = json.loads(request.content.decode("utf-8"))
+    # DeepSeek through Go keeps the legacy plain ``max_tokens`` wire field.
+    assert body["max_tokens"] == 64
+    assert "max_completion_tokens" not in body
+
+
 def test_budget_is_enforced_before_requests_and_warns_before_hard_stop() -> None:
     budget = AgentRunBudget(max_requests=9, max_total_tokens=100_000)
 
     limits = budget.usage_limits()
-    capabilities = build_runtime_capabilities(budget)
+    capabilities = build_runtime_capabilities(budget, context_window=None)
 
     assert limits.request_limit == 9
     assert limits.total_tokens_limit == 100_000
     assert limits.count_tokens_before_request is True
     assert any(isinstance(item, TieredCompaction) for item in capabilities)
-    assert any(isinstance(item, CacheStabilityMonitor) for item in capabilities)
-    warner = next(item for item in capabilities if isinstance(item, LimitWarner))
+    assert any(isinstance(item, WarnOnCacheBusts) for item in capabilities)
+    warner = next(item for item in capabilities if isinstance(item, WarnNearLimits))
     assert warner.max_iterations == 9
     assert warner.max_total_tokens == 100_000
     assert warner.warning_threshold == 0.7
@@ -330,7 +580,7 @@ def test_unconfigured_budget_disables_run_limits_but_keeps_context_governance() 
     budget = AgentRunBudget()
 
     limits = budget.usage_limits()
-    capabilities = build_runtime_capabilities(budget)
+    capabilities = build_runtime_capabilities(budget, context_window=None)
 
     assert limits.request_limit is None
     assert limits.total_tokens_limit is None
@@ -339,10 +589,11 @@ def test_unconfigured_budget_disables_run_limits_but_keeps_context_governance() 
         RunUsage(requests=1_000, input_tokens=1_000_000)
     )
     assert any(isinstance(item, TieredCompaction) for item in capabilities)
-    warner = next(item for item in capabilities if isinstance(item, LimitWarner))
+    warner = next(item for item in capabilities if isinstance(item, WarnNearLimits))
     assert warner.max_iterations is None
     assert warner.max_total_tokens is None
-    assert warner.max_context_tokens == budget.context_target_tokens
+    assert warner.max_context_tokens is None
+    assert warner.max_context_fraction == 1.0
 
 
 @pytest.mark.asyncio
@@ -577,6 +828,57 @@ async def test_legacy_complete_uses_stream_transport_for_large_output_limits() -
 
 
 @pytest.mark.asyncio
+async def test_direct_openai_complete_and_stream_disable_storage() -> None:
+    response = ModelResponse(
+        parts=[TextPart("hello")],
+        usage=RequestUsage(input_tokens=12, output_tokens=3),
+        model_name="test-model",
+        provider_name="openai",
+        finish_reason="stop",
+    )
+
+    class FakeStream:
+        def __aiter__(self):
+            async def events():
+                if False:
+                    yield None
+
+            return events()
+
+        def get(self):
+            return response
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStream()
+
+        async def __aexit__(self, *args):
+            return False
+
+    client = PydanticAIClient(
+        LLMConfig(provider="openai", model="test-model", api_key="test-key")
+    )
+    with patch(
+        "src.services.llm.pydantic_client.create_agent_model",
+        return_value=MagicMock(),
+    ), patch(
+        "src.services.llm.pydantic_client.model_request_stream",
+        side_effect=[FakeStreamContext(), FakeStreamContext()],
+    ) as request_stream:
+        await client.complete([LLMMessage(role="user", content="hello")])
+        _ = [
+            chunk
+            async for chunk in client.stream(
+                [LLMMessage(role="user", content="hello")]
+            )
+        ]
+
+    assert request_stream.call_count == 2
+    for call in request_stream.call_args_list:
+        assert call.kwargs["model_settings"]["openai_store"] is False
+
+
+@pytest.mark.asyncio
 async def test_toolset_preserves_stored_json_schema_and_emits_lifecycle_events() -> None:
     calls: list[tuple[str, dict]] = []
     events = []
@@ -615,6 +917,49 @@ async def test_toolset_preserves_stored_json_schema_and_emits_lifecycle_events()
     assert calls == [("get_ticket", {"ticket_id": 42})]
     assert result == {"ticket": 42}
     assert [event.type for event in events] == ["tool_call", "tool_result"]
+
+
+@pytest.mark.asyncio
+async def test_toolset_rejects_missing_and_unknown_args_before_executor() -> None:
+    calls: list[tuple[str, dict]] = []
+    events = []
+
+    async def execute(name: str, arguments: dict, tool_call_id: str) -> dict:
+        calls.append((name, arguments))
+        return {"ok": True}
+
+    async def observe(event) -> None:
+        events.append(event)
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    toolset = BifrostToolset(
+        [ToolDefinition(name="search_records", description="Search", parameters=schema)],
+        execute,
+        event_handler=observe,
+    )
+    ctx = MagicMock(tool_call_id="call-1")
+    tools = await toolset.get_tools(ctx)
+
+    result = await toolset.call_tool(
+        "search_records",
+        {"sql": "SELECT * FROM tickets"},
+        ctx,
+        tools["search_records"],
+    )
+
+    assert calls == []
+    assert result.startswith("Error: Arguments do not match the live tool schema.")
+    assert "required" in result
+    assert "unexpected" in result or "unexpected" in result.lower()
+    assert [event.type for event in events] == ["tool_call", "tool_error"]
+    assert events[-1].error is not None
 
 
 @pytest.mark.asyncio

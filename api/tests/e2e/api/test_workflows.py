@@ -92,6 +92,15 @@ async def e2e_test_validation(name: str, count: int = 1) -> dict:
         # Should have parameters extracted from function signature
         assert len(data["metadata"]["parameters"]) == 2
 
+    def test_validate_workflow_requires_platform_admin(self, e2e_client, org1_user):
+        """Validation imports the submitted module, so only platform admins may call it."""
+        response = e2e_client.post(
+            "/api/workflows/validate",
+            headers=org1_user.headers,
+            json={"path": "test_validation.py", "content": "x = 1\n"},
+        )
+        assert response.status_code == 403, response.text
+
     def test_validate_workflow_with_roi(self, e2e_client, platform_admin):
         """Validate workflow with time_saved and value fields (set via API, not decorator)."""
         workflow_with_roi = '''
@@ -289,6 +298,40 @@ async def timeout_bounds_workflow() -> str:
         finally:
             e2e_client.delete(
                 "/api/files/editor?path=timeout_bounds_workflow.py",
+                headers=platform_admin.headers,
+            )
+
+    def test_a_declared_memory_request_is_set_and_cleared(self, e2e_client, platform_admin):
+        """memory_request_mib overrides the learned value; null returns to it."""
+        content = '''from bifrost import workflow
+
+@workflow(name="memory_request_workflow", description="Memory request")
+async def memory_request_workflow() -> str:
+    return "ok"
+'''
+        workflow = write_and_register(
+            e2e_client, platform_admin.headers,
+            "memory_request_workflow.py", content, "memory_request_workflow",
+        )
+        try:
+            response = e2e_client.patch(
+                f"/api/workflows/{workflow['id']}",
+                headers=platform_admin.headers,
+                json={"memory_request_mib": 512},
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["memory_request_mib"] == 512
+
+            response = e2e_client.patch(
+                f"/api/workflows/{workflow['id']}",
+                headers=platform_admin.headers,
+                json={"memory_request_mib": None},
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["memory_request_mib"] is None
+        finally:
+            e2e_client.delete(
+                "/api/files/editor?path=memory_request_workflow.py",
                 headers=platform_admin.headers,
             )
 

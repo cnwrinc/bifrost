@@ -8,17 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-
-@dataclass(frozen=True)
-class PlatformJobPolicy:
-    timeout_seconds: int
-    max_attempts: int = 2
-    max_concurrency: int | None = None
-    retry_on_runner_loss: bool = True
-    min_memory_headroom_mb: int = 256
-    admission_memory_ratio: float = 0.85
-    hard_memory_ratio: float = 0.95
-    allow_running_cancellation: bool = False
+from src.jobs.platform.catalog import get_platform_job_metadata
+from src.jobs.platform.policy import PlatformJobPolicy
 
 
 class PlatformJobFailure(Exception):
@@ -28,11 +19,22 @@ class PlatformJobFailure(Exception):
         message: str,
         *,
         retryable: bool = False,
+        result: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.result = result
+
+
+class PlatformJobRequiresAction(Exception):
+    """Stop a job until a user completes an explicit follow-up action."""
+
+    def __init__(self, phase: str, result: dict[str, Any]) -> None:
+        super().__init__(phase)
+        self.phase = phase
+        self.result = result
 
 
 class PlatformJobCancelled(Exception):
@@ -56,6 +58,9 @@ class PlatformJobContext:
     requested_by_user_id: str
     requested_by_email: str
     requested_by_name: str
+    impersonated_by_user_id: UUID | None = None
+    impersonation_session_id: UUID | None = None
+    checkpoint: dict[str, Any] | None = None
 
     async def report(
         self,
@@ -89,6 +94,26 @@ class PlatformJobContext:
             platform_job_id=self.job_id,
         )
 
+    async def save_checkpoint(
+        self,
+        result: dict[str, Any],
+        *,
+        phase: str,
+        current: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        from src.services.platform_jobs import checkpoint_platform_job
+
+        if not await checkpoint_platform_job(
+            self.job_id,
+            self.lease_token,
+            result=result,
+            phase=phase,
+            current=current,
+            total=total,
+        ):
+            raise PlatformJobCancelled
+
 
 PlatformJobHandler = Callable[
     [PlatformJobContext, BaseModel],
@@ -104,3 +129,29 @@ class PlatformJobDefinition:
     handler: PlatformJobHandler
     policy: PlatformJobPolicy
     encrypt_payload: bool = False
+    # Product-surface copy for the Isolated Jobs list in Settings -> Kubernetes.
+    # Only definitions with execution_class="build" are listed; others may
+    # leave these unset.
+    display_name: str | None = None
+    description: str | None = None
+
+
+def define_platform_job(
+    job_type: str,
+    payload_model: type[BaseModel],
+    handler: PlatformJobHandler,
+) -> PlatformJobDefinition:
+    """Materialize a handler definition from the immutable metadata catalog."""
+    metadata = get_platform_job_metadata(job_type)
+    if metadata is None:
+        raise ValueError(f"No platform-job metadata is registered for {job_type}")
+    return PlatformJobDefinition(
+        job_type=metadata.job_type,
+        payload_version=metadata.payload_version,
+        payload_model=payload_model,
+        handler=handler,
+        policy=metadata.policy,
+        encrypt_payload=metadata.encrypt_payload,
+        display_name=metadata.display_name,
+        description=metadata.description,
+    )

@@ -1,0 +1,1090 @@
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
+
+import pytest
+
+from src.models.orm.agents import Agent
+from src.services.ai_model_service import (
+    AIModelService,
+    OPENCODE_GO_DEFAULT_ENDPOINT,
+    OPENROUTER_DEFAULT_ENDPOINT,
+    PROVIDER_DEFAULT_ENDPOINTS,
+)
+
+
+async def _connection(service: AIModelService):
+    return await service.create_connection(
+        name=f"Default {uuid4().hex[:8]}",
+        provider="openrouter",
+        api_key="sk-test",
+        endpoint=None,
+    )
+
+
+async def _profile(service: AIModelService, *, enabled_for_chat: bool = False):
+    if not await service.list_profiles():
+        seed_connection = await _connection(service)
+        await service.create_profile(
+            name=f"Initial {uuid4().hex[:8]}",
+            connection_id=seed_connection.id,
+            model="openai/gpt-4o-mini",
+            capabilities=None,
+            enabled_for_chat=True,
+        )
+    connection = await _connection(service)
+    return await service.create_profile(
+        name=f"Balanced {uuid4().hex[:8]}",
+        connection_id=connection.id,
+        model="openai/gpt-4o-mini",
+        capabilities=None,
+        enabled_for_chat=enabled_for_chat,
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_profile_bootstraps_every_assignment(db_session):
+    service = AIModelService(db_session)
+    connection = await _connection(service)
+
+    profile = await service.create_profile(
+        name="First Profile",
+        connection_id=connection.id,
+        model="openai/gpt-4o-mini",
+        capabilities=None,
+        enabled_for_chat=False,
+    )
+    assignments = await service.list_assignments()
+
+    assert profile.enabled_for_chat is True
+    assert {assignment.assignment_key for assignment in assignments} == {
+        "primary",
+        "summarization",
+        "tuning",
+        "image_generation",
+        "video_generation",
+        "chat_default",
+    }
+    assert {assignment.profile_id for assignment in assignments} == {profile.id}
+
+
+@pytest.mark.asyncio
+async def test_create_connection_requires_key_and_defaults_openrouter_endpoint(
+    db_session,
+):
+    service = AIModelService(db_session)
+
+    with pytest.raises(ValueError, match="API key is required"):
+        await service.create_connection(
+            name="Default",
+            provider="openai",
+            api_key=" ",
+            endpoint=None,
+        )
+
+    connection = await service.create_connection(
+        name="Default",
+        provider="openrouter",
+        api_key="sk-test",
+        endpoint=None,
+    )
+
+    assert connection.endpoint == OPENROUTER_DEFAULT_ENDPOINT
+    assert connection.encrypted_api_key != "sk-test"
+    assert service.decrypt_api_key(connection.encrypted_api_key) == "sk-test"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider", ["openai", "openrouter", "opencode_go", "google", "anthropic"]
+)
+async def test_create_connection_defaults_builtin_provider_endpoints(
+    db_session, provider
+):
+    service = AIModelService(db_session)
+
+    connection = await service.create_connection(
+        name=f"{provider} {uuid4().hex[:8]}",
+        provider=provider,
+        api_key="sk-test",
+        endpoint=None,
+    )
+
+    assert connection.endpoint == PROVIDER_DEFAULT_ENDPOINTS[provider]
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_connection_requires_endpoint(db_session):
+    service = AIModelService(db_session)
+
+    with pytest.raises(ValueError, match="Endpoint is required"):
+        await service.create_connection(
+            name="Compatible",
+            provider="openai_compatible",
+            api_key="sk-test",
+            endpoint=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_profiles_route_models_to_their_wire_surface(db_session):
+    from unittest.mock import AsyncMock, patch
+
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="Go",
+        provider="opencode_go",
+        api_key="oc_sk-test",
+        endpoint=None,
+    )
+
+    chat = await service.create_profile(
+        name="Go Chat",
+        connection_id=connection.id,
+        model="deepseek-v4.1-flash",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+    responses = await service.create_profile(
+        name="Go Responses",
+        connection_id=connection.id,
+        model="gpt-6-luna",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+    messages = await service.create_profile(
+        name="Go Messages",
+        connection_id=connection.id,
+        model="qwen3.8-flash",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+
+    # deepseek-v4.1-flash matches no documented prefix, so its surface is
+    # probed once and persisted; prefix-matched models never probe.
+    detect = AsyncMock(return_value="chat_completions")
+    with patch(
+        "src.services.opencode_go_detection.detect_opencode_go_wire_api",
+        new=detect,
+    ):
+        chat_config = await service.resolve_config(profile_id=chat.id)
+
+    detect.assert_awaited_once()
+    assert chat_config.provider == "openai"
+    assert chat_config.endpoint == OPENCODE_GO_DEFAULT_ENDPOINT
+    assert chat_config.openai_transport == "chat_completions"
+
+    responses_config = await service.resolve_config(profile_id=responses.id)
+    assert responses_config.provider == "openai"
+    assert responses_config.endpoint == OPENCODE_GO_DEFAULT_ENDPOINT
+    assert responses_config.openai_transport == "responses"
+
+    messages_config = await service.resolve_config(profile_id=messages.id)
+    assert messages_config.provider == "anthropic"
+    assert messages_config.endpoint == "https://opencode.ai/zen/go"
+    assert messages_config.openai_transport is None
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_known_models_resolve_without_probing(db_session):
+    from unittest.mock import AsyncMock, patch
+
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="Go Known",
+        provider="opencode_go",
+        api_key="oc_sk-test",
+        endpoint=None,
+    )
+    profile = await service.create_profile(
+        name="Go Known Responses",
+        connection_id=connection.id,
+        model="grok-4.7",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+
+    with patch(
+        "src.services.opencode_go_detection.detect_opencode_go_wire_api",
+        new=AsyncMock(side_effect=AssertionError("must not probe known models")),
+    ):
+        config = await service.resolve_config(profile_id=profile.id)
+
+    assert config.openai_transport == "responses"
+    assert profile.wire_api is None
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_unknown_models_probe_once_and_persist(db_session):
+    from unittest.mock import AsyncMock, patch
+
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="Go Unknown",
+        provider="opencode_go",
+        api_key="oc_sk-test",
+        endpoint=None,
+    )
+    profile = await service.create_profile(
+        name="Go Unknown",
+        connection_id=connection.id,
+        model="omen-alpha",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+
+    detect = AsyncMock(return_value="messages")
+    with patch(
+        "src.services.opencode_go_detection.detect_opencode_go_wire_api",
+        new=detect,
+    ):
+        config = await service.resolve_config(profile_id=profile.id)
+
+    detect.assert_awaited_once()
+    assert config.provider == "anthropic"
+    assert config.endpoint == "https://opencode.ai/zen/go"
+    assert profile.wire_api == "messages"
+
+    # Second resolve reuses the persisted surface without probing again.
+    detect.reset_mock()
+    with patch(
+        "src.services.opencode_go_detection.detect_opencode_go_wire_api",
+        new=detect,
+    ):
+        reread = await service.resolve_config(profile_id=profile.id)
+
+    detect.assert_not_awaited()
+    assert reread.provider == "anthropic"
+
+    # Endpoint changes invalidate the persisted surface.
+    await service.update_connection(
+        connection.id, endpoint="https://opencode.ai/zen/go/v1", endpoint_provided=True
+    )
+    assert profile.wire_api is None
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_wire_api_resets_when_profile_model_changes(db_session):
+    from unittest.mock import AsyncMock, patch
+
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="Go Reset",
+        provider="opencode_go",
+        api_key="oc_sk-test",
+        endpoint=None,
+    )
+    profile = await service.create_profile(
+        name="Go Reset",
+        connection_id=connection.id,
+        model="omen-alpha",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+
+    with patch(
+        "src.services.opencode_go_detection.detect_opencode_go_wire_api",
+        new=AsyncMock(return_value="chat_completions"),
+    ):
+        await service.resolve_config(profile_id=profile.id)
+    assert profile.wire_api == "chat_completions"
+
+    await service.update_profile(profile.id, model="glm-5.3")
+    assert profile.wire_api is None
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_profile_detects_and_remembers_transport(db_session):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="Foundry",
+        provider="openai_compatible",
+        api_key="sk-test",
+        endpoint="https://foundry.example.test/openai/v1",
+    )
+    profile = await service.create_profile(
+        name="Foundry Luna",
+        connection_id=connection.id,
+        model="gpt-5.6-luna",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+    detector = AsyncMock(return_value="responses")
+
+    with patch(
+        "src.services.openai_transport_detection.detect_openai_transport", detector
+    ):
+        first = await service.resolve_config(profile_id=profile.id)
+        second = await service.resolve_config(profile_id=profile.id)
+
+    assert first.openai_transport == "responses"
+    assert second.openai_transport == "responses"
+    detector.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_profile_and_connection_changes_clear_detected_transport(db_session):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="Compatible",
+        provider="openai_compatible",
+        api_key="sk-test",
+        endpoint="https://one.example.test/v1",
+    )
+    profile = await service.create_profile(
+        name="Compatible Model",
+        connection_id=connection.id,
+        model="model-one",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+    profile.openai_transport = "responses"
+    await db_session.flush()
+
+    updated = await service.update_profile(profile.id, model="model-two")
+    assert updated.openai_transport is None
+
+    updated.openai_transport = "chat_completions"
+    await db_session.flush()
+    await service.update_connection(
+        connection.id,
+        endpoint="https://two.example.test/v1",
+        endpoint_provided=True,
+    )
+    assert updated.openai_transport is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_config_carries_anthropic_cache_capability(db_session):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name=f"Anthropic {uuid4().hex[:8]}",
+        provider="anthropic",
+        api_key="sk-test",
+        endpoint="https://gateway.example.test",
+    )
+    connection.anthropic_prompt_cache_supported = False
+    profile = await service.create_profile(
+        name=f"Claude {uuid4().hex[:8]}",
+        connection_id=connection.id,
+        model="claude-test",
+        capabilities=None,
+        enabled_for_chat=True,
+    )
+
+    config = await service.resolve_config(profile_id=profile.id)
+
+    assert config.provider_connection_id == connection.id
+    assert config.anthropic_prompt_cache_supported is False
+
+
+@pytest.mark.asyncio
+async def test_connection_transport_change_resets_cache_capability(db_session):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name=f"Anthropic {uuid4().hex[:8]}",
+        provider="anthropic",
+        api_key="sk-test",
+        endpoint="https://one.example.test",
+    )
+    connection.anthropic_prompt_cache_supported = False
+    await db_session.flush()
+
+    updated = await service.update_connection(
+        connection.id,
+        endpoint="https://two.example.test",
+        endpoint_provided=True,
+    )
+
+    assert updated.anthropic_prompt_cache_supported is None
+
+
+@pytest.mark.asyncio
+async def test_connection_update_preserves_stored_key_when_omitted(db_session):
+    service = AIModelService(db_session)
+    connection = await _connection(service)
+    encrypted_before = connection.encrypted_api_key
+
+    updated = await service.update_connection(
+        connection.id,
+        name="Renamed Default",
+        provider="openai_compatible",
+        endpoint="https://models.example.test/v1",
+    )
+
+    assert updated.encrypted_api_key == encrypted_before
+    assert updated.endpoint == "https://models.example.test/v1"
+    assert service.decrypt_api_key(updated.encrypted_api_key) == "sk-test"
+
+
+@pytest.mark.asyncio
+async def test_case_insensitive_unique_names(db_session):
+    service = AIModelService(db_session)
+    await service.create_connection(
+        name="Default", provider="openai", api_key="sk-test", endpoint=None
+    )
+
+    with pytest.raises(ValueError, match="Provider connection name already exists"):
+        await service.create_connection(
+            name="default", provider="openai", api_key="sk-test", endpoint=None
+        )
+
+
+@pytest.mark.asyncio
+async def test_chat_default_requires_chat_enabled_profile(db_session):
+    service = AIModelService(db_session)
+    profile = await _profile(service, enabled_for_chat=False)
+
+    with pytest.raises(ValueError, match="chat-enabled"):
+        await service.set_assignment("chat_default", profile.id)
+
+    await service.update_profile(profile.id, enabled_for_chat=True)
+    assignment = await service.set_assignment("chat_default", profile.id)
+
+    assert assignment.assignment_key == "chat_default"
+    assert assignment.profile_id == profile.id
+
+
+@pytest.mark.asyncio
+async def test_profile_delete_is_blocked_while_assigned(db_session):
+    service = AIModelService(db_session)
+    profile = await _profile(service)
+    await service.set_assignment("primary", profile.id)
+
+    with pytest.raises(ValueError, match="used by assignments"):
+        await service.delete_profile(profile.id)
+
+    replacement = await _profile(service)
+    reassigned = await service.set_assignment("primary", replacement.id)
+    assert reassigned.profile.id == replacement.id
+    await service.delete_profile(profile.id)
+
+
+@pytest.mark.asyncio
+async def test_merge_profiles_reassigns_agents_assignments_and_chat(db_session):
+    service = AIModelService(db_session)
+    target = await _profile(service, enabled_for_chat=False)
+    source = await _profile(service, enabled_for_chat=True)
+    second_source = await _profile(service, enabled_for_chat=False)
+    await service.set_assignment("primary", source.id)
+    await service.set_assignment("chat_default", source.id)
+    await service.set_assignment("summarization", second_source.id)
+    agent = Agent(
+        name="Merged Profile Agent",
+        system_prompt="Use the selected profile.",
+        created_by="test",
+        llm_profile=source,
+    )
+    db_session.add(agent)
+    await db_session.flush()
+
+    result = await service.merge_profiles(
+        profile_ids=[target.id, source.id, second_source.id],
+        target_profile_id=target.id,
+    )
+
+    assert result.profile.id == target.id
+    assert result.profile.enabled_for_chat is True
+    assert set(result.merged_profile_ids) == {source.id, second_source.id}
+    assert result.reassigned_agent_count == 1
+    assert result.profile.referenced_agent_count == 1
+    assert set(result.reassigned_assignment_keys) == {
+        "primary",
+        "summarization",
+        "chat_default",
+    }
+    assert agent.llm_profile_id == target.id
+    assert {
+        assignment.profile_id
+        for assignment in await service.list_assignments()
+        if assignment.assignment_key in {"primary", "summarization", "chat_default"}
+    } == {target.id}
+    assert {profile.id for profile in await service.list_profiles()}.isdisjoint(
+        {source.id, second_source.id}
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_profiles_requires_target_in_unique_selection(db_session):
+    service = AIModelService(db_session)
+    target = await _profile(service)
+    source = await _profile(service)
+
+    with pytest.raises(ValueError, match="duplicates"):
+        await service.merge_profiles(
+            profile_ids=[source.id, source.id],
+            target_profile_id=source.id,
+        )
+
+    with pytest.raises(ValueError, match="included"):
+        await service.merge_profiles(
+            profile_ids=[source.id, target.id],
+            target_profile_id=uuid4(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_config_defaults_to_platform_default_assignment(db_session):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="OpenAI Compatible",
+        provider="openai_compatible",
+        api_key="compatible-key",
+        endpoint="https://llm.example.test/v1",
+    )
+    profile = await service.create_profile(
+        name="Primary",
+        connection_id=connection.id,
+        model="custom/model",
+        capabilities=None,
+        enabled_for_chat=False,
+    )
+    await service.set_assignment("primary", profile.id)
+
+    with patch(
+        "src.services.openai_transport_detection.detect_openai_transport",
+        AsyncMock(return_value="responses"),
+    ):
+        config = await service.resolve_config()
+
+    assert config.provider == "openai"
+    assert config.endpoint == "https://llm.example.test/v1"
+    assert config.api_key == "compatible-key"
+    assert config.model == "custom/model"
+    assert config.openai_transport == "responses"
+
+
+@pytest.mark.asyncio
+async def test_resolve_config_from_explicit_profile_uuid(db_session):
+    service = AIModelService(db_session)
+    profile = await _profile(service)
+
+    config = await service.resolve_config(profile_id=profile.id)
+
+    assert config.provider == "openai"
+    assert config.endpoint == "https://openrouter.ai/api/v1"
+    assert config.model == "openai/gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_resolve_config_from_case_insensitive_profile_name(db_session):
+    service = AIModelService(db_session)
+    profile = await _profile(service)
+
+    config = await service.resolve_config(profile_name=profile.name.swapcase())
+
+    assert config.provider == "openai"
+    assert config.endpoint == "https://openrouter.ai/api/v1"
+    assert config.model == "openai/gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_resolve_config_rejects_unknown_profile_name(db_session):
+    service = AIModelService(db_session)
+
+    with pytest.raises(ValueError, match="Model profile 'Missing' was not found"):
+        await service.resolve_config(profile_name="Missing")
+
+
+@pytest.mark.asyncio
+async def test_embedding_config_resolves_selected_provider_connection(db_session):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="Embedding Provider",
+        provider="openai_compatible",
+        api_key="embedding-key",
+        endpoint="https://embeddings.example.test/v1",
+    )
+
+    await service.set_embedding_config(
+        connection_id=connection.id,
+        model="custom/embedding",
+        dimensions=768,
+    )
+    config = await service.resolve_embedding_config()
+
+    assert config.api_key == "embedding-key"
+    assert config.model == "custom/embedding"
+    assert config.dimensions == 768
+    assert config.endpoint == "https://embeddings.example.test/v1"
+
+
+@pytest.mark.asyncio
+async def test_connection_delete_is_blocked_while_used_for_embeddings(db_session):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name="Embedding Provider",
+        provider="openai",
+        api_key="embedding-key",
+        endpoint=None,
+    )
+    await service.set_embedding_config(
+        connection_id=connection.id,
+        model="text-embedding-3-small",
+        dimensions=1536,
+    )
+
+    with pytest.raises(ValueError, match="embedding configuration"):
+        await service.delete_connection(connection.id)
+
+    await service.delete_embedding_config()
+    await service.delete_connection(connection.id)
+
+
+# --- models.dev catalog integration -------------------------------------------
+
+
+def _test_catalog():
+    from src.services.model_catalog import parse_catalog
+
+    return parse_catalog(
+        {
+            "anthropic": {
+                "id": "anthropic",
+                "name": "Anthropic",
+                "npm": "@ai-sdk/anthropic",
+                "models": {
+                    "claude-haiku-4-5": {
+                        "id": "claude-haiku-4-5",
+                        "name": "Claude Haiku 4.5",
+                        "reasoning": True,
+                        "reasoning_options": [{"type": "budget_tokens", "min": 1024}],
+                        "tool_call": True,
+                        "modalities": {"input": ["text", "image", "pdf"], "output": ["text"]},
+                        "limit": {"context": 200000, "output": 64000},
+                        "cost": {"input": 1, "output": 5, "cache_read": 0.1},
+                    },
+                    "claude-plain": {"id": "claude-plain", "name": "Claude Plain"},
+                },
+            },
+            "fireworks-ai": {
+                "id": "fireworks-ai",
+                "name": "Fireworks AI",
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "https://api.fireworks.ai/inference/v1/",
+                "models": {
+                    "kimi-k3": {
+                        "id": "kimi-k3",
+                        "name": "Kimi K3",
+                        "reasoning": True,
+                        "reasoning_options": [{"type": "effort", "values": ["low", "high"]}],
+                    }
+                },
+            },
+        },
+        fetched_at=None,
+        source="bundled",
+    )
+
+
+@pytest.fixture
+def catalog():
+    with patch(
+        "src.services.ai_model_service.get_model_catalog",
+        new=AsyncMock(return_value=_test_catalog()),
+    ):
+        yield
+
+
+@pytest.mark.asyncio
+async def test_native_connection_on_its_own_endpoint_links_to_the_catalog(db_session, catalog):
+    service = AIModelService(db_session)
+    native = await service.create_connection(
+        name=f"Anthropic {uuid4().hex[:8]}", provider="anthropic", api_key="k", endpoint=None
+    )
+    azure = await service.create_connection(
+        name=f"Azure {uuid4().hex[:8]}",
+        provider="openai",
+        api_key="k",
+        endpoint="https://example.openai.azure.com/openai/v1",
+    )
+    assert native.catalog_provider_id == "anthropic"
+    # A custom endpoint on a native adapter is not vouched for by the catalog.
+    assert azure.catalog_provider_id is None
+
+
+@pytest.mark.asyncio
+async def test_community_provider_uses_catalog_endpoint_and_adapter(db_session, catalog):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name=f"Fireworks {uuid4().hex[:8]}",
+        provider="openai_compatible",
+        api_key="k",
+        endpoint=None,
+        catalog_provider_id="fireworks-ai",
+    )
+    assert connection.endpoint == "https://api.fireworks.ai/inference/v1"
+    proxied = await service.create_connection(
+        name=f"Proxied {uuid4().hex[:8]}",
+        provider="openai_compatible",
+        api_key="k",
+        endpoint="https://proxy.example/v1",
+        catalog_provider_id="fireworks-ai",
+    )
+    assert proxied.catalog_provider_id is None
+
+    with pytest.raises(ValueError, match="uses the 'openai_compatible' adapter"):
+        await service.create_connection(
+            name=f"Wrong {uuid4().hex[:8]}",
+            provider="anthropic",
+            api_key="k",
+            endpoint=None,
+            catalog_provider_id="fireworks-ai",
+        )
+    with pytest.raises(ValueError, match="not a provider Bifrost can connect to"):
+        await service.create_connection(
+            name=f"Unknown {uuid4().hex[:8]}",
+            provider="openai_compatible",
+            api_key="k",
+            endpoint="https://x.example/v1",
+            catalog_provider_id="no-such-provider",
+        )
+
+
+@pytest.mark.asyncio
+async def test_catalog_connection_lists_catalog_models_without_calling_provider(
+    db_session, catalog
+):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name=f"Anthropic {uuid4().hex[:8]}", provider="anthropic", api_key="k", endpoint=None
+    )
+    with patch.object(
+        AIModelService, "test_saved_connection", side_effect=AssertionError("live call")
+    ):
+        models = await service.list_models(connection.id)
+
+    assert models is not None
+    haiku = next(model for model in models if model.id == "claude-haiku-4-5")
+    assert haiku.display_name == "Claude Haiku 4.5"
+    assert haiku.context_window == 200000
+    assert haiku.input_price == "1"
+    assert haiku.reasoning_choices == ["off", "on"]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_choice_must_be_one_the_model_accepts(db_session, catalog):
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name=f"Fireworks {uuid4().hex[:8]}",
+        provider="openai_compatible",
+        api_key="k",
+        endpoint=None,
+        catalog_provider_id="fireworks-ai",
+    )
+    profile = await service.create_profile(
+        name=f"Kimi {uuid4().hex[:8]}",
+        connection_id=connection.id,
+        model="kimi-k3",
+        capabilities=None,
+        enabled_for_chat=False,
+        reasoning_effort="high",
+    )
+    config = await service.resolve_config(profile_id=profile.id)
+    assert config.reasoning_effort == "high"
+    assert config.catalog_provider_id == "fireworks-ai"
+
+    with pytest.raises(ValueError, match="choose one of low, high"):
+        await service.update_profile(
+            profile.id, reasoning_effort="max", reasoning_effort_provided=True
+        )
+    # Switching to a model the catalog does not know cannot keep the choice.
+    with pytest.raises(ValueError, match="lists no reasoning control"):
+        await service.update_profile(profile.id, model="custom-finetune")
+    cleared = await service.update_profile(
+        profile.id, model="custom-finetune", reasoning_effort=None, reasoning_effort_provided=True
+    )
+    assert cleared.reasoning_effort is None
+
+
+@pytest.mark.asyncio
+async def test_chat_capabilities_prefer_admin_record_then_catalog(db_session, catalog):
+    from src.models.contracts.artifacts import ModelCapabilities
+    from src.services.model_capabilities import model_fingerprint
+
+    service = AIModelService(db_session)
+    connection = await service.create_connection(
+        name=f"Anthropic {uuid4().hex[:8]}", provider="anthropic", api_key="k", endpoint=None
+    )
+    from_catalog = await service.create_profile(
+        name=f"Haiku {uuid4().hex[:8]}",
+        connection_id=connection.id,
+        model="claude-haiku-4-5",
+        capabilities=None,
+        enabled_for_chat=False,
+    )
+    capabilities = await service.profile_capabilities(from_catalog)
+    assert capabilities.source == "catalog"
+    assert capabilities.pdf_input is True
+
+    asserted = await service.create_profile(
+        name=f"Haiku manual {uuid4().hex[:8]}",
+        connection_id=connection.id,
+        model="claude-haiku-4-5",
+        capabilities=ModelCapabilities(
+            tool_calling=False,
+            source="manual",
+            fingerprint=model_fingerprint(
+                provider="anthropic",
+                model="claude-haiku-4-5",
+                endpoint=connection.endpoint,
+            ),
+        ),
+        enabled_for_chat=False,
+    )
+    capabilities = await service.profile_capabilities(asserted)
+    assert (capabilities.source, capabilities.tool_calling) == ("manual", False)
+
+
+@pytest.mark.asyncio
+async def test_gateway_models_route_to_the_api_the_catalog_documents(db_session):
+    from src.services.model_catalog import parse_catalog
+
+    gateway = parse_catalog(
+        {
+            "zen": {
+                "id": "zen",
+                "name": "Zen",
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "https://gateway.example/zen/v1",
+                "models": {
+                    "kimi": {"id": "kimi", "name": "Kimi"},
+                    "gpt": {"id": "gpt", "name": "GPT", "provider": {"npm": "@ai-sdk/openai"}},
+                    "claude": {"id": "claude", "name": "Claude", "provider": {"npm": "@ai-sdk/anthropic"}},
+                    "gemini": {"id": "gemini", "name": "Gemini", "provider": {"npm": "@ai-sdk/google"}},
+                    "vertex": {
+                        "id": "vertex",
+                        "name": "Vertex",
+                        "provider": {"npm": "@ai-sdk/openai", "api": "https://${REGION}.example/v1"},
+                    },
+                },
+            }
+        },
+        fetched_at=None,
+        source="bundled",
+    )
+    with patch(
+        "src.services.ai_model_service.get_model_catalog",
+        new=AsyncMock(return_value=gateway),
+    ):
+        service = AIModelService(db_session)
+        connection = await service.create_connection(
+            name=f"Zen {uuid4().hex[:8]}",
+            provider="openai_compatible",
+            api_key="k",
+            endpoint=None,
+            catalog_provider_id="zen",
+        )
+        routes = {}
+        for model in ("kimi", "gpt", "claude"):
+            profile = await service.create_profile(
+                name=f"{model} {uuid4().hex[:8]}",
+                connection_id=connection.id,
+                model=model,
+                capabilities=None,
+                enabled_for_chat=False,
+            )
+            config = await service.resolve_config(profile_id=profile.id)
+            routes[model] = (config.provider, config.endpoint, config.openai_transport)
+        listed = {model.id for model in await service.list_models(connection.id) or []}
+
+    assert routes == {
+        "kimi": ("openai", "https://gateway.example/zen/v1", "chat_completions"),
+        "gpt": ("openai", "https://gateway.example/zen/v1", "responses"),
+        # The Anthropic SDK appends /v1/messages itself.
+        "claude": ("anthropic", "https://gateway.example/zen", None),
+    }
+    # A Google /v1 endpoint and a templated URL cannot be called; not offered.
+    assert listed == {"kimi", "gpt", "claude"}
+
+
+@pytest.mark.asyncio
+async def test_verify_profile_sends_one_request_through_the_profile_config(db_session):
+    service = AIModelService(db_session)
+    profile = await _profile(service)
+    built = []
+
+    class FakeClient:
+        def __init__(self, config, fallback_configs=None):
+            built.append((config, fallback_configs))
+
+        async def complete(self, messages, **kwargs):
+            return None
+
+    with patch("src.services.llm.pydantic_client.PydanticAIClient", FakeClient):
+        result = await service.verify_profile(profile.id)
+
+    assert result.success is True
+    [(config, fallbacks)] = built
+    assert config.model == "openai/gpt-4o-mini"
+    assert config.endpoint == OPENROUTER_DEFAULT_ENDPOINT
+    assert fallbacks is None  # the profile alone, not its failover chain
+
+
+@pytest.mark.asyncio
+async def test_verify_profile_reports_the_provider_error(db_session):
+    service = AIModelService(db_session)
+    profile = await _profile(service)
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    rejected = AsyncMock(
+        side_effect=ModelHTTPError(
+            status_code=401,
+            model_name="openai/gpt-4o-mini",
+            body={"error": {"message": "No auth credentials found", "code": 401}},
+        )
+    )
+
+    with patch("src.services.llm.pydantic_client.PydanticAIClient.complete", rejected):
+        result = await service.verify_profile(profile.id)
+
+    assert result.success is False
+    assert result.message == (
+        "The provider rejected the API key. The provider said: No auth credentials found."
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_profile_reports_a_timeout(db_session):
+    import asyncio
+
+    service = AIModelService(db_session)
+    profile = await _profile(service)
+
+    async def hang(*args, **kwargs):
+        await asyncio.sleep(5)
+
+    with (
+        patch("src.services.ai_model_service.PROFILE_VERIFY_TIMEOUT_SECONDS", 0.05),
+        patch("src.services.llm.pydantic_client.PydanticAIClient.complete", hang),
+    ):
+        result = await service.verify_profile(profile.id)
+
+    assert result.success is False
+    assert "did not answer" in result.message
+
+
+@pytest.mark.asyncio
+async def test_connection_test_checks_every_profile_on_the_connection(db_session):
+    from src.services.provider_catalog_service import ProviderTestResult
+
+    service = AIModelService(db_session)
+    profile = await _profile(service)
+    second = await service.create_profile(
+        name=f"Second {uuid4().hex[:8]}",
+        connection_id=profile.connection_id,
+        model="openai/gpt-5.4-nano",
+        capabilities=None,
+        enabled_for_chat=False,
+    )
+    outcomes = {
+        profile.id: ProviderTestResult(True, "The model answered a test request."),
+        second.id: ProviderTestResult(False, "The provider rejected the API key."),
+    }
+    listing = AsyncMock(side_effect=AssertionError("listing is only for profile-less connections"))
+
+    with (
+        patch.object(AIModelService, "verify_profile", AsyncMock(side_effect=lambda pid: outcomes[pid])),
+        patch.object(AIModelService, "test_saved_connection", listing),
+    ):
+        failed = await service.test_connection(profile.connection_id)
+        outcomes[second.id] = ProviderTestResult(True, "The model answered a test request.")
+        passed = await service.test_connection(profile.connection_id)
+
+    assert failed.success is False
+    assert failed.message == f"{second.name}: The provider rejected the API key."
+    assert passed.success is True
+    assert passed.message == "All 2 profiles answered a test request."
+
+
+@pytest.mark.asyncio
+async def test_connection_without_profiles_falls_back_to_listing_and_says_so(db_session):
+    from src.services.provider_catalog_service import ProviderTestResult
+
+    service = AIModelService(db_session)
+    connection = await _connection(service)
+    listing = AsyncMock(return_value=ProviderTestResult(True, "Connected. Listed 3 model(s)."))
+
+    with patch.object(AIModelService, "test_saved_connection", listing):
+        result = await service.test_connection(connection.id)
+
+    assert result.success is True
+    assert result.message == (
+        "Connected. Listed 3 model(s). Add a model profile to test a real request."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lookup", "query_count"),
+    [("runtime_config", 1), ("agent_record", 1), ("profile_counts", 2), ("connection_counts", 1)],
+)
+async def test_profile_reads_load_only_the_requested_graph(db_session, async_engine, lookup, query_count):
+    """Runtime reads and management counts must not hydrate reverse graphs."""
+    from sqlalchemy import event, select
+
+    from src.models.orm.ai_models import AIModelProfile, AIProviderConnection
+    from src.services.model_catalog import get_model_catalog
+
+    # Catalog freshness is independent of relationship loading. Warm that
+    # process cache so this assertion measures only the requested ORM graph.
+    await get_model_catalog(db_session)
+
+    connection = AIProviderConnection(
+        name=f"Graph {uuid4().hex}",
+        provider="openai_compatible",
+        endpoint="http://scheduler-fixtures:8080/v1",
+        encrypted_api_key=AIModelService(db_session).encrypt_api_key("fixture-key"),
+    )
+    db_session.add(connection)
+    await db_session.flush()
+    profiles = [
+        AIModelProfile(
+            name=f"Graph profile {uuid4().hex}",
+            connection_id=connection.id,
+            model="fixture-chat",
+            openai_transport="chat_completions",
+        )
+        for _ in range(3)
+    ]
+    db_session.add_all(profiles)
+    await db_session.flush()
+    agents = [
+        Agent(
+            name=f"Graph agent {uuid4().hex}",
+            system_prompt="Local loading fixture",
+            created_by="loading-fixture",
+            llm_profile_id=profile.id,
+        )
+        for profile in profiles
+    ]
+    db_session.add_all(agents)
+    await db_session.flush()
+    profile_id, agent_id = profiles[0].id, agents[0].id
+    db_session.expunge_all()
+    statements: list[str] = []
+
+    def capture(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(async_engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        if lookup == "runtime_config":
+            config = await AIModelService(db_session).resolve_config(profile_id=profile_id)
+            assert config.model == "fixture-chat"
+            assert config.api_key == "fixture-key"
+        elif lookup == "agent_record":
+            agent = (await db_session.execute(select(Agent).where(Agent.id == agent_id))).scalar_one()
+            assert agent.llm_profile_id == profile_id
+        elif lookup == "profile_counts":
+            listed_profiles = await AIModelService(db_session).list_profiles()
+            assert [profile.referenced_agent_count for profile in listed_profiles] == [1, 1, 1]
+            assert not any(isinstance(row, Agent) for row in db_session.identity_map.values())
+        else:
+            listed_connections = await AIModelService(db_session).list_connections()
+            assert [connection.profile_count for connection in listed_connections] == [3]
+            assert not any(isinstance(row, AIModelProfile) for row in db_session.identity_map.values())
+    finally:
+        event.remove(async_engine.sync_engine, "before_cursor_execute", capture)
+
+    print(f"PROFILE_GRAPH_QUERY_EVIDENCE {lookup}: {len(statements)} statements")
+    assert len(statements) == query_count, "Reads must not hydrate reverse profile/agent collections"

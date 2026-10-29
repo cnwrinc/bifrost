@@ -1,21 +1,29 @@
+import {
+	InstallSession,
+	InstallFailure,
+	useInstallSession,
+} from "./InstallSession";
 /**
  * CreateEditSolution — the single, state-driven dialog for installing a
  * Solution (create) and editing an existing install (edit).
  *
- * Create mode offers TWO install sources, both routed through the same
- * preview → confirm → install machinery:
- *   - "From a repository": a repo URL + optional subfolder + ref; previews via
- *     `previewSolutionFromRepo` and installs via `installSolutionFromRepo`.
- *   - "From a zip": a dropzone (or a prefilled file from a page drop) that
- *     previews via `previewInstall` and installs via `installSolution`.
- * When neither source is pre-selected, a small source picker is shown first.
+ * Create mode is destination-first: destination (workspace import vs managed
+ * Solution install) is chosen before source (repository vs zip). Reactivate
+ * and other fixed-destination flows skip the destination screen.
+ *   - Workspace destination: a one-time snapshot preview → collision review →
+ *     `workspace.bundle_import` PlatformJob. No Solution record is created and
+ *     the repository is never kept connected.
+ *   - Solution destination: "From a repository" previews via
+ *     `previewSolutionFromRepo` and installs via `installSolutionFromRepo`;
+ *     "From a zip" previews via `previewInstall` and installs via
+ *     `installSolution`.
  * There is NO empty-shell "create with no content" path — content always
  * lands via a zip or a repo.
  *
  * Both sources share the read-only confirmation card (`PreviewConfirmation`):
  * the entity summary / upgrade diff / declared config values.
  *
- * Edit mode: name + Organization + global repo access + the git section.
+ * Edit mode: name + Organization + outbound/inbound access + the git section.
  *
  * Git connection is driven by GitHub being configured in Settings (a saved
  * token) — there is no manual "git connected" toggle. An install is
@@ -23,18 +31,19 @@
  * create a repository named `solution-<slug>-<suffix>` via the saved token.
  */
 
-import { useEffect, useRef, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useId, useRef, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import {
 	AppWindow,
+	ArrowLeft,
 	Bot,
-	ChevronRight,
 	Database,
 	FileArchive,
 	FileCode,
 	GitBranch,
+	GitCompareArrows,
 	Loader2,
 	Plug,
 	Plus,
@@ -58,7 +67,6 @@ import {
 } from "@/components/ui/dialog";
 import {
 	AlertDialog,
-	AlertDialogAction,
 	AlertDialogCancel,
 	AlertDialogContent,
 	AlertDialogDescription,
@@ -67,10 +75,7 @@ import {
 	AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { OrganizationSelect } from "@/components/forms/OrganizationSelect";
-import {
-	useGitHubConfig,
-	useCreateGitHubRepository,
-} from "@/hooks/useGitHub";
+import { useGitHubConfig, useCreateGitHubRepository } from "@/hooks/useGitHub";
 import {
 	installSolution,
 	installSolutionFromRepo,
@@ -83,6 +88,8 @@ import {
 	type SolutionUpdate,
 	type SolutionUpgradeDiff,
 } from "@/services/solutions";
+import { WorkspaceImportBody } from "./WorkspaceImportBody";
+import { ConfigValueFields, asConfigSchemas, nonBlankConfigValues } from "./SolutionConfigFields";
 import type { components } from "@/lib/v1";
 
 /** Pre-filled From-repository fields (e.g. from a `?repo=` deep link). */
@@ -92,54 +99,35 @@ export interface RepoPrefill {
 	ref?: string | null;
 }
 
+type CreateSolutionIntent = "install" | "update" | "reactivate";
+
+/** Where the package lands. Lifecycle/ownership — the first decision. */
+export type InstallDestination = "workspace" | "solution";
+/** Where the package comes from — the second decision, after destination. */
+export type InstallSource = "repo" | "zip";
+
 export type CreateEditSolutionMode =
 	| {
 			kind: "create";
 			/**
-			 * Which install source to show. When omitted (and no `file`/`repo`
-			 * prefill is present), the source picker is shown first.
+			 * Which destination to show. When omitted (and no prefill implies
+			 * one), the destination picker is shown first.
 			 */
-			source?: "repo" | "zip";
+			destination?: InstallDestination;
+			/**
+			 * Which source to show once the destination is known. When
+			 * omitted (and no `file`/`repo` prefill is present), the source
+			 * picker is shown after the destination.
+			 */
+			source?: InstallSource;
 			/** Prefilled zip (a page drop) — implies the zip source. */
 			file?: File;
 			/** Prefilled repo fields (a deep link) — implies the repo source. */
 			repo?: RepoPrefill;
 			organizationId?: string | null;
-			intent?: "install" | "update";
+			intent?: CreateSolutionIntent;
 	  }
 	| { kind: "edit"; solution: Solution };
-
-/** A declared config schema item on a preview, narrowed from the loose dict. */
-interface PreviewConfigSchema {
-	key: string;
-	type: string;
-	required: boolean;
-	description: string | null;
-}
-
-function asConfigSchemas(
-	raw: SolutionInstallPreview["config_schemas"],
-): PreviewConfigSchema[] {
-	if (!raw) return [];
-	return raw
-		.map((item) => {
-			const key = typeof item.key === "string" ? item.key : "";
-			if (!key) return null;
-			return {
-				key,
-				type: typeof item.type === "string" ? item.type : "string",
-				required: item.required === true,
-				description:
-					typeof item.description === "string" ? item.description : null,
-			};
-		})
-		.filter((x): x is PreviewConfigSchema => x !== null);
-}
-
-function isSecretType(type: string): boolean {
-	const t = type.toLowerCase();
-	return t === "secret" || t === "password";
-}
 
 /**
  * Distinct knowledge namespaces referenced by the bundle's agents. A Solution
@@ -181,7 +169,11 @@ function parseCollisionKeys(message: string): string[] | null {
 /** Summary chips of what an install/preview creates. */
 function EntitySummary({ preview }: { preview: SolutionInstallPreview }) {
 	const items: { icon: typeof Workflow; label: string; count: number }[] = [
-		{ icon: Workflow, label: "workflows", count: preview.workflows?.length ?? 0 },
+		{
+			icon: Workflow,
+			label: "workflows",
+			count: preview.workflows?.length ?? 0,
+		},
 		{ icon: AppWindow, label: "apps", count: preview.apps?.length ?? 0 },
 		{ icon: FileCode, label: "forms", count: preview.forms?.length ?? 0 },
 		{ icon: Bot, label: "agents", count: preview.agents?.length ?? 0 },
@@ -241,10 +233,10 @@ function KnowledgeNamespaceNote({
 				<p className="mt-0.5 text-muted-foreground">
 					This solution's agents use knowledge namespace
 					{namespaces.length > 1 ? "s" : ""}{" "}
-					<span className="font-mono">{namespaces.join(", ")}</span>. The
-					documents aren't part of the bundle — populate{" "}
-					{namespaces.length > 1 ? "them" : "it"} after install or the agents
-					will retrieve from an empty corpus.
+					<span className="font-mono">{namespaces.join(", ")}</span>.
+					The documents aren't part of the bundle — populate{" "}
+					{namespaces.length > 1 ? "them" : "it"} after install or the
+					agents will retrieve from an empty corpus.
 				</p>
 			</div>
 		</div>
@@ -271,7 +263,9 @@ function DiffSection({
 				</p>
 			)}
 			{removed.length > 0 && (
-				<p className="text-destructive">Removed: {removed.join(", ")}</p>
+				<p className="text-destructive">
+					Removed: {removed.join(", ")}
+				</p>
 			)}
 		</div>
 	);
@@ -295,13 +289,14 @@ function describeConfigChange(
 
 /** What an upgrade changes, per entity type plus config declarations. */
 export function UpgradeDiffView({ diff }: { diff: SolutionUpgradeDiff }) {
-	const entitySections: { label: string; key: keyof SolutionUpgradeDiff }[] = [
-		{ label: "Workflows", key: "workflows" },
-		{ label: "Apps", key: "apps" },
-		{ label: "Forms", key: "forms" },
-		{ label: "Agents", key: "agents" },
-		{ label: "Tables", key: "tables" },
-	];
+	const entitySections: { label: string; key: keyof SolutionUpgradeDiff }[] =
+		[
+			{ label: "Workflows", key: "workflows" },
+			{ label: "Apps", key: "apps" },
+			{ label: "Forms", key: "forms" },
+			{ label: "Agents", key: "agents" },
+			{ label: "Tables", key: "tables" },
+		];
 	const configs = diff.config_schemas;
 	const hasConfigDiff =
 		(configs?.added?.length ?? 0) > 0 ||
@@ -321,7 +316,8 @@ export function UpgradeDiffView({ diff }: { diff: SolutionUpgradeDiff }) {
 	return (
 		<div className="space-y-3" data-testid="upgrade-diff">
 			{entitySections.map(({ label, key }) => {
-				const d = diff[key] as SolutionUpgradeDiff["workflows"] | undefined;
+				const d = diff[key] as
+					SolutionUpgradeDiff["workflows"] | undefined;
 				return (
 					<DiffSection
 						key={key}
@@ -392,22 +388,60 @@ function GitRepoSection({
 	onRefChange: (gitRef: string) => void;
 	onDisconnect: () => void;
 }) {
-	const { data: ghConfig, isLoading } = useGitHubConfig();
+	const repoUrlId = useId();
+	const {
+		data: ghConfig,
+		isLoading,
+		isError,
+		isFetching,
+		refetch,
+	} = useGitHubConfig();
 	const createRepo = useCreateGitHubRepository();
 	const tokenSaved = ghConfig?.token_saved === true;
 
-	if (isLoading) return null;
+	if (isLoading)
+		return (
+			<p role="status" className="text-sm text-muted-foreground">
+				Loading repository connection…
+			</p>
+		);
+	if (isError)
+		return (
+			<div
+				role="alert"
+				className="space-y-3 rounded-[var(--bf-radius-surface)] border border-destructive/30 p-3 text-sm"
+			>
+				<p className="text-destructive">
+					Couldn't load the repository connection.
+				</p>
+				<Button
+					type="button"
+					variant="outline"
+					className="min-h-11"
+					disabled={isFetching}
+					onClick={() => void refetch()}
+				>
+					{isFetching ? "Loading…" : "Retry repository connection"}
+				</Button>
+			</div>
+		);
 
 	if (!tokenSaved) {
 		return (
-			<div className="rounded-lg border p-3" data-testid="git-section">
+			<div
+				className="rounded-[var(--bf-radius-surface)] border p-3"
+				data-testid="git-section"
+			>
 				<div className="flex items-center gap-2 text-sm font-medium">
 					<GitBranch className="h-4 w-4 text-muted-foreground" />
 					Repository connection
 				</div>
 				<p className="mt-1 text-xs text-muted-foreground">
 					GitHub isn't configured.{" "}
-					<Link to="/settings/github" className="underline hover:text-foreground">
+					<Link
+						to="/settings/github"
+						className="underline hover:text-foreground"
+					>
 						Connect GitHub in Settings
 					</Link>{" "}
 					to back installs with a repository.
@@ -419,39 +453,47 @@ function GitRepoSection({
 	const suggestedName = `solution-${slug || "install"}-${repoSuffix()}`;
 
 	return (
-		<div className="space-y-2 rounded-lg border p-3" data-testid="git-section">
-			<div className="flex items-center justify-between gap-2">
+		<div
+			className="space-y-2 rounded-[var(--bf-radius-surface)] border p-3"
+			data-testid="git-section"
+		>
+			<div className="flex flex-wrap items-center justify-between gap-2">
 				<div className="flex items-center gap-2 text-sm font-medium">
 					<GitBranch className="h-4 w-4 text-muted-foreground" />
 					Repository connection
 				</div>
-				<Badge variant={connected ? "default" : "secondary"}>
+				<Badge variant="outline">
 					{connected ? "Connected" : "Not connected"}
 				</Badge>
 			</div>
 			{connected ? (
 				<p className="text-xs text-muted-foreground">
-					This install pulls its content from a repository. Disconnect to make
-					it manual (CLI-writable) again.
+					This install pulls its content from a repository. Disconnect
+					to make it manual (CLI-writable) again.
 				</p>
 			) : (
 				<p className="text-xs text-muted-foreground">
-					Enter a repository URL and save to connect this install to git.
+					Enter a repository URL and save to connect this install to
+					git.
 				</p>
 			)}
+			<Label htmlFor={repoUrlId}>Repository URL</Label>
 			<Input
+				id={repoUrlId}
+				className="min-h-11"
 				data-testid="git-repo-url"
 				value={repoUrl}
 				placeholder="https://github.com/org/repo"
 				onChange={(e) => onRepoUrlChange(e.target.value)}
 			/>
-			<div className="grid grid-cols-2 gap-2">
+			<div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
 				<div className="space-y-1">
 					<Label htmlFor="git-subpath" className="text-xs">
 						Subfolder
 					</Label>
 					<Input
 						id="git-subpath"
+						className="min-h-11"
 						data-testid="git-repo-subpath"
 						value={subpath}
 						placeholder="solutions/my-solution"
@@ -464,6 +506,7 @@ function GitRepoSection({
 					</Label>
 					<Input
 						id="git-ref"
+						className="min-h-11"
 						data-testid="git-repo-ref"
 						value={gitRef}
 						placeholder="main"
@@ -471,11 +514,17 @@ function GitRepoSection({
 					/>
 				</div>
 			</div>
-			<div className="flex items-center gap-2">
+			<p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+				New repository:{" "}
+				<span className="font-mono text-foreground">
+					{suggestedName}
+				</span>
+			</p>
+			<div className="flex flex-wrap items-center gap-2">
 				<Button
 					type="button"
 					variant="outline"
-					size="sm"
+					className="min-h-11 h-auto max-w-full whitespace-normal [overflow-wrap:anywhere]"
 					data-testid="create-repo"
 					disabled={createRepo.isPending}
 					onClick={() =>
@@ -483,7 +532,8 @@ function GitRepoSection({
 							{
 								body: {
 									name: suggestedName,
-									description: `Bifrost Solution ${slug ?? ""}`.trim(),
+									description:
+										`Bifrost Solution ${slug ?? ""}`.trim(),
 									private: true,
 								},
 							},
@@ -504,11 +554,16 @@ function GitRepoSection({
 					}
 				>
 					{createRepo.isPending ? (
-						<Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+						<Loader2
+							aria-hidden="true"
+							className="mr-1.5 h-3.5 w-3.5 animate-spin motion-reduce:animate-none"
+						/>
 					) : (
 						<Plus className="mr-1.5 h-3.5 w-3.5" />
 					)}
-					Create {suggestedName}
+					{createRepo.isPending
+						? "Creating repository…"
+						: "Create repository"}
 				</Button>
 				{connected && (
 					<Button
@@ -516,7 +571,7 @@ function GitRepoSection({
 						variant="ghost"
 						size="sm"
 						data-testid="git-disconnect"
-						className="text-destructive hover:text-destructive"
+						className="min-h-11 text-destructive hover:text-destructive"
 						onClick={onDisconnect}
 					>
 						Disconnect
@@ -524,6 +579,117 @@ function GitRepoSection({
 				)}
 			</div>
 		</div>
+	);
+}
+
+/**
+ * A manual install becomes Git-managed only after its proposed source has been
+ * read and shown to the operator. The server validates the same source again
+ * while saving, so this is a review step rather than a trust boundary.
+ */
+function GitConnectionConfirmDialog({
+	open,
+	solutionSlug,
+	preview,
+	loading,
+	retrying,
+	previewError,
+	onRetryPreview,
+	onClose,
+	onConfirm,
+	pending,
+}: {
+	open: boolean;
+	solutionSlug: string;
+	preview: SolutionInstallPreview | undefined;
+	loading: boolean;
+	retrying: boolean;
+	previewError: boolean;
+	onRetryPreview: () => void;
+	onClose: () => void;
+	onConfirm: () => void;
+	pending: boolean;
+}) {
+	const sourceMatchesInstall = preview?.slug === solutionSlug;
+	return (
+		<AlertDialog open={open} onOpenChange={(next) => !next && onClose()}>
+			<AlertDialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-xl">
+				<AlertDialogHeader>
+					<AlertDialogTitle>Connect Git?</AlertDialogTitle>
+					<AlertDialogDescription>
+						Git becomes this Solution&apos;s only writer. Future updates pull
+						and replace its installed content from this repository.
+					</AlertDialogDescription>
+				</AlertDialogHeader>
+				<div
+					className="max-h-[40dvh] overflow-y-auto"
+					data-testid="git-connect-preview"
+				>
+					{loading ? (
+						<p
+							role="status"
+							className="flex items-center gap-2 text-sm text-muted-foreground"
+						>
+							<Loader2
+								aria-hidden="true"
+								className="size-4 animate-spin motion-reduce:animate-none"
+							/>
+							Reviewing repository contents…
+						</p>
+					) : previewError ? (
+						<div className="space-y-3">
+							<p role="alert" className="text-sm text-destructive">
+								Couldn&apos;t preview this repository. Review it before
+								connecting Git.
+							</p>
+							<Button
+								type="button"
+								variant="outline"
+								disabled={retrying || pending}
+								onClick={onRetryPreview}
+							>
+								Retry preview
+							</Button>
+						</div>
+					) : !sourceMatchesInstall ? (
+						<p role="alert" className="text-sm text-destructive">
+							This repository declares{" "}
+							{preview?.slug
+								? `“${preview.slug}”`
+								: "no Solution slug"}
+							, not “{solutionSlug}”. It can&apos;t manage this install.
+						</p>
+					) : (
+						<div className="space-y-3">
+							<p className="text-sm">
+								Repository declares{" "}
+								<span className="font-semibold">
+									{preview.name ?? solutionSlug}
+								</span>
+								{preview.version ? ` · v${preview.version}` : ""}.
+							</p>
+							<UpgradeDiffView diff={preview.diff ?? {}} />
+						</div>
+					)}
+				</div>
+				<AlertDialogFooter>
+					<AlertDialogCancel disabled={pending}>Cancel</AlertDialogCancel>
+					<Button
+						type="button"
+						disabled={
+							pending ||
+							loading ||
+							retrying ||
+							previewError ||
+							!sourceMatchesInstall
+						}
+						onClick={onConfirm}
+					>
+						{pending ? "Connecting…" : "Connect Git"}
+					</Button>
+				</AlertDialogFooter>
+			</AlertDialogContent>
+		</AlertDialog>
 	);
 }
 
@@ -539,26 +705,28 @@ export function CreateEditSolution({
 	/** Called after a successful install (with the created install) or edit. */
 	onSaved: (solution: Solution) => void;
 }) {
+	if (mode.kind === "edit")
+		return open ? (
+			<EditBody
+				key={mode.solution.id}
+				solution={mode.solution}
+				onClose={onClose}
+				onSaved={onSaved}
+			/>
+		) : null;
 	return (
-		<Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-			<DialogContent
-				className="max-h-[85vh] overflow-y-auto sm:max-w-lg"
-				data-testid="solution-dialog"
-			>
-				{mode.kind === "create" ? (
-					<CreateDispatch mode={mode} onClose={onClose} onSaved={onSaved} />
-				) : (
-					<EditBody solution={mode.solution} onClose={onClose} onSaved={onSaved} />
-				)}
-			</DialogContent>
-		</Dialog>
+		<InstallSession open={open} onClose={onClose}>
+			<CreateDispatch mode={mode} onClose={onClose} onSaved={onSaved} />
+		</InstallSession>
 	);
 }
 
 /**
- * Decides which create surface to show: the source picker, the From-repository
- * form, or the From-zip dropzone. A prefilled `file`/`repo` (or an explicit
- * `source`) skips the picker.
+ * Decides which create surface to show: destination first (the lifecycle /
+ * ownership decision), then source, then the per-path body. A prefilled
+ * `file`/`repo` (or an explicit `destination`/`source`) skips the
+ * corresponding picker. Reactivate has a fixed destination and skips the
+ * destination screen.
  */
 function CreateDispatch({
 	mode,
@@ -569,16 +737,49 @@ function CreateDispatch({
 	onClose: () => void;
 	onSaved: (solution: Solution) => void;
 }) {
-	const initialSource: "repo" | "zip" | null =
-		mode.source ?? (mode.repo ? "repo" : mode.file ? "zip" : null);
-	const [source, setSource] = useState<"repo" | "zip" | null>(initialSource);
+	const intent = mode.intent ?? "install";
+	const fixedDestination: InstallDestination | null =
+		intent === "reactivate" ? "solution" : null;
+	// A dropped/picked file is a zip, but its destination is unknown — the
+	// destination picker keeps it and the source screen is skipped. A repo
+	// prefill implies the managed repo path (deep links target installs).
+	const initialDestination: InstallDestination | null =
+		fixedDestination ?? mode.destination ?? (mode.repo ? "solution" : null);
+	const initialSource: InstallSource | null =
+		intent === "reactivate"
+			? "zip"
+			: (mode.source ?? (mode.repo ? "repo" : mode.file ? "zip" : null));
+	const [destination, setDestination] = useState<InstallDestination | null>(initialDestination);
+	const [source, setSource] = useState<InstallSource | null>(initialSource);
+	// Pickers stay compact; WorkspaceImportBody widens the dialog for upload
+	// fields and the review table.
 
 	const orgId = mode.organizationId ?? null;
 	const lockOrganization = mode.organizationId !== undefined;
-	const intent = mode.intent ?? "install";
 
+	if (destination === null) {
+		return <DestinationPicker intent={intent} onPick={setDestination} />;
+	}
 	if (source === null) {
-		return <SourcePicker intent={intent} onPick={setSource} />;
+		return (
+			<SourcePicker
+				intent={intent}
+				destination={destination}
+				onPick={setSource}
+				onBack={fixedDestination === null ? () => setDestination(null) : null}
+			/>
+		);
+	}
+	if (destination === "workspace") {
+		return (
+			<WorkspaceImportBody
+				source={source}
+				initialRepo={mode.repo ?? null}
+				initialFile={mode.file ?? null}
+				onBack={() => setSource(null)}
+				onClose={onClose}
+			/>
+		);
 	}
 	if (source === "repo") {
 		return (
@@ -602,16 +803,89 @@ function CreateDispatch({
 	);
 }
 
-/** The two install sources — a repository (marketplace) or a local zip. */
-function SourcePicker({
+/** Step 1: destination — the lifecycle/ownership decision. Two equal choices. */
+function DestinationPicker({
 	intent,
 	onPick,
 }: {
-	intent: "install" | "update";
-	onPick: (s: "repo" | "zip") => void;
+	intent: CreateSolutionIntent;
+	onPick: (d: InstallDestination) => void;
 }) {
 	const options: {
-		source: "repo" | "zip";
+		destination: InstallDestination;
+		icon: typeof GitBranch;
+		title: string;
+		description: string;
+		testid: string;
+	}[] = [
+		{
+			destination: "workspace",
+			icon: GitCompareArrows,
+			title: "Import into workspace",
+			description: "Bring definitions and source into your chosen workspace scope with uncommitted Git changes.",
+			testid: "destination-workspace",
+		},
+		{
+			destination: "solution",
+			icon: AppWindow,
+			title: "Import as a Solution",
+			description: "Create or update an isolated, lifecycle-managed Solution installation.",
+			testid: "destination-solution",
+		},
+	];
+	return (
+		<>
+			<DialogHeader>
+				<DialogTitle>
+					{intent === "reactivate"
+						? "Reactivate Solution"
+						: intent === "update"
+							? "Update Solution"
+							: "Install Solution"}
+				</DialogTitle>
+				<DialogDescription>
+					Choose where this package should go.
+				</DialogDescription>
+			</DialogHeader>
+			<div className="grid grid-cols-2 gap-3" data-testid="destination-picker">
+				{options.map(
+					({ destination, icon: Icon, title, description, testid }) => (
+						<button
+							key={destination}
+							type="button"
+							data-testid={testid}
+							onClick={() => onPick(destination)}
+							className="flex w-full flex-col gap-2 rounded-lg border p-4 text-left transition-colors hover:border-primary/60 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						>
+							<Icon className="h-6 w-6 shrink-0 text-muted-foreground" />
+							<div className="min-w-0 flex-1">
+								<p className="text-sm font-semibold">{title}</p>
+								<p className="text-xs text-muted-foreground">
+									{description}
+								</p>
+							</div>
+						</button>
+					),
+				)}
+			</div>
+		</>
+	);
+}
+
+/** Step 2: source — the same two package origins for either destination. */
+function SourcePicker({
+	intent,
+	destination,
+	onPick,
+	onBack,
+}: {
+	intent: CreateSolutionIntent;
+	destination: InstallDestination;
+	onPick: (s: InstallSource) => void;
+	onBack: (() => void) | null;
+}) {
+	const options: {
+		source: InstallSource;
 		icon: typeof GitBranch;
 		title: string;
 		description: string;
@@ -621,14 +895,20 @@ function SourcePicker({
 			source: "repo",
 			icon: GitBranch,
 			title: "From a repository",
-			description: "Install from a GitHub repository — the marketplace path.",
+			description:
+				destination === "workspace"
+					? "Import a one-time snapshot from a Git repository — the repository is not kept connected."
+					: "Install from a Git repository — the marketplace path.",
 			testid: "source-repo",
 		},
 		{
 			source: "zip",
 			icon: FileArchive,
 			title: "From a zip",
-			description: "Install from an exported Solution .zip on your machine.",
+			description:
+				destination === "workspace"
+					? "Import a one-time snapshot from an exported Solution .zip on your machine."
+					: "Install from an exported Solution .zip on your machine.",
 			testid: "source-zip",
 		},
 	];
@@ -636,30 +916,44 @@ function SourcePicker({
 		<>
 			<DialogHeader>
 				<DialogTitle>
-					{intent === "update" ? "Update Solution" : "Install Solution"}
+					{intent === "reactivate"
+						? "Reactivate Solution"
+						: intent === "update"
+							? "Update Solution"
+							: destination === "workspace"
+								? "Import into workspace"
+								: "Install Solution"}
 				</DialogTitle>
 				<DialogDescription>
-					Choose where this Solution comes from.
+					Choose where this package comes from.
 				</DialogDescription>
 			</DialogHeader>
-			<div className="space-y-3" data-testid="source-picker">
-				{options.map(({ source, icon: Icon, title, description, testid }) => (
-					<button
-						key={source}
-						type="button"
-						data-testid={testid}
-						onClick={() => onPick(source)}
-						className="flex w-full items-center gap-3 rounded-lg border p-4 text-left transition-colors hover:border-primary/60 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-					>
-						<Icon className="h-6 w-6 shrink-0 text-muted-foreground" />
-						<div className="min-w-0 flex-1">
-							<p className="text-sm font-semibold">{title}</p>
-							<p className="text-xs text-muted-foreground">{description}</p>
-						</div>
-						<ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
-					</button>
-				))}
+			<div className="grid grid-cols-2 gap-3" data-testid="source-picker">
+				{options.map(
+					({ source, icon: Icon, title, description, testid }) => (
+						<button
+							key={source}
+							type="button"
+							data-testid={testid}
+							onClick={() => onPick(source)}
+							className="flex w-full flex-col gap-2 rounded-lg border p-4 text-left transition-colors hover:border-primary/60 hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						>
+							<Icon className="h-6 w-6 shrink-0 text-muted-foreground" />
+							<div className="min-w-0 flex-1">
+								<p className="text-sm font-semibold">{title}</p>
+								<p className="text-xs text-muted-foreground">
+									{description}
+								</p>
+							</div>
+						</button>
+					),
+				)}
 			</div>
+			{onBack && (
+				<div className="pt-3">
+					<Button type="button" variant="ghost" onClick={onBack}><ArrowLeft className="mr-1 size-4" />Back</Button>
+				</div>
+			)}
 		</>
 	);
 }
@@ -704,7 +998,10 @@ function PreviewConfirmation({
 							{preview.name ?? "this Solution"}
 						</span>
 						{preview.slug ? (
-							<span className="text-muted-foreground"> ({preview.slug})</span>
+							<span className="text-muted-foreground">
+								{" "}
+								({preview.slug})
+							</span>
 						) : null}
 						.
 					</p>
@@ -717,9 +1014,12 @@ function PreviewConfirmation({
 
 			{configMode === "edit" && preview.requires_password && (
 				<div className="space-y-2 rounded-lg border p-3">
-					<p className="text-sm font-medium">Backup password required</p>
+					<p className="text-sm font-medium">
+						Backup password required
+					</p>
 					<p className="text-xs text-muted-foreground">
-						This is a full backup. Enter the password used when it was exported.
+						This is a full backup. Enter the password used when it
+						was exported.
 					</p>
 					<div className="space-y-1">
 						<Label htmlFor="backup-password">Password</Label>
@@ -728,7 +1028,9 @@ function PreviewConfirmation({
 							data-testid="backup-password-input"
 							type="password"
 							value={backupPassword ?? ""}
-							onChange={(e) => onBackupPasswordChange?.(e.target.value)}
+							onChange={(e) =>
+								onBackupPasswordChange?.(e.target.value)
+							}
 							placeholder="Export password"
 						/>
 					</div>
@@ -742,9 +1044,14 @@ function PreviewConfirmation({
 						<div className="space-y-2">
 							{declaredConfigs.map((cfg) => (
 								<div key={cfg.key} className="text-sm">
-									<span className="font-mono font-medium">{cfg.key}</span>
+									<span className="font-mono font-medium">
+										{cfg.key}
+									</span>
 									{cfg.required && (
-										<span className="ml-1 text-destructive" aria-hidden>
+										<span
+											className="ml-1 text-destructive"
+											aria-hidden
+										>
 											*
 										</span>
 									)}
@@ -756,62 +1063,21 @@ function PreviewConfirmation({
 								</div>
 							))}
 							<p className="text-xs text-muted-foreground">
-								Set these values after installing, from the install's
-								configuration.
+								Set these values after installing, from the
+								install's configuration.
 							</p>
 						</div>
 					) : (
-						declaredConfigs.map((cfg) => {
-							const value = configValues?.[cfg.key] ?? "";
-							const missing = cfg.required && value.trim() === "";
-							return (
-								<div key={cfg.key} className="space-y-1">
-									<Label
-										htmlFor={`cfg-${cfg.key}`}
-										className="flex items-center gap-1"
-									>
-										{cfg.key}
-										{cfg.required && (
-											<span className="text-destructive" aria-hidden>
-												*
-											</span>
-										)}
-									</Label>
-									{cfg.description && (
-										<p className="text-xs text-muted-foreground">
-											{cfg.description}
-										</p>
-									)}
-									<Input
-										id={`cfg-${cfg.key}`}
-										type={isSecretType(cfg.type) ? "password" : "text"}
-										value={value}
-										onChange={(e) => onConfigChange?.(cfg.key, e.target.value)}
-									/>
-									{missing && (
-										<p className="text-xs text-yellow-600 dark:text-yellow-500">
-											Required — you can still install and set this later.
-										</p>
-									)}
-								</div>
-							);
-						})
+						<ConfigValueFields
+							configs={declaredConfigs.map((cfg) => ({ ...cfg, required: false }))}
+							values={configValues ?? {}}
+							onChange={(key, value) => onConfigChange?.(key, value)}
+						/>
 					)}
 				</div>
 			)}
 		</>
 	);
-}
-
-/** Build the install-time config-value map, dropping blank entries. */
-function nonBlankConfigValues(
-	configValues: Record<string, string>,
-): Record<string, string> {
-	const values: Record<string, string> = {};
-	for (const [k, v] of Object.entries(configValues)) {
-		if (v.trim() !== "") values[k] = v;
-	}
-	return values;
 }
 
 function CreateBody({
@@ -825,10 +1091,11 @@ function CreateBody({
 	initialFile: File | null;
 	initialOrgId: string | null;
 	lockOrganization: boolean;
-	intent: "install" | "update";
+	intent: CreateSolutionIntent;
 	onClose: () => void;
 	onSaved: (solution: Solution) => void;
 }) {
+	const session = useInstallSession();
 	const queryClient = useQueryClient();
 	const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -838,7 +1105,9 @@ function CreateBody({
 	const [previewError, setPreviewError] = useState<string | null>(null);
 	const [previewLoading, setPreviewLoading] = useState(false);
 	const [installError, setInstallError] = useState<string | null>(null);
-	const [configValues, setConfigValues] = useState<Record<string, string>>({});
+	const [configValues, setConfigValues] = useState<Record<string, string>>(
+		{},
+	);
 	const [backupPassword, setBackupPassword] = useState("");
 	const [downgradeConfirm, setDowngradeConfirm] = useState(false);
 	// Colliding config-value keys parsed from a ContentCollision 409. When
@@ -870,7 +1139,9 @@ function CreateBody({
 		const seq = ++previewSeq.current;
 		setPreviewLoading(true);
 		try {
-			const data = await previewInstall(f, { organizationId: scope ?? "" });
+			const data = await previewInstall(f, {
+				organizationId: scope ?? "",
+			});
 			if (seq !== previewSeq.current) return;
 			setPreview(data);
 			setPreviewError(null);
@@ -899,6 +1170,8 @@ function CreateBody({
 	}
 
 	const installMutation = useMutation({
+		onSettled: session.finish,
+		onMutate: () => setInstallError(null),
 		mutationFn: ({
 			force,
 			replaceSecrets,
@@ -914,6 +1187,7 @@ function CreateBody({
 				force,
 				replaceSecrets,
 				password: backupPassword.trim() || undefined,
+				reactivate: intent === "reactivate",
 			});
 		},
 		onSuccess: async (created) => {
@@ -947,7 +1221,8 @@ function CreateBody({
 		},
 		onError: (err: unknown) => {
 			const status = (err as { status?: number }).status;
-			const message = err instanceof Error ? err.message : "Failed to install";
+			const message =
+				err instanceof Error ? err.message : "Failed to install";
 			if (message.includes("older than installed")) {
 				// Server's downgrade guard (409) — ask before forcing.
 				setInstallError(null);
@@ -970,7 +1245,9 @@ function CreateBody({
 				// password field stays visible (preview.requires_password is still
 				// true) so they can correct it and retry.
 				setBackupPassword("");
-				setInstallError("Incorrect password — please enter the backup password and try again.");
+				setInstallError(
+					"Incorrect password — please enter the backup password and try again.",
+				);
 				return;
 			}
 			setInstallError(message);
@@ -986,16 +1263,20 @@ function CreateBody({
 				<DialogTitle>
 					{isUpgrade && existingInstall
 						? `Upgrade ${existingInstall.name} v${existingInstall.version ?? "?"} → v${preview?.version ?? "?"}`
-						: intent === "update"
-							? "Update Solution"
-							: "Install Solution"}
+						: intent === "reactivate"
+							? "Reactivate Solution"
+							: intent === "update"
+								? "Update Solution"
+								: "Install Solution"}
 				</DialogTitle>
 				<DialogDescription>
 					{isUpgrade
 						? "This package upgrades an existing install in place. Review the changes below."
-						: intent === "update"
-							? "Choose a package to update this install in place."
-						: "Choose a package and an organization, review what it creates, and set any required configuration values."}
+						: intent === "reactivate"
+							? "Choose the exported package for this inactive install. Confirming reactivates the existing install in place."
+							: intent === "update"
+								? "Choose a package to update this install in place."
+								: "Choose a package and an organization, then review what it creates."}
 				</DialogDescription>
 			</DialogHeader>
 
@@ -1018,16 +1299,19 @@ function CreateBody({
 					<div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
 						<div className="flex min-w-0 items-center gap-2 text-sm">
 							<FileArchive className="h-4 w-4 shrink-0 text-muted-foreground" />
-							<span className="truncate font-medium">{file.name}</span>
+							<span className="truncate font-medium">
+								{file.name}
+							</span>
 						</div>
 						<Button
 							type="button"
 							variant="ghost"
 							size="icon"
-							className="h-7 w-7"
+							className="size-11"
 							aria-label="Remove file"
 							onClick={() => {
 								setFile(null);
+								setInstallError(null);
 								setPreview(null);
 								setPreviewError(null);
 								setDowngradeConfirm(false);
@@ -1094,21 +1378,36 @@ function CreateBody({
 
 				{previewLoading ? (
 					<div className="flex items-center gap-2 py-4 text-muted-foreground">
-						<Loader2 className="h-4 w-4 animate-spin" />
+						<Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" />
 						Reading package…
 					</div>
 				) : previewError ? (
-					<p className="text-sm text-destructive">{previewError}</p>
+					<div className="space-y-3">
+						<InstallFailure message={previewError} />
+						<Button
+							variant="outline"
+							className="min-h-11"
+							onClick={() => {
+								if (file) void runPreview(file, orgId);
+							}}
+						>
+							Retry package preview
+						</Button>
+					</div>
 				) : preview && downgradeConfirm ? (
-					<div data-testid="downgrade-confirm" className="space-y-2 py-2">
+					<div
+						data-testid="downgrade-confirm"
+						className="space-y-2 py-2"
+					>
 						<p className="text-sm font-medium">
-							This is a DOWNGRADE: v{existingInstall?.version ?? "?"} → v
+							This is a DOWNGRADE: v
+							{existingInstall?.version ?? "?"} → v
 							{preview.version ?? "?"}. Replace anyway?
 						</p>
 						<p className="text-xs text-muted-foreground">
-							The installed version is newer than this package. Replacing
-							it will overwrite the install's content with the older
-							version.
+							The installed version is newer than this package.
+							Replacing it will overwrite the install's content
+							with the older version.
 						</p>
 					</div>
 				) : preview ? (
@@ -1118,7 +1417,10 @@ function CreateBody({
 							configMode="edit"
 							configValues={configValues}
 							onConfigChange={(key, value) =>
-								setConfigValues((prev) => ({ ...prev, [key]: value }))
+								setConfigValues((prev) => ({
+									...prev,
+									[key]: value,
+								}))
 							}
 							backupPassword={backupPassword}
 							onBackupPasswordChange={setBackupPassword}
@@ -1141,14 +1443,13 @@ function CreateBody({
 								}}
 							/>
 						)}
-
-						{installError && (
-							<p className="text-sm text-destructive">{installError}</p>
-						)}
 					</>
 				) : null}
 			</div>
 
+			{installError && !collisionKeys && (
+				<InstallFailure message={installError} />
+			)}
 			<DialogFooter>
 				{downgradeConfirm ? (
 					<>
@@ -1161,12 +1462,16 @@ function CreateBody({
 						</Button>
 						<Button
 							variant="destructive"
-							onClick={() => installMutation.mutate({ force: true })}
+							onClick={() =>
+								session.run(() =>
+									installMutation.mutate({ force: true }),
+								)
+							}
 							disabled={installMutation.isPending}
 							data-testid="confirm-downgrade"
 						>
 							{installMutation.isPending && (
-								<Loader2 className="mr-2 h-4 w-4 animate-spin" />
+								<Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />
 							)}
 							Replace anyway
 						</Button>
@@ -1181,16 +1486,26 @@ function CreateBody({
 							Cancel
 						</Button>
 						<Button
-							onClick={() => installMutation.mutate({ force: false })}
+							onClick={() =>
+								session.run(() =>
+									installMutation.mutate({ force: false }),
+								)
+							}
 							disabled={
-								!preview || previewLoading || installMutation.isPending
+								!preview ||
+								previewLoading ||
+								installMutation.isPending
 							}
 							data-testid="confirm-install"
 						>
 							{installMutation.isPending && (
-								<Loader2 className="mr-2 h-4 w-4 animate-spin" />
+								<Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />
 							)}
-							{isUpgrade ? "Upgrade" : "Install"}
+							{isUpgrade
+								? "Upgrade"
+								: intent === "reactivate"
+									? "Reactivate"
+									: "Install"}
 						</Button>
 					</>
 				)}
@@ -1201,10 +1516,13 @@ function CreateBody({
 			<AlertDialog
 				open={collisionKeys !== null}
 				onOpenChange={(o) => {
-					if (!o) setCollisionKeys(null);
+					if (!o && !session.pending) setCollisionKeys(null);
 				}}
 			>
-				<AlertDialogContent data-testid="replace-secrets-prompt">
+				<AlertDialogContent
+					className="max-h-[90dvh] overflow-y-auto"
+					data-testid="replace-secrets-prompt"
+				>
 					<AlertDialogHeader>
 						<AlertDialogTitle>
 							Replace existing secret values?
@@ -1214,26 +1532,33 @@ function CreateBody({
 							<span className="font-mono font-medium">
 								{collisionKeys?.join(", ")}
 							</span>
-							. Replacing them overwrites the existing secret config values
-							with the ones from this package.
+							. Replacing them overwrites the existing secret
+							config values with the ones from this package.
 						</AlertDialogDescription>
 					</AlertDialogHeader>
+					{installError && <InstallFailure message={installError} />}
 					<AlertDialogFooter>
-						<AlertDialogCancel onClick={() => setCollisionKeys(null)}>
+						<AlertDialogCancel
+							disabled={session.pending}
+							onClick={() => setCollisionKeys(null)}
+						>
 							Keep existing
 						</AlertDialogCancel>
-						<AlertDialogAction
+						<Button
+							variant="destructive"
+							disabled={session.pending}
 							data-testid="confirm-replace-secrets"
 							onClick={() => {
-								setCollisionKeys(null);
-								installMutation.mutate({
-									force: false,
-									replaceSecrets: true,
-								});
+								session.run(() =>
+									installMutation.mutate({
+										force: false,
+										replaceSecrets: true,
+									}),
+								);
 							}}
 						>
 							Replace secrets
-						</AlertDialogAction>
+						</Button>
 					</AlertDialogFooter>
 				</AlertDialogContent>
 			</AlertDialog>
@@ -1255,10 +1580,11 @@ function RepoBody({
 	onSaved,
 }: {
 	initialRepo: RepoPrefill | null;
-	intent: "install" | "update";
+	intent: CreateSolutionIntent;
 	onClose: () => void;
 	onSaved: (solution: Solution) => void;
 }) {
+	const session = useInstallSession();
 	const queryClient = useQueryClient();
 
 	const [repoUrl, setRepoUrl] = useState(initialRepo?.url ?? "");
@@ -1294,12 +1620,16 @@ function RepoBody({
 		onError: (err: unknown) => {
 			setPreview(null);
 			setPreviewError(
-				err instanceof Error ? err.message : "Failed to resolve repository",
+				err instanceof Error
+					? err.message
+					: "Failed to resolve repository",
 			);
 		},
 	});
 
 	const installMutation = useMutation({
+		onSettled: session.finish,
+		onMutate: () => setInstallError(null),
 		mutationFn: () => installSolutionFromRepo(buildBody()),
 		onSuccess: (created) => {
 			queryClient.invalidateQueries({ queryKey: ["solutions"] });
@@ -1312,7 +1642,9 @@ function RepoBody({
 		},
 		onError: (err: unknown) => {
 			setInstallError(
-				err instanceof Error ? err.message : "Failed to install from repository",
+				err instanceof Error
+					? err.message
+					: "Failed to install from repository",
 			);
 		},
 	});
@@ -1326,12 +1658,15 @@ function RepoBody({
 				<DialogTitle>
 					{isUpgrade && preview?.existing_install
 						? `Upgrade ${preview.existing_install.name} v${preview.existing_install.version ?? "?"} → v${preview?.version ?? "?"}`
-						: intent === "update"
-							? "Update from repository"
-							: "Install from a repository"}
+						: intent === "reactivate"
+							? "Reactivate from repository"
+							: intent === "update"
+								? "Update from repository"
+								: "Install from a repository"}
 				</DialogTitle>
 				<DialogDescription>
-					Point at a GitHub repository, resolve what it installs, and install.
+					Point at a GitHub repository, resolve what it installs, and
+					install.
 				</DialogDescription>
 			</DialogHeader>
 
@@ -1345,6 +1680,7 @@ function RepoBody({
 							</span>
 						</Label>
 						<Input
+							disabled={previewMutation.isPending}
 							id="repo-url"
 							data-testid="repo-url"
 							value={repoUrl}
@@ -1359,6 +1695,7 @@ function RepoBody({
 						<div className="space-y-1.5">
 							<Label htmlFor="repo-subpath">Subfolder</Label>
 							<Input
+								disabled={previewMutation.isPending}
 								id="repo-subpath"
 								data-testid="repo-subpath"
 								value={subpath ?? ""}
@@ -1372,6 +1709,7 @@ function RepoBody({
 						<div className="space-y-1.5">
 							<Label htmlFor="repo-ref">Ref / branch / tag</Label>
 							<Input
+								disabled={previewMutation.isPending}
 								id="repo-ref"
 								data-testid="repo-ref"
 								value={gitRef ?? ""}
@@ -1392,7 +1730,7 @@ function RepoBody({
 							onClick={() => previewMutation.mutate()}
 						>
 							{previewMutation.isPending && (
-								<Loader2 className="mr-2 h-4 w-4 animate-spin" />
+								<Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />
 							)}
 							Resolve
 						</Button>
@@ -1401,18 +1739,21 @@ function RepoBody({
 
 				{previewMutation.isPending ? (
 					<div className="flex items-center gap-2 py-4 text-muted-foreground">
-						<Loader2 className="h-4 w-4 animate-spin" />
+						<Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" />
 						Resolving repository…
 					</div>
 				) : previewError ? (
-					<p className="text-sm text-destructive" data-testid="repo-preview-error">
-						{previewError}
-					</p>
+					<div data-testid="repo-preview-error">
+						<InstallFailure message={previewError} />
+					</div>
 				) : preview ? (
 					<>
-						<PreviewConfirmation preview={preview} configMode="declare" />
+						<PreviewConfirmation
+							preview={preview}
+							configMode="declare"
+						/>
 						{installError && (
-							<p className="text-sm text-destructive">{installError}</p>
+							<InstallFailure message={installError} />
 						)}
 					</>
 				) : null}
@@ -1428,11 +1769,11 @@ function RepoBody({
 				</Button>
 				<Button
 					data-testid="confirm-install-repo"
-					onClick={() => installMutation.mutate()}
+					onClick={() => session.run(() => installMutation.mutate())}
 					disabled={!preview || installMutation.isPending}
 				>
 					{installMutation.isPending && (
-						<Loader2 className="mr-2 h-4 w-4 animate-spin" />
+						<Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" />
 					)}
 					{isUpgrade ? "Upgrade" : "Install"}
 				</Button>
@@ -1450,12 +1791,17 @@ function EditBody({
 	onClose: () => void;
 	onSaved: (solution: Solution) => void;
 }) {
+	const savingRef = useRef(false);
 	const [name, setName] = useState(solution.name);
 	const [orgId, setOrgId] = useState<string | null>(
 		solution.organization_id ?? null,
 	);
-	const [globalRepoAccess, setGlobalRepoAccess] = useState(
-		solution.global_repo_access,
+	const [allowOutboundAccess, setAllowOutboundAccess] = useState(
+		// Deprecated global_repo_access still read during the transition.
+		solution.allow_outbound_access ?? solution.global_repo_access,
+	);
+	const [allowInboundAccess, setAllowInboundAccess] = useState(
+		solution.allow_inbound_access ?? true,
 	);
 	const [gitRepoUrl, setGitRepoUrl] = useState(solution.git_repo_url ?? "");
 	const [gitSubpath, setGitSubpath] = useState(solution.repo_subpath ?? "");
@@ -1465,6 +1811,30 @@ function EditBody({
 	// typing a URL back in flips it on. A connected install with an edited URL
 	// is a "reconnect" — the same save, no separate control.
 	const [connected, setConnected] = useState(solution.git_connected);
+	const [gitConnectConfirmOpen, setGitConnectConfirmOpen] = useState(false);
+
+	const outboundInitial =
+		solution.allow_outbound_access ?? solution.global_repo_access;
+	const inboundInitial = solution.allow_inbound_access ?? true;
+
+	function gitConnectionDraft() {
+		const trimmedUrl = gitRepoUrl.trim();
+		const nextConnected = connected && trimmedUrl !== "";
+		return {
+			nextConnected,
+			nextUrl: nextConnected ? trimmedUrl : null,
+			nextSubpath: nextConnected
+				? gitSubpath.trim() === ""
+					? null
+					: gitSubpath.trim()
+				: null,
+			nextRef: nextConnected
+				? gitRef.trim() === ""
+					? null
+					: gitRef.trim()
+				: null,
+		};
+	}
 
 	const saveMut = useMutation({
 		mutationFn: () => {
@@ -1472,123 +1842,253 @@ function EditBody({
 			if (name !== solution.name) update.name = name;
 			if (orgId !== (solution.organization_id ?? null))
 				update.organization_id = orgId;
-			if (globalRepoAccess !== solution.global_repo_access)
-				update.global_repo_access = globalRepoAccess;
+			if (allowOutboundAccess !== outboundInitial)
+				update.allow_outbound_access = allowOutboundAccess;
+			if (allowInboundAccess !== inboundInitial)
+				update.allow_inbound_access = allowInboundAccess;
 
-			const trimmedUrl = gitRepoUrl.trim();
 			// Connect when there's a URL and the user hasn't disconnected;
 			// disconnect otherwise. A disconnected install clears its repo coords.
-			const nextConnected = connected && trimmedUrl !== "";
-			const nextUrl = nextConnected ? trimmedUrl : null;
-			const nextSubpath = nextConnected
-				? gitSubpath.trim() === ""
-					? null
-					: gitSubpath.trim()
-				: null;
-			const nextRef = nextConnected
-				? gitRef.trim() === ""
-					? null
-					: gitRef.trim()
-				: null;
+			const { nextConnected, nextUrl, nextSubpath, nextRef } =
+				gitConnectionDraft();
+			const enablingGitConnection = nextConnected && !solution.git_connected;
 
 			if (nextConnected !== solution.git_connected)
 				update.git_connected = nextConnected;
 			if (nextUrl !== (solution.git_repo_url ?? null))
 				update.git_repo_url = nextUrl;
-			if (nextSubpath !== (solution.repo_subpath ?? null))
+			if (
+				enablingGitConnection ||
+				nextSubpath !== (solution.repo_subpath ?? null)
+			)
 				update.repo_subpath = nextSubpath;
-			if (nextRef !== (solution.git_ref ?? null)) update.git_ref = nextRef;
+			if (enablingGitConnection || nextRef !== (solution.git_ref ?? null))
+				update.git_ref = nextRef;
 
 			return updateSolution(solution.id, update);
 		},
 		onSuccess: (updated) => {
+			setGitConnectConfirmOpen(false);
 			toast.success("Solution updated");
 			onSaved(updated);
 		},
-		onError: (err: unknown) => {
-			toast.error(
-				err instanceof Error ? err.message : "Failed to update Solution",
-			);
+		onSettled: () => {
+			savingRef.current = false;
 		},
 	});
 
+	const gitConnectionPreview = useQuery({
+		queryKey: [
+			"solution-git-connect-preview",
+			solution.id,
+			gitRepoUrl,
+			gitSubpath,
+			gitRef,
+		],
+		enabled: gitConnectConfirmOpen,
+		queryFn: () => {
+			const { nextUrl, nextSubpath, nextRef } = gitConnectionDraft();
+			return previewSolutionFromRepo({
+				repo_url: nextUrl ?? "",
+				repo_subpath: nextSubpath,
+				git_ref: nextRef,
+				organization_id: solution.organization_id ?? null,
+			});
+		},
+	});
+
+	function submitEdit() {
+		if (savingRef.current) return;
+		const { nextConnected } = gitConnectionDraft();
+		if (nextConnected && !solution.git_connected) {
+			setGitConnectConfirmOpen(true);
+			return;
+		}
+		savingRef.current = true;
+		saveMut.mutate();
+	}
+
 	return (
-		<>
-			<DialogHeader>
-				<DialogTitle>Edit Solution</DialogTitle>
-				<DialogDescription>
-					Update install-local settings. Portable content (workflows, apps,
-					forms, etc.) is owned by the bundle and is read-only.
-				</DialogDescription>
-			</DialogHeader>
+		<Dialog
+			open
+			onOpenChange={(open) => {
+				if (!open && !savingRef.current) onClose();
+			}}
+		>
+			<DialogContent
+				data-testid="solution-dialog"
+				className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0"
+			>
+				<form
+					className="flex max-h-[90dvh] min-h-0 flex-1 flex-col overflow-hidden"
+					onSubmit={(event) => {
+						event.preventDefault();
+						submitEdit();
+					}}
+				>
+					<DialogHeader className="shrink-0 border-b p-5 pr-16! text-left">
+						<DialogTitle>Edit Solution</DialogTitle>
+						<DialogDescription>
+							Update install-local settings. Portable content
+							(workflows, apps, forms, etc.) is owned by the
+							bundle and is read-only.
+						</DialogDescription>
+					</DialogHeader>
 
-			<div className="space-y-4">
-				<div className="space-y-2">
-					<Label>Organization</Label>
-					<OrganizationSelect
-						value={orgId}
-						onChange={(value) => setOrgId(value ?? null)}
-						showGlobal
-					/>
-				</div>
+					<div className="min-h-0 overflow-y-auto">
+						<fieldset
+							disabled={saveMut.isPending}
+							onClickCapture={(event) => {
+								if (savingRef.current) {
+									event.preventDefault();
+									event.stopPropagation();
+								}
+							}}
+							className="min-w-0 space-y-4 border-0 p-5"
+						>
+							<div className="space-y-2">
+								<Label>Organization</Label>
+								<OrganizationSelect
+									aria-label="Solution organization"
+									value={orgId}
+									onChange={(value) =>
+										setOrgId(value ?? null)
+									}
+									showGlobal
+								/>
+							</div>
 
-				<div className="space-y-1.5">
-					<Label htmlFor="edit-name">Name</Label>
-					<Input
-						id="edit-name"
-						value={name}
-						onChange={(e) => setName(e.target.value)}
-					/>
-				</div>
+							<div className="space-y-1.5">
+								<Label htmlFor="edit-name">Name</Label>
+								<Input
+									id="edit-name"
+									className="min-h-11"
+									value={name}
+									onChange={(e) => setName(e.target.value)}
+								/>
+							</div>
 
-				<div className="flex items-center justify-between rounded-lg border p-3">
-					<div className="space-y-0.5">
-						<Label htmlFor="edit-global-repo">Global repo access</Label>
-						<p className="text-xs text-muted-foreground">
-							Allow shared module imports and read fallback to loose
-							org/global workflows, tables, and files.
-						</p>
+							<div className="flex items-center justify-between gap-3 rounded-[var(--bf-radius-surface)] border p-3">
+								<div className="space-y-0.5">
+									<Label htmlFor="edit-outbound-access">
+										Allow outbound access
+									</Label>
+									<p className="text-xs text-muted-foreground">
+										Allow shared module imports and read
+										fallback to loose org/global workflows,
+										tables, and files.
+									</p>
+								</div>
+								<Switch
+									id="edit-outbound-access"
+									checked={allowOutboundAccess}
+									onCheckedChange={setAllowOutboundAccess}
+								/>
+							</div>
+
+							<div className="flex items-center justify-between gap-3 rounded-[var(--bf-radius-surface)] border p-3">
+								<div className="space-y-0.5">
+									<Label htmlFor="edit-inbound-access">
+										Allow inbound access
+									</Label>
+									<p className="text-xs text-muted-foreground">
+										Allow other solutions and workflows to
+										call this install&apos;s workflows,
+										tables, and files. Off means only this
+										install&apos;s own calls resolve.
+									</p>
+								</div>
+								<Switch
+									id="edit-inbound-access"
+									checked={allowInboundAccess}
+									onCheckedChange={setAllowInboundAccess}
+								/>
+							</div>
+
+							<GitRepoSection
+								slug={solution.slug}
+								connected={
+									connected && gitRepoUrl.trim() !== ""
+								}
+								repoUrl={gitRepoUrl}
+								subpath={gitSubpath}
+								gitRef={gitRef}
+								onRepoUrlChange={(url) => {
+									setGitRepoUrl(url);
+									// Typing a URL on a disconnected install re-arms the connection.
+									if (url.trim() !== "") setConnected(true);
+								}}
+								onSubpathChange={setGitSubpath}
+								onRefChange={setGitRef}
+								onDisconnect={() => {
+									setConnected(false);
+									setGitRepoUrl("");
+									setGitSubpath("");
+									setGitRef("");
+								}}
+							/>
+							{saveMut.isError && (
+								<p
+									role="alert"
+									className="text-sm text-destructive"
+								>
+									Couldn't save the solution. Your changes are
+									ready to retry.
+								</p>
+							)}
+							{saveMut.isPending && (
+								<p role="status" className="sr-only">
+									Saving solution changes…
+								</p>
+							)}
+						</fieldset>
 					</div>
-					<Switch
-						id="edit-global-repo"
-						checked={globalRepoAccess}
-						onCheckedChange={setGlobalRepoAccess}
-					/>
-				</div>
-
-				<GitRepoSection
-					slug={solution.slug}
-					connected={connected && gitRepoUrl.trim() !== ""}
-					repoUrl={gitRepoUrl}
-					subpath={gitSubpath}
-					gitRef={gitRef}
-					onRepoUrlChange={(url) => {
-						setGitRepoUrl(url);
-						// Typing a URL on a disconnected install re-arms the connection.
-						if (url.trim() !== "") setConnected(true);
+					<DialogFooter className="shrink-0 border-t p-5">
+						<Button
+							type="button"
+							variant="outline"
+							className="min-h-11"
+							disabled={saveMut.isPending}
+							onClick={onClose}
+						>
+							Cancel
+						</Button>
+						<Button
+							type="submit"
+							className="min-h-11"
+							disabled={saveMut.isPending}
+						>
+							{saveMut.isPending && (
+								<Loader2
+									aria-hidden="true"
+									className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none"
+								/>
+							)}
+							{saveMut.isPending
+								? "Saving…"
+								: saveMut.isError
+									? "Retry save"
+									: "Save changes"}
+						</Button>
+					</DialogFooter>
+				</form>
+				<GitConnectionConfirmDialog
+					open={gitConnectConfirmOpen}
+					solutionSlug={solution.slug ?? solution.name}
+					preview={gitConnectionPreview.data}
+					loading={gitConnectionPreview.isLoading}
+					retrying={gitConnectionPreview.isFetching}
+					previewError={gitConnectionPreview.isError}
+					onRetryPreview={() => void gitConnectionPreview.refetch()}
+					onClose={() => setGitConnectConfirmOpen(false)}
+					onConfirm={() => {
+						if (savingRef.current) return;
+						savingRef.current = true;
+						saveMut.mutate();
 					}}
-					onSubpathChange={setGitSubpath}
-					onRefChange={setGitRef}
-					onDisconnect={() => {
-						setConnected(false);
-						setGitRepoUrl("");
-						setGitSubpath("");
-						setGitRef("");
-					}}
+					pending={saveMut.isPending}
 				/>
-			</div>
-
-			<DialogFooter>
-				<Button variant="outline" onClick={onClose}>
-					Cancel
-				</Button>
-				<Button disabled={saveMut.isPending} onClick={() => saveMut.mutate()}>
-					{saveMut.isPending && (
-						<Loader2 className="mr-2 h-4 w-4 animate-spin" />
-					)}
-					Save changes
-				</Button>
-			</DialogFooter>
-		</>
+			</DialogContent>
+		</Dialog>
 	);
 }

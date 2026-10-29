@@ -26,6 +26,24 @@ from bifrost import UserError, WorkflowError, ValidationError
 
 {sdk_models_docs}
 
+### Run As
+
+`workflows.execute(..., run_as=user_id)` and `agents.run(..., run_as=user_id)` (or `agents.enqueue`) start the run as another user:
+
+```python
+from bifrost import agents, workflows
+
+execution_id = await workflows.execute("workflows/onboard.py::onboard_user", {"ticket_id": ticket_id}, run_as=user_id)
+result = await agents.run("ticket-triage-agent", input={"ticket_id": ticket_id}, run_as=user_id)
+```
+
+- The caller needs the Impersonate Users permission in that user's organization. Without it the call returns 403. Running as a privileged user, such as a Platform Admin, also needs Read and Write Privileged Access.
+- Tools and SDK calls act as that user. The run is still the caller's: it keeps the caller's reach and records the caller as the one who started it.
+- Naming yourself is a plain launch, not impersonation, and needs no permission.
+- Inactive users, the system account and managed identities can't be run as (400). To run as a managed identity, assign it to the workflow or agent instead.
+- An organization-scoped agent can only run as a user from its own organization.
+- A delayed or scheduled workflow run is checked again when it fires.
+
 ### File Locations
 
 The `files` module accepts special locations plus custom, user-defined
@@ -120,7 +138,7 @@ Agents can run autonomously without a chat session. The agent receives input dat
 #### SDK Invocation
 
 ```python
-from bifrost import workflow, agents
+from bifrost import workflow, agents, AgentRunPending
 
 @workflow
 async def process_ticket(ticket_id: str):
@@ -137,8 +155,21 @@ async def process_ticket(ticket_id: str):
         },
         timeout=300,
     )
+    if isinstance(result, AgentRunPending):
+        return {
+            "run_id": result.run_id,
+            "status": result.last_known_status,
+            "wait_ended": result.reason,
+        }
     return result
 ```
+
+Pass `run_as=user_id` to run the agent as another user (see Run As above).
+
+`timeout` limits how long the workflow waits, not how long the agent runs.
+Without an explicit wait limit, `agents.run()` waits until the agent completes
+or the workflow approaches its own deadline. A pending result includes the run
+ID for a later `agents.get_run(run_id)` call.
 
 #### Event-Triggered Agent Runs
 
@@ -367,7 +398,7 @@ Pick `useTable` for "Page X of Y" numbered-page UI; pick `useInfiniteTable` for 
 | `tables.upsert(table, item \| array, scope?)` | Insert or update by id. |
 | `tables.update(table, id, data, scope?)` | Patch a row's data fields. Returns `null` if missing. |
 | `tables.delete(table, id \| array, scope?)` | Delete by id; single-form is idempotent (returns `false` if missing). |
-| `tables.query(table, q?, scope?)` | One-shot read with `where`/`limit`/`offset`/`order_by`/`order_dir`/`skip_count`. |
+| `tables.query(table, q?, scope?)` | One-shot read with `document_ids`/`where`/`limit`/`offset`/`order_by`/`order_dir`/`skip_count`. |
 | `tables.count(table, scope?)` | Row count. Throws `TableNotFoundError` if missing. |
 | `tables.subscribe(tableId, filter, onEvent)` | Direct live subscription; advanced — `useTable` covers the common case. |
 
@@ -575,6 +606,29 @@ Tables provide structured data storage with schema validation and multi-tenancy.
 | Organization | UUID | Only the owning org |
 
 Scope is resolved via cascade: org-specific first, then global fallback. The SDK `scope` parameter accepts `None` for global or an org UUID for a specific org. Omit it to use the execution context's org (default, with global cascade).
+
+### Claim-backed policies
+
+For multi-dimensional row access, materialize a scalar key from immutable UUIDs, such as `<site UUID>:<category UUID>`, and compare it with a list claim:
+
+```json
+{"in": [{"row": "access_key"}, {"claims": "allowed_access_keys"}]}
+```
+
+Keep component UUIDs on each grant row for filtered reference-data navigation, but preserve the composite key for document authorization so independent claims cannot create a Cartesian product.
+
+For managed files, a file policy may match an exact or slash-delimited descendant path against claim scopes:
+
+```json
+{
+  "path_within_any": [
+    {"file": "path"},
+    {"claims": "allowed_resource_paths"}
+  ]
+}
+```
+
+`path_within_any` is file-only and fails closed for missing, malformed, or empty scopes. Store one path prefix per grant row and use UUID path segments so display-name changes do not move files.
 
 ## Data Providers
 

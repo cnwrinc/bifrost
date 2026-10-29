@@ -1,5 +1,6 @@
 import { expect, type Page } from "@playwright/test";
 import { Buffer } from "node:buffer";
+import { readFile } from "node:fs/promises";
 import { test, type AuthedApi } from "./fixtures/api-fixture";
 
 const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
@@ -167,8 +168,16 @@ test.describe("Solution backup export (admin)", () => {
 			await deploySolution(api, page, solutionId, slug);
 			await seedSolutionFile(api, solutionId);
 
-			await page.goto(`/solutions/${solutionId}`);
-			await expect(page.getByTestId("solution-detail")).toBeVisible({ timeout: 15000 });
+			await page.goto(`/solutions/${solutionId}?tab=exports&from=docs`);
+			const exportsTab = page.getByRole("tab", { name: "Exports" });
+			await expect(exportsTab).toHaveAttribute("aria-selected", "true");
+			await expect(page.getByText("No backup exports queued yet.")).toBeVisible();
+			await page.getByRole("tab", { name: "Overview", exact: true }).click();
+			await expect(page).toHaveURL(/tab=overview&from=docs/);
+			await page.goBack();
+			await expect(exportsTab).toHaveAttribute("aria-selected", "true");
+			await page.reload();
+			await expect(exportsTab).toHaveAttribute("aria-selected", "true");
 
 			await page.getByRole("button", { name: "More solution actions" }).click();
 			await page.getByRole("menuitem", { name: "Export Solution" }).click();
@@ -177,11 +186,10 @@ test.describe("Solution backup export (admin)", () => {
 			await expect(dialog).toBeVisible();
 			await dialog.getByRole("radio", { name: "Backup" }).click();
 			await dialog.getByLabel("Password").fill("correct horse battery staple");
-			await expect(dialog.getByRole("checkbox", { name: "Config values" })).toBeChecked();
+			await expect(dialog.getByRole("checkbox", { name: /^Config values/ })).toBeChecked();
 			await expect(dialog.getByRole("checkbox", { name: "Solution-owned files" })).toBeChecked();
 			await dialog.getByRole("button", { name: "Queue backup" }).click();
 
-			const exportsTab = page.getByRole("tab", { name: "Exports" });
 			await expect(exportsTab).toHaveAttribute("aria-selected", "true", { timeout: 10000 });
 
 			let exportJobId = "";
@@ -221,19 +229,38 @@ test.describe("Solution backup export (admin)", () => {
 				.toBe("completed");
 
 			await page.reload();
-			await expect(page.getByTestId("solution-detail")).toBeVisible({ timeout: 15000 });
-			await page.getByRole("tab", { name: "Exports" }).click();
+			await expect(exportsTab).toHaveAttribute("aria-selected", "true");
 			await expect(page.getByText("completed", { exact: true })).toBeVisible({
 				timeout: 10000,
 			});
 
 			const downloadButton = page.getByRole("button", { name: "Download" });
 			await expect(downloadButton).toBeEnabled();
-			const [download] = await Promise.all([
+			const [download, linkResponse] = await Promise.all([
 				page.waitForEvent("download"),
+				page.waitForResponse(
+					(response) =>
+						response
+							.url()
+							.endsWith(
+								`/export-jobs/${exportJobId}/download-link`,
+							) && response.request().method() === "POST",
+				),
 				downloadButton.click(),
 			]);
+			expect(linkResponse.status()).toBe(200);
+			expect(linkResponse.headers()["cache-control"]).toContain("no-store");
 			expect(download.suggestedFilename()).toMatch(/\.zip$/);
+			expect(new URL(download.url()).protocol).toMatch(/^https?:$/);
+			expect(await download.failure()).toBeNull();
+			const downloadedPath = await download.path();
+			expect(downloadedPath).not.toBeNull();
+			const legacyDownload = await api.get(`/api/solutions/export-jobs/${exportJobId}/download`);
+			expect(legacyDownload.ok()).toBe(true);
+			const legacyBytes = await legacyDownload.body();
+			const downloadedBytes = await readFile(downloadedPath!);
+			expect(downloadedBytes.equals(legacyBytes)).toBe(true);
+			expect(downloadedBytes.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))).toBe(true);
 		} finally {
 			if (solutionId) {
 				await api

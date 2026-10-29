@@ -8,7 +8,13 @@ Covers:
 - Access control (non-platform-admin denied)
 """
 
+from datetime import datetime
+from uuid import uuid4
+
 import pytest
+from sqlalchemy import select
+
+from src.models.orm.audit import AuditLog
 
 
 @pytest.mark.e2e
@@ -83,20 +89,27 @@ class TestAuditLogEmission:
         ]
         assert matching, "Expected an organization.create audit event"
 
-    def test_login_failure_emits_event(self, e2e_client):
-        """Failed login attempts with an unknown user should be recorded."""
-        resp = e2e_client.post(
+    @pytest.mark.asyncio
+    async def test_login_failure_emits_event(self, private_client, db_session):
+        """A refused sign-in is recorded even though the request fails."""
+        email = f"no-such-user-{uuid4().hex[:8]}@gobifrost.dev"
+        resp = private_client.post(
             "/auth/login",
-            data={
-                "username": "no-such-user@gobifrost.dev",
-                "password": "wrongpassword",
-            },
+            data={"username": email, "password": "wrongpassword"},
         )
         assert resp.status_code == 401
 
-        # Can't list without platform admin; that's covered elsewhere. Here we
-        # just verify the request was accepted by the server (audit write
-        # happens in the same session).
+        rows = (
+            await db_session.execute(
+                select(AuditLog.outcome, AuditLog.details).where(
+                    AuditLog.action == "auth.login.failed",
+                    AuditLog.details["email"].astext == email,
+                )
+            )
+        ).all()
+        assert [(outcome, details["reason"]) for outcome, details in rows] == [
+            ("failure", "user_not_found")
+        ]
 
     def test_outcome_filter(self, e2e_client, platform_admin):
         resp = e2e_client.get(
@@ -106,6 +119,79 @@ class TestAuditLogEmission:
         assert resp.status_code == 200
         for entry in resp.json()["entries"]:
             assert entry["outcome"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_search_matches_file_path_and_table_context(
+        self,
+        e2e_client,
+        platform_admin,
+        db_session,
+    ):
+        path = f"reports/deny-{uuid4().hex}.csv"
+        table_name = f"customers_{uuid4().hex[:8]}"
+        db_session.add_all([
+            AuditLog(
+                action="policy.deny",
+                user_id=platform_admin.user_id,
+                organization_id=None,
+                resource_type="file",
+                outcome="failure",
+                source="http",
+                details={"path": path, "location": "reports"},
+            ),
+            AuditLog(
+                action="policy.deny",
+                user_id=platform_admin.user_id,
+                organization_id=None,
+                resource_type="table_document",
+                outcome="failure",
+                source="http",
+                details={"table_name": table_name, "table_id": str(uuid4())},
+            ),
+        ])
+        await db_session.commit()
+
+        for needle, expected_context in (
+            (path, path),
+            (table_name, table_name),
+            (platform_admin.email, path),
+        ):
+            response = e2e_client.get(
+                "/api/audit",
+                headers=platform_admin.headers,
+                params={"search": needle},
+            )
+            assert response.status_code == 200, response.text
+            assert any(
+                entry["details"] and expected_context in str(entry["details"])
+                for entry in response.json()["entries"]
+            )
+
+    @pytest.mark.asyncio
+    async def test_list_returns_impersonation_provenance(self, e2e_client, platform_admin, db_session):
+        resource_id, session_id = uuid4(), uuid4()
+        db_session.add(
+            AuditLog(
+                user_id=platform_admin.user_id,
+                impersonated_by_user_id=platform_admin.user_id,
+                impersonation_session_id=session_id,
+                action="test.impersonation.audit",
+                resource_type="test",
+                resource_id=resource_id,
+                outcome="success",
+                source="http",
+            )
+        )
+        await db_session.commit()
+
+        response = e2e_client.get("/api/audit?action=test.impersonation.", headers=platform_admin.headers)
+
+        assert response.status_code == 200, response.text
+        [entry] = [row for row in response.json()["entries"] if row["resource_id"] == str(resource_id)]
+        assert entry["impersonation_session_id"] == str(session_id)
+        assert entry["actor"]["impersonated_by_user_id"] == str(platform_admin.user_id)
+        assert entry["actor"]["impersonated_by_email"] == platform_admin.email
+        assert entry["actor"]["impersonated_by_name"] == platform_admin.name
 
 
 @pytest.mark.e2e
@@ -117,3 +203,16 @@ class TestAuditLogPagination:
         assert resp.status_code == 200
         body = resp.json()
         assert len(body["entries"]) <= 1
+
+
+@pytest.mark.e2e
+class TestAuditLogRetentionWindow:
+    """The list states how far back the database goes."""
+
+    def test_list_reports_retention_window(self, e2e_client, platform_admin):
+        resp = e2e_client.get("/api/audit?limit=1", headers=platform_admin.headers)
+        assert resp.status_code == 200
+        retention = resp.json()["retention"]
+        assert retention["hot_days"] == 30
+        assert retention["archive_days"] == 365
+        datetime.fromisoformat(retention["oldest_in_database"])

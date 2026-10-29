@@ -21,7 +21,8 @@ from contextlib import asynccontextmanager
 from uuid import UUID
 
 from src.config import Settings, get_settings
-from src.services.repo_storage import _get_shared_session
+from src.core.s3_transport import S3Transport
+from src.services.repo_storage import S3FileMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +40,11 @@ class SolutionStorage:
 
     @asynccontextmanager
     async def _get_client(self):
-        session = _get_shared_session()
-        async with session.create_client(
-            "s3",
+        async with S3Transport(
             endpoint_url=self._settings.s3_endpoint_url,
-            aws_access_key_id=self._settings.s3_access_key,
-            aws_secret_access_key=self._settings.s3_secret_key,
-            region_name=self._settings.s3_region,
+            access_key_id=self._settings.s3_access_key,
+            secret_access_key=self._settings.s3_secret_key,
+            region=self._settings.s3_region,
         ) as client:
             yield client
 
@@ -79,6 +78,56 @@ class SolutionStorage:
         """List files under this install (optional sub-prefix). Returns relative paths."""
         async with self._get_client() as client:
             return await self._list_from_s3(client, prefix)
+
+    async def list_with_metadata(self, prefix: str = "") -> dict[str, S3FileMetadata]:
+        """List this install's objects with size/etag metadata, keyed by relative path."""
+        async with self._get_client() as client:
+            return await self._list_with_metadata_from_s3(client, prefix)
+
+    async def _list_with_metadata_from_s3(self, client, prefix: str = "") -> dict[str, S3FileMetadata]:
+        strip = len(self.prefix)
+        result: dict[str, S3FileMetadata] = {}
+        continuation_token = None
+        while True:
+            kwargs: dict = {"Bucket": self._bucket, "Prefix": self._key(prefix)}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = await client.list_objects_v2(**kwargs)
+            for obj in response.get("Contents", []):
+                result[obj["Key"][strip:]] = S3FileMetadata(
+                    etag=obj["ETag"].strip('"'),
+                    last_modified=obj["LastModified"],
+                    size=obj["Size"],
+                )
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+        return result
+
+    async def content_hash(self, path: str) -> str | None:
+        """Return a bounded-memory SHA-256 fingerprint, or None when absent."""
+        async with self._get_client() as client:
+            try:
+                response = await client.get_object(Bucket=self._bucket, Key=self._key(path))
+            except client.exceptions.NoSuchKey:
+                return None
+            digest = hashlib.sha256()
+            body = response["Body"]
+            async with body:
+                while chunk := await body.read(8 * 1024 * 1024):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+    async def prefix_exists(self, prefix: str) -> bool:
+        """Check if any object exists under this install's prefix."""
+        async with self._get_client() as client:
+            key_prefix = self._key(prefix.rstrip("/") + "/")
+            response = await client.list_objects_v2(
+                Bucket=self._bucket,
+                Prefix=key_prefix,
+                MaxKeys=1,
+            )
+            return response.get("KeyCount", 0) > 0 or bool(response.get("Contents"))
 
     async def _list_from_s3(self, client, prefix: str = "") -> list[str]:
         full_prefix = self._key(prefix)

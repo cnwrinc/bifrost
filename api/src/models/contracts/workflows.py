@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from src.models.enums import FormAccessLevel
 from src.models.contracts.base import RetryPolicy
+from src.models.contracts.workflow_permissions import WorkflowPermissionMode
 
 if TYPE_CHECKING:
     pass
@@ -24,6 +25,7 @@ class ExecutableType(str, Enum):
     WORKFLOW = "workflow"
     TOOL = "tool"
     DATA_PROVIDER = "data_provider"
+    SERVICE = "service"
 
 
 # ==================== WORKFLOW PARAMETER & METADATA ====================
@@ -43,6 +45,8 @@ class WorkflowParameter(BaseModel):
     default_value: Any | None = None
     description: str | None = None
     options: list[dict[str, str]] | None = None  # For Literal types - [{label, value}, ...]
+    python_type: str | None = None
+    json_schema: dict[str, Any] | None = None
 
 
 class WorkflowMetadata(BaseModel):
@@ -65,8 +69,8 @@ class WorkflowMetadata(BaseModel):
     display_name: str | None = Field(default=None, description="Optional UI display name (falls back to the tool name if not set)")
     description: str | None = Field(default=None, description="Human-readable description")
 
-    # Type discriminator - distinguishes workflow/tool/data_provider
-    type: ExecutableType = Field(default=ExecutableType.WORKFLOW, description="Executable type: workflow, tool, or data_provider")
+    # Type discriminator - distinguishes workflow/tool/data_provider/service
+    type: ExecutableType = Field(default=ExecutableType.WORKFLOW, description="Executable type: workflow, tool, data_provider, or service")
 
     # Organization scoping - NULL means global (available to all orgs)
     organization_id: str | None = Field(default=None, description="Organization ID if org-scoped, None for global")
@@ -77,8 +81,15 @@ class WorkflowMetadata(BaseModel):
     is_solution_managed: bool = Field(default=False, description="True if managed by a deployed Solution (read-only on platform)")
     solution_id: UUID | None = Field(default=None, description="UUID of the owning Solution install (null if not solution-managed)")
 
+    # Identity this workflow runs as when no person starts it
+    run_identity_id: UUID | None = Field(default=None, description="Identity this workflow runs as when no person starts it. Null = its organization's default identity.")
+
+    # Powers a run of this workflow adds to its run user (effective: its own setting, else the platform default)
+    permission_mode: WorkflowPermissionMode = Field(description="Effective workflow permission mode: 'full' or 'restricted'")
+
     # Access control
     access_level: str = Field(default="role_based", description="Access level: 'authenticated' (any signed-in user except externals), 'everyone' (any signed-in user incl. externals), or 'role_based' (specific roles required)")
+    role_ids: list[str] = Field(default_factory=list, description="List of role IDs assigned to this workflow")
 
     # Optional fields with defaults
     category: str = Field(default="General", description="Category for organization")
@@ -88,6 +99,8 @@ class WorkflowMetadata(BaseModel):
     # Execution configuration
     execution_mode: Literal["sync", "async"] = Field(default="sync", description="Execution mode")
     timeout_seconds: int = Field(default=1800, ge=0, le=86400, description="Max execution time in seconds. 0 = no timeout. Default 1800 (30 min), max 86400 (24h).")
+    memory_request_mib: int | None = Field(default=None, description="Declared memory a run of this workflow requests from an executor; when unset, the learned value is used")
+    learned_memory_bytes: int | None = Field(default=None, description="Peak memory its recent runs added (learned per code version); None before a measured run")
 
     # Retry policy (for future use)
     retry_policy: RetryPolicy | None = Field(default=None, description="Retry configuration")
@@ -307,6 +320,10 @@ class WorkflowUpdateRequest(BaseModel):
             "set, role_ids wins."
         ),
     )
+    run_identity_id: UUID | None = Field(
+        default=None,
+        description="Identity this workflow runs as when no person starts it. Null = its organization's default identity.",
+    )
 
     # New fields for UI management
     name: str | None = Field(
@@ -366,6 +383,14 @@ class WorkflowUpdateRequest(BaseModel):
         ge=0,
         le=86400,
         description="Cache TTL in seconds for data providers (0-86400, default 300)"
+    )
+
+    # Memory a run requests from an executor; null clears it (learned value).
+    memory_request_mib: int | None = Field(
+        default=None,
+        ge=1,
+        le=262144,
+        description="Declared memory (MiB) a run requests from an executor; null uses the learned value"
     )
 
     # Tags (editable in UI, code-defined tags are initial values)

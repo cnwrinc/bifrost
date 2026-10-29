@@ -21,14 +21,13 @@ class TestPackages:
         data = response.json()
         assert isinstance(data, list) or "packages" in data
 
-    def test_check_package_updates(self, e2e_client, platform_admin):
-        """Platform admin can check for package updates."""
+    def test_package_updates_requires_admin(self, e2e_client, org1_user):
+        """Reject a non-admin before invoking the network-backed pip check."""
         response = e2e_client.get(
             "/api/packages/updates",
-            headers=platform_admin.headers,
+            headers=org1_user.headers,
         )
-        # May return 200 or 404 depending on implementation
-        assert response.status_code in [200, 404]
+        assert response.status_code == 403
 
 
 @pytest.mark.e2e
@@ -113,6 +112,41 @@ class TestBranding:
         public_response = e2e_client.get("/api/branding")
         assert public_response.status_code == 200
         assert public_response.json()["terminology"]["form"]["plural"] == "Quests"
+
+    def test_update_terminology_does_not_rewrite_color_and_color_reset_persists(
+        self, e2e_client, platform_admin
+    ):
+        """Omitted color survives PUT updates and DELETE /color clears it."""
+        response = e2e_client.put(
+            "/api/branding",
+            headers=platform_admin.headers,
+            json={"primary_color": "#123456"},
+        )
+        assert response.status_code in [200, 201], response.text
+        assert response.json()["primary_color"] == "#123456"
+
+        terminology_only = e2e_client.put(
+            "/api/branding",
+            headers=platform_admin.headers,
+            json={
+                "terminology": {
+                    "app": {"singular": "Game", "plural": "Games"},
+                },
+            },
+        )
+        assert terminology_only.status_code in [200, 201], terminology_only.text
+        assert terminology_only.json()["primary_color"] == "#123456"
+
+        reset = e2e_client.delete(
+            "/api/branding/color",
+            headers=platform_admin.headers,
+        )
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["primary_color"] is None
+
+        public_response = e2e_client.get("/api/branding")
+        assert public_response.status_code == 200
+        assert public_response.json()["primary_color"] is None
 
     def test_update_branding_org_user_denied(self, e2e_client, org1_user):
         """Org user cannot update branding (403)."""
@@ -396,9 +430,6 @@ class TestMetrics:
 
     def test_get_metrics_unauthenticated(self, e2e_client):
         """Unauthenticated request should fail."""
-        # Clear any cookies from previous authenticated tests
-        # (e2e_client is session-scoped and may have access_token cookie)
-        e2e_client.cookies.clear()
         response = e2e_client.get(
             "/api/metrics",
             headers={},  # No auth header
@@ -442,16 +473,79 @@ class TestMetrics:
         assert response.status_code == 403, \
             f"Org user should not access snapshot: {response.status_code}"
 
-    def test_get_metrics_authenticated(self, e2e_client, org1_user):
-        """Authenticated org user can access basic metrics endpoint."""
+    def test_get_metrics_authenticated_hides_roi_from_regular_users(
+        self, e2e_client, org1_user
+    ):
+        """A regular org user still gets the dashboard payload, but ROI
+        (platform-wide, no per-org breakdown) is bypass-only."""
         response = e2e_client.get(
             "/api/metrics",
             headers=org1_user.headers,
         )
-        # Org user may get 200 (limited view) or 403 (platform admin only)
-        # Depends on implementation - both are valid
-        assert response.status_code in [200, 403], \
-            f"Unexpected status for org user metrics: {response.status_code}"
+        assert response.status_code == 200, f"Unexpected status: {response.text}"
+        data = response.json()
+        assert data.get("roi_24h") is None
+
+    @pytest.mark.asyncio
+    async def test_get_metrics_recent_failures_scoped_to_own_org(
+        self, e2e_client, platform_admin, org1_user, org2_user, db_session
+    ):
+        """recent_failures only shows the caller's own org's failed runs
+        for a regular user; a platform admin sees ROI and is not org-filtered."""
+        from uuid import uuid4
+
+        from sqlalchemy import delete
+
+        from src.models.enums import ExecutionStatus
+        from src.models.orm import Execution
+
+        org1_workflow_name = f"org1-metrics-probe-{uuid4().hex[:8]}"
+        org2_workflow_name = f"org2-metrics-probe-{uuid4().hex[:8]}"
+        db_session.add_all(
+            [
+                Execution(
+                    id=uuid4(),
+                    workflow_name=org1_workflow_name,
+                    status=ExecutionStatus.FAILED.value,
+                    organization_id=org1_user.organization_id,
+                    executed_by=org1_user.user_id,
+                    executed_by_name=org1_user.name,
+                ),
+                Execution(
+                    id=uuid4(),
+                    workflow_name=org2_workflow_name,
+                    status=ExecutionStatus.FAILED.value,
+                    organization_id=org2_user.organization_id,
+                    executed_by=org2_user.user_id,
+                    executed_by_name=org2_user.name,
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        try:
+            org1_response = e2e_client.get("/api/metrics", headers=org1_user.headers)
+            assert org1_response.status_code == 200, org1_response.text
+            org1_names = {
+                f["workflow_name"] for f in org1_response.json()["recent_failures"]
+            }
+            assert org1_workflow_name in org1_names
+            assert org2_workflow_name not in org1_names
+
+            admin_response = e2e_client.get(
+                "/api/metrics", headers=platform_admin.headers
+            )
+            assert admin_response.status_code == 200, admin_response.text
+            assert admin_response.json().get("roi_24h") is not None
+        finally:
+            await db_session.execute(
+                delete(Execution).where(
+                    Execution.workflow_name.in_(
+                        [org1_workflow_name, org2_workflow_name]
+                    )
+                )
+            )
+            await db_session.commit()
 
     def test_get_organization_metrics_superuser(self, e2e_client, platform_admin, org1):
         """Superuser can get organization-specific metrics."""
@@ -581,27 +675,15 @@ class TestMetrics:
             )
             for offset, status in enumerate(previous_statuses, start=1)
         )
-        executions.extend(
-            [
-                Execution(
-                    workflow_name=workflow_name,
-                    status=ExecutionStatus.RUNNING,
-                    started_at=now - timedelta(seconds=1),
-                    executed_by=platform_admin.user_id,
-                    executed_by_name=platform_admin.name,
-                    organization_id=organization.id,
-                ),
-                Execution(
-                    workflow_name=workflow_name,
-                    status=ExecutionStatus.SUCCESS,
-                    started_at=now - timedelta(seconds=1),
-                    completed_at=now,
-                    executed_by=platform_admin.user_id,
-                    executed_by_name=platform_admin.name,
-                    organization_id=organization.id,
-                    is_local_execution=True,
-                ),
-            ]
+        executions.append(
+            Execution(
+                workflow_name=workflow_name,
+                status=ExecutionStatus.RUNNING,
+                started_at=now - timedelta(seconds=1),
+                executed_by=platform_admin.user_id,
+                executed_by_name=platform_admin.name,
+                organization_id=organization.id,
+            )
         )
         db_session.add_all(executions)
         await db_session.commit()
@@ -639,12 +721,15 @@ class TestMetrics:
     async def test_execution_timeseries_matches_history_visibility(
         self,
         e2e_client,
-        org1_user,
         platform_admin,
         org1,
         db_session,
     ):
-        """Org users only aggregate their own non-local executions."""
+        """Org users only aggregate their own non-local executions.
+
+        Uses a person of its own: the count covers every run the user made in
+        the window, so a shared fixture user would count other tests' runs.
+        """
         from datetime import datetime, timedelta, timezone
         from uuid import UUID, uuid4
 
@@ -652,6 +737,26 @@ class TestMetrics:
 
         from src.models.enums import ExecutionStatus
         from src.models.orm.executions import Execution
+        from tests.e2e.fixtures.setup import _register_and_authenticate_user
+        from tests.e2e.fixtures.users import E2EUser
+
+        tag = uuid4().hex[:8]
+        created = e2e_client.post(
+            "/api/users",
+            headers=platform_admin.headers,
+            json={"email": f"timeseries-{tag}@example.com", "name": "Timeseries User", "organization_id": org1["id"]},
+        )
+        assert created.status_code == 201, created.text
+        org1_user = _register_and_authenticate_user(
+            E2EUser(
+                email=f"timeseries-{tag}@example.com",
+                password=f"Ts-{tag}-Pass1!",
+                name="Timeseries User",
+                organization_id=UUID(org1["id"]),
+            ),
+            skip_registration=False,
+        )
+        org1_user.user_id = UUID(created.json()["id"])
 
         workflow_name = f"timeseries-scope-{uuid4()}"
         now = datetime.now(timezone.utc)
@@ -695,6 +800,7 @@ class TestMetrics:
                 delete(Execution).where(Execution.workflow_name == workflow_name)
             )
             await db_session.commit()
+            e2e_client.delete(f"/api/users/{org1_user.user_id}", headers=platform_admin.headers)
 
 
 # TestLogs removed: the /api/logs stub endpoint was replaced by /api/audit.

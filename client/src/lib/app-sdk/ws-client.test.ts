@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setBifrostTransport } from "./tables";
+import type { TableChangeMessage } from "./ws-client";
 import { buildWsUrl, subscribeToTable } from "./ws-client";
 
 type MockEvent = { data?: string; code?: number };
@@ -44,6 +45,24 @@ afterEach(() => {
 });
 
 describe("subscribeToTable", () => {
+  it("dispatches table invalidation frames to the subscriber", () => {
+    const events: TableChangeMessage[] = [];
+    const invalidation: TableChangeMessage = {
+      type: "table_invalidated",
+      table_id: "table-1",
+    };
+    const unsubscribe = subscribeToTable("table-1", null, (event) => {
+      events.push(event);
+    });
+
+    MockWebSocket.instances[0].emit("message", {
+      data: JSON.stringify(invalidation),
+    });
+
+    expect(events).toEqual([invalidation]);
+    unsubscribe();
+  });
+
   it("reconnects, resubscribes, and signals snapshot recovery after acknowledgement", () => {
     const events: Record<string, unknown>[] = [];
     const recovered = vi.fn();
@@ -57,7 +76,10 @@ describe("subscribeToTable", () => {
     const first = MockWebSocket.instances[0];
     first.emit("open", {});
     first.emit("message", {
-      data: JSON.stringify({ type: "subscribed", channel: "table:table-1" }),
+			data: JSON.stringify({
+				type: "subscribed",
+				channel: "table:table-1",
+			}),
     });
     expect(recovered).not.toHaveBeenCalled();
 
@@ -78,7 +100,10 @@ describe("subscribeToTable", () => {
     expect(recovered).not.toHaveBeenCalled();
 
     second.emit("message", {
-      data: JSON.stringify({ type: "subscribed", channel: "table:table-1" }),
+			data: JSON.stringify({
+				type: "subscribed",
+				channel: "table:table-1",
+			}),
     });
     expect(recovered).toHaveBeenCalledTimes(1);
     expect(events).toHaveLength(2);
@@ -97,12 +122,20 @@ describe("subscribeToTable", () => {
 
   it("requests a snapshot refresh when the initial handshake only succeeds after retry", () => {
     const recovered = vi.fn();
-    const unsubscribe = subscribeToTable("table-1", null, () => {}, recovered);
+		const unsubscribe = subscribeToTable(
+			"table-1",
+			null,
+			() => {},
+			recovered,
+		);
     MockWebSocket.instances[0].emit("close", { code: 1006 });
 
     vi.advanceTimersByTime(500);
     MockWebSocket.instances[1].emit("message", {
-      data: JSON.stringify({ type: "subscribed", channel: "table:table-1" }),
+			data: JSON.stringify({
+				type: "subscribed",
+				channel: "table:table-1",
+			}),
     });
 
     expect(recovered).toHaveBeenCalledTimes(1);
@@ -139,7 +172,9 @@ describe("buildWsUrl", () => {
   it("defaults to the window origin with NO token param (v1 inline, cookie auth)", () => {
     const url = new URL(buildWsUrl());
     const origin = new URL(window.location.href);
-    expect(url.protocol).toBe(origin.protocol === "https:" ? "wss:" : "ws:");
+		expect(url.protocol).toBe(
+			origin.protocol === "https:" ? "wss:" : "ws:",
+		);
     expect(url.host).toBe(origin.host);
     expect(url.pathname).toBe("/ws/connect");
     expect(url.searchParams.has("token")).toBe(false);
@@ -152,4 +187,21 @@ describe("buildWsUrl", () => {
     });
     expect(buildWsUrl()).toBe("ws://localhost:8000/ws/connect?token=t2");
   });
+
+	it("reads the live token each time a websocket reconnect URL is built", () => {
+		let token = "t-old";
+		restore = setBifrostTransport({
+			baseUrl: "https://remote.example",
+			token: "bootstrap-token",
+			getToken: () => token,
+		});
+
+		expect(buildWsUrl()).toBe(
+			"wss://remote.example/ws/connect?token=t-old",
+		);
+		token = "t-new";
+		expect(buildWsUrl()).toBe(
+			"wss://remote.example/ws/connect?token=t-new",
+		);
+	});
 });

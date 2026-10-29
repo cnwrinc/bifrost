@@ -4,7 +4,11 @@ Unit tests for GitHub Sync Service.
 Tests the GitHubSyncService data models and exceptions.
 """
 
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 import pytest
+from git import Repo
 
 from src.models.contracts.github import (
     OrphanInfo,
@@ -12,7 +16,333 @@ from src.models.contracts.github import (
     PreflightResult,
     WorkflowReference,
 )
-from src.services.github_sync import SyncError
+from src.services.github_sync import GitStatusError, SyncError
+
+
+class _StatusRepoManager:
+    """Minimal read-only repo manager for exercising desktop_status()."""
+
+    def __init__(self, work_dir: Path, *, is_initialized: bool = True) -> None:
+        self.work_dir = work_dir
+        self.is_initialized = is_initialized
+
+    @asynccontextmanager
+    async def lock(self):
+        yield self.work_dir
+
+
+def _status_service(work_dir: Path):
+    from src.services.github_sync import GitHubSyncService
+
+    service = GitHubSyncService.__new__(GitHubSyncService)
+    service.branch = "main"
+    service.repo_url = "https://example.invalid/workspace.git"
+    service.repo_manager = _StatusRepoManager(work_dir)
+    return service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content,field,line", [
+    ("events: {}\nevnts: {}\n", None, None),
+    ("events: {}\nevents: {}\n", None, 2),
+    ("events:\n  x:\n    id: x\n    source_type: topic\n    naem: hidden-value\n", "naem", None),
+])
+async def test_preflight_reports_strict_manifest_errors_at_the_source(
+    tmp_path: Path, content: str, field: str | None, line: int | None,
+) -> None:
+    manifest_dir = tmp_path / ".bifrost"
+    manifest_dir.mkdir()
+    (manifest_dir / "events.yaml").write_text(content)
+
+    result = await _status_service(tmp_path)._run_preflight(tmp_path)
+
+    assert result.valid is False
+    errors = [issue for issue in result.issues if issue.severity == "error"]
+    assert len(errors) == 1
+    assert errors[0].path == ".bifrost/events.yaml"
+    assert errors[0].category == "manifest"
+    assert errors[0].line == line
+    assert "hidden-value" not in errors[0].message
+    if field:
+        assert field in errors[0].message
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_decorator_settings_without_changing_candidate_source(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "from bifrost import workflow\n"
+        "@workflow(timeout_seconds=30)\n"
+        "def run(): pass\n"
+    )
+    candidate = tmp_path / "workflows" / "example.py"
+    candidate.parent.mkdir()
+    candidate.write_text(source)
+    result = await _status_service(tmp_path)._run_preflight(tmp_path)
+
+    assert result.valid is False
+    issue = next(issue for issue in result.issues if issue.category == "syntax")
+    assert issue.path == "workflows/example.py"
+    assert issue.line == 2
+    assert candidate.read_text() == source
+
+
+@pytest.mark.parametrize("path", ["../outside.py", "/tmp/outside.py"])
+def test_candidate_python_source_rejects_paths_outside_candidate(
+    tmp_path: Path, path: str,
+) -> None:
+    from bifrost.definition_validation import DefinitionValidationError
+    from src.services.github_sync import _candidate_python_source
+
+    with pytest.raises(DefinitionValidationError, match="resolve inside"):
+        _candidate_python_source(tmp_path, path)
+
+
+def test_candidate_python_source_rejects_symlink_outside_candidate(tmp_path: Path) -> None:
+    from bifrost.definition_validation import DefinitionValidationError
+    from src.services.github_sync import _candidate_python_source
+
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("from bifrost import workflow\n")
+    source = tmp_path / "workflows" / "outside.py"
+    source.parent.mkdir()
+    source.symlink_to(outside)
+
+    with pytest.raises(DefinitionValidationError, match="resolve inside"):
+        _candidate_python_source(tmp_path, "workflows/outside.py")
+
+
+@pytest.mark.asyncio
+async def test_desktop_status_returns_empty_only_for_uninitialized_workspace(tmp_path: Path) -> None:
+    service = _status_service(tmp_path)
+    service.repo_manager = _StatusRepoManager(tmp_path, is_initialized=False)
+
+    assert await service.desktop_status() == await service.desktop_status()
+
+
+@pytest.mark.asyncio
+async def test_desktop_status_surfaces_invalid_repository(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+
+    with pytest.raises(GitStatusError, match="status failed"):
+        await _status_service(tmp_path).desktop_status()
+
+
+def _git_state(repo: Repo) -> tuple[bytes, bytes, bytes, tuple[tuple[str, bytes], ...]]:
+    """Capture the index plus merge state that status must not alter."""
+    work_dir = Path(repo.working_tree_dir)
+    merge_files = ("MERGE_HEAD", "MERGE_MODE", "MERGE_MSG")
+    return (
+        (work_dir / ".git" / "index").read_bytes(),
+        repo.git.diff("--cached", "--binary", as_process=False).encode(),
+        repo.git.ls_files("-u", "-z", as_process=False).encode(),
+        tuple(
+            (name, (work_dir / ".git" / name).read_bytes())
+            for name in merge_files
+            if (work_dir / ".git" / name).exists()
+        ),
+    )
+
+
+def _commit(repo: Repo, path: str, content: str, message: str) -> None:
+    target = Path(repo.working_tree_dir) / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    repo.index.add([path])
+    repo.index.commit(message)
+
+
+def _configure_user(repo: Repo) -> None:
+    with repo.config_writer() as config:
+        config.set_value("user", "name", "Test User")
+        config.set_value("user", "email", "test@example.com")
+
+
+@pytest.mark.asyncio
+async def test_desktop_status_does_not_change_dirty_index(tmp_path: Path) -> None:
+    repo = Repo.init(tmp_path)
+    _configure_user(repo)
+    repo.git.branch("-M", "main")
+    _commit(repo, "tracked.txt", "base\n", "initial")
+    _commit(repo, "rename source.txt", "rename me\n", "add rename source")
+    _commit(repo, "staged modified.txt", "before\n", "add staged modification")
+    _commit(repo, "deleted.txt", "delete me\n", "add deleted file")
+
+    (tmp_path / "staged.txt").write_text("staged\n")
+    repo.index.add(["staged.txt"])
+    (tmp_path / "staged modified.txt").write_text("after\n")
+    repo.index.add(["staged modified.txt"])
+    repo.git.mv("rename source.txt", "renamed file.txt")
+    repo.git.rm("deleted.txt")
+    (tmp_path / "tracked.txt").write_text("working tree change\n")
+    (tmp_path / "file with spaces.txt").write_text("untracked\n")
+
+    before = _git_state(repo)
+    status = await _status_service(tmp_path).desktop_status()
+
+    assert _git_state(repo) == before
+    assert {(change.path, change.change_type) for change in status.changed_files} == {
+        ("staged.txt", "added"),
+        ("staged modified.txt", "modified"),
+        ("tracked.txt", "modified"),
+        ("file with spaces.txt", "added"),
+        ("renamed file.txt", "renamed"),
+        ("deleted.txt", "deleted"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_desktop_status_does_not_change_in_progress_merge(tmp_path: Path, caplog) -> None:
+    repo = Repo.init(tmp_path)
+    _configure_user(repo)
+    repo.git.branch("-M", "main")
+    _commit(repo, "conflict.txt", "base\n", "initial")
+
+    other = repo.create_head("other")
+    other.checkout()
+    _commit(repo, "conflict.txt", "theirs\n", "theirs")
+    repo.heads.main.checkout()
+    _commit(repo, "conflict.txt", "ours\n", "ours")
+    with pytest.raises(Exception):
+        repo.git.merge("other")
+    assert (tmp_path / ".git" / "MERGE_HEAD").exists()
+
+    before = _git_state(repo)
+    status = await _status_service(tmp_path).desktop_status()
+
+    assert _git_state(repo) == before
+    assert "Status failed" not in caplog.text
+    assert status.merging is True
+    assert [conflict.path for conflict in status.conflicts] == ["conflict.txt"]
+
+
+def test_status_parser_consumes_copy_source_record(tmp_path: Path) -> None:
+    """A porcelain-v2 copy record reports only its destination to the API."""
+    from src.services.github_sync import GitHubSyncService
+
+    class FakeGit:
+        def status(self, *args, **kwargs):
+            assert args == ("--porcelain=v2", "-z")
+            assert kwargs == {"env": {"GIT_OPTIONAL_LOCKS": "0"}}
+            return (
+                "2 C. N... 100644 100644 100644 abcdef0 abcdef0 C100 "
+                "copied file.txt\0source file.txt\0"
+            )
+
+    class FakeRepo:
+        git = FakeGit()
+
+        class index:
+            @staticmethod
+            def unmerged_blobs():
+                return {}
+
+        class head:
+            @staticmethod
+            def is_valid():
+                return False
+
+    (tmp_path / ".git").mkdir()
+    service = GitHubSyncService.__new__(GitHubSyncService)
+
+    status = service._do_status(tmp_path, FakeRepo())
+
+    assert [(change.path, change.change_type) for change in status.changed_files] == [
+        ("copied file.txt", "modified")
+    ]
+
+
+def test_status_parser_reports_unmerged_record(tmp_path: Path) -> None:
+    """Porcelain type-u records produce conflicts without consulting the index."""
+    from src.services.github_sync import GitHubSyncService
+
+    class FakeGit:
+        def status(self, *args, **kwargs):
+            return "u UU N... 100644 100644 100644 100644 base ours theirs conflict.txt\0"
+
+        def show(self, spec):
+            return {":2:conflict.txt": "ours", ":3:conflict.txt": "theirs"}[spec]
+
+    class FakeRepo:
+        git = FakeGit()
+
+        class head:
+            @staticmethod
+            def is_valid():
+                return False
+
+    (tmp_path / ".git").mkdir()
+    status = GitHubSyncService.__new__(GitHubSyncService)._do_status(tmp_path, FakeRepo())
+
+    assert [(conflict.path, conflict.conflict_type) for conflict in status.conflicts] == [
+        ("conflict.txt", "both_modified")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "stage", "conflict_type"),
+    [
+        ("UD", 2, "deleted_by_them"),
+        ("DU", 3, "deleted_by_us"),
+    ],
+)
+def test_status_parser_reads_only_present_conflict_stage(
+    tmp_path: Path,
+    status_code: str,
+    stage: int,
+    conflict_type: str,
+) -> None:
+    """Delete/modify conflicts expose only the side present in Git's index."""
+    from src.services.github_sync import GitHubSyncService
+
+    class FakeGit:
+        def status(self, *args, **kwargs):
+            return (
+                f"u {status_code} N... 100644 100644 100644 100644 "
+                "base ours theirs conflict.txt\0"
+            )
+
+        def show(self, spec):
+            assert spec == f":{stage}:conflict.txt"
+            return "present"
+
+    class FakeRepo:
+        git = FakeGit()
+
+        class head:
+            @staticmethod
+            def is_valid():
+                return False
+
+    (tmp_path / ".git").mkdir()
+    conflict = GitHubSyncService.__new__(GitHubSyncService)._do_status(tmp_path, FakeRepo()).conflicts[0]
+
+    assert conflict.conflict_type == conflict_type
+    assert conflict.ours_content == ("present" if stage == 2 else None)
+    assert conflict.theirs_content == ("present" if stage == 3 else None)
+
+
+@pytest.mark.parametrize("porcelain", ["x unknown\0", "1 M. malformed\0"])
+def test_status_parser_rejects_unknown_or_malformed_records(tmp_path: Path, porcelain: str) -> None:
+    from src.services.github_sync import GitHubSyncService
+
+    class FakeGit:
+        def status(self, *args, **kwargs):
+            return porcelain
+
+    class FakeRepo:
+        git = FakeGit()
+
+        class head:
+            @staticmethod
+            def is_valid():
+                return False
+
+    (tmp_path / ".git").mkdir()
+
+    with pytest.raises(GitStatusError):
+        GitHubSyncService.__new__(GitHubSyncService)._do_status(tmp_path, FakeRepo())
 
 
 class TestWorkflowReference:
@@ -415,3 +745,69 @@ class TestMemoryUsageDuringFileScan:
             f"expected max {max_expected / 1024 / 1024:.1f}MB. "
             f"This simulates sync pull pattern - memory should not accumulate."
         )
+
+
+PAT = "ghp_unitTestSecretToken0123456789"
+
+
+def test_clone_failure_error_does_not_contain_the_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitPython errors quote the command line, which carries the clone URL."""
+    from git import GitCommandError
+
+    from src.services.github_sync import GitHubSyncService
+
+    def failing_clone(url, path, **_kwargs):
+        raise GitCommandError(["git", "clone", "-v", "--", url, path], 128, b"fatal: denied")
+
+    monkeypatch.setattr("src.services.github_sync.GitRepo.clone_from", failing_clone)
+    service = GitHubSyncService(
+        db=None,  # type: ignore[arg-type]
+        repo_url="https://github.com/owner/repo.git",
+        token=PAT,
+    )
+
+    with pytest.raises(SyncError) as error:
+        service._clone_or_init(tmp_path)
+
+    assert PAT not in str(error.value)
+
+
+def test_opening_a_repo_rewrites_a_tokenized_remote(tmp_path: Path) -> None:
+    """Instances that stored the token in .git/config heal on the next open."""
+    from src.services.github_sync import GitHubSyncService
+
+    legacy = Repo.init(str(tmp_path))
+    legacy.create_remote("origin", f"https://x-access-token:{PAT}@github.com/owner/repo.git")
+    service = GitHubSyncService(
+        db=None,  # type: ignore[arg-type]
+        repo_url="https://github.com/owner/repo.git",
+        token=PAT,
+    )
+
+    repo = service._open_or_init(tmp_path)
+
+    assert repo.remotes.origin.url == "https://github.com/owner/repo.git"
+    assert PAT not in (tmp_path / ".git" / "config").read_text()
+
+
+def test_git_commands_authenticate_through_their_environment(tmp_path: Path) -> None:
+    """The token reaches git per command, scoped to github.com, never on disk."""
+    import base64
+
+    from src.services.github_sync import GitHubSyncService
+
+    Repo.init(str(tmp_path))
+    service = GitHubSyncService(
+        db=None,  # type: ignore[arg-type]
+        repo_url="https://github.com/owner/repo.git",
+        token=PAT,
+    )
+
+    repo = service._open_or_init(tmp_path)
+
+    header = repo.git.config("--get", "http.https://github.com/.extraheader")
+    basic = base64.b64encode(f"x-access-token:{PAT}".encode()).decode()
+    assert header == f"Authorization: Basic {basic}"
+    assert PAT not in (tmp_path / ".git" / "config").read_text()

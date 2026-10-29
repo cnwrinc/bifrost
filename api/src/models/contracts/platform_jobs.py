@@ -16,6 +16,7 @@ class PlatformJobStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    REQUIRES_ACTION = "requires_action"
 
 
 class PlatformJobProgress(BaseModel):
@@ -53,6 +54,9 @@ class PlatformJobPublic(BaseModel):
     priority: int = 100
     title: str
     action_url: str | None = None
+    # Where the attempt executes: "local" (scheduler child) or "kubernetes"
+    # (one-shot pod). Persisted at enqueue so replicas never disagree.
+    execution_backend: str = "local"
     requested_by_user_id: str
     requested_by_name: str
     status: PlatformJobStatus
@@ -64,6 +68,7 @@ class PlatformJobPublic(BaseModel):
     result: dict[str, Any] | None = None
     error: PlatformJobError | None = None
     notification_id: UUID | None = None
+    memory_required_bytes: int | None = None
     memory_start_bytes: int | None = None
     memory_peak_bytes: int | None = None
     memory_limit_bytes: int | None = None
@@ -77,6 +82,9 @@ class PlatformJobPublic(BaseModel):
 
 class PlatformJobListResponse(BaseModel):
     jobs: list[PlatformJobPublic]
+    total: int
+    limit: int
+    offset: int
 
 
 class PlatformJobCancelResponse(BaseModel):

@@ -42,6 +42,26 @@ async def _ws_subscribe(user_token: str, channels: list):
     return ws, ack
 
 
+async def _policy_deny_rows(
+    client: httpx.AsyncClient,
+    headers: dict,
+    *,
+    user_id: str,
+) -> list[dict]:
+    response = await client.get(
+        "/api/audit",
+        headers=headers,
+        params={
+            "action": "policy.deny",
+            "resource_type": "table_document",
+            "user_id": user_id,
+            "limit": 50,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["entries"]
+
+
 @pytest.mark.e2e
 @pytest.mark.asyncio
 async def test_subscribe_with_read_accepted(platform_admin, alice_user):
@@ -82,24 +102,49 @@ async def test_subscribe_with_read_accepted(platform_admin, alice_user):
 @pytest.mark.asyncio
 async def test_subscribe_without_read_rejected(platform_admin, alice_user):
     """Alice subscribes to a seeded-only table → rejected."""
+    table_name = f"sub_deny_{uuid.uuid4().hex[:8]}"
     async with httpx.AsyncClient(base_url=TEST_API_URL) as client:
         r = await client.post(
             "/api/tables",
             headers=platform_admin.headers,
             json={
-                "name": f"sub_deny_{uuid.uuid4().hex[:8]}",
+                "name": table_name,
                 "organization_id": None,
             },  # seeded admin_bypass only
         )
         assert r.status_code == 201, r.text
         table_id = r.json()["id"]
+        before = len(
+            await _policy_deny_rows(
+                client,
+                platform_admin.headers,
+                user_id=str(alice_user.user_id),
+            )
+        )
 
-    ws, ack = await _ws_subscribe(alice_user.access_token, [f"table:{table_id}"])
-    try:
-        assert ack.get("type") == "error", f"expected error ack, got {ack}"
-        assert ack.get("channel") == f"table:{table_id}"
-    finally:
-        await ws.close()
+        ws, ack = await _ws_subscribe(
+            alice_user.access_token,
+            [f"table:{table_id}"],
+        )
+        try:
+            assert ack.get("type") == "error", f"expected error ack, got {ack}"
+            assert ack.get("channel") == f"table:{table_id}"
+        finally:
+            await ws.close()
+
+        rows = await _policy_deny_rows(
+            client,
+            platform_admin.headers,
+            user_id=str(alice_user.user_id),
+        )
+        assert len(rows) == before + 1
+        assert rows[0]["action"] == "policy.deny"
+        assert rows[0]["outcome"] == "failure"
+        assert rows[0]["details"] == {
+            "policy_action": "subscribe",
+            "table_id": table_id,
+            "table_name": table_name,
+        }
 
 
 @pytest.mark.e2e
@@ -290,17 +335,19 @@ async def test_user_filter_narrows_messages(platform_admin, alice_user):
         try:
             assert ack.get("type") == "subscribed", f"subscribe failed: {ack}"
             # Insert a 'done' row → filter drops it
-            await client.post(
+            done = await client.post(
                 f"/api/tables/{table_id}/documents",
                 headers=platform_admin.headers,
                 json={"data": {"status": "done"}},
             )
+            assert done.status_code == 201, done.text
             # Insert an 'open' row → user sees it
-            await client.post(
+            open_row = await client.post(
                 f"/api/tables/{table_id}/documents",
                 headers=platform_admin.headers,
                 json={"data": {"status": "open"}},
             )
+            assert open_row.status_code == 201, open_row.text
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
             assert msg["type"] == "document_change", msg
             assert msg["action"] == "insert", msg

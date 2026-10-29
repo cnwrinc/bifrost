@@ -1,0 +1,176 @@
+"""Surface-accounting and generated-reference tripwires."""
+
+from pathlib import Path
+
+import pytest
+
+from src.main import app
+from src.services.operation_inventory import build_operation_inventory
+
+
+API_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = API_ROOT.parent
+
+
+def test_every_observed_surface_is_classified_with_a_reason() -> None:
+    inventory = build_operation_inventory(app, REPO_ROOT)
+    # R1a snapshot against current main. There is no Builder runtime on main
+    # yet (native_builder is a Builder-phase surface), and cli/mcp counts
+    # reflect main's pre-rename tool/command surface: R1b lands each domain's
+    # MCP thin-wrapper rewrite and tool-name migration, closing that parity
+    # domain by domain.
+    assert inventory["counts"] == {
+        "cli": 172,
+        "manifest": 16,
+        "mcp": 94,
+        "rest": 689,
+        "sdk": 21,
+    }
+    for surface, rows in inventory["uncataloged"].items():
+        assert rows, f"expected {surface} inventory coverage"
+        for row in rows:
+            assert row["status"]
+            assert row["reason"]
+
+
+def test_solution_dev_context_is_authentication_transport() -> None:
+    inventory = build_operation_inventory(app, REPO_ROOT)
+    row = next(
+        row for row in inventory["uncataloged"]["rest"]
+        if row["path"] == "/api/solutions/{solution_id}/dev-context"
+    )
+
+    assert row["method"] == "POST"
+    assert row["status"] == "transport_only"
+    assert row["reason"] == (
+        "Issues user-bound context for local Solution development; owns no entity state."
+    )
+
+
+@pytest.mark.parametrize("path", ["/auth/device/authorize", "/auth/device/deny"])
+def test_device_decisions_are_authentication_transport(path: str) -> None:
+    inventory = build_operation_inventory(app, REPO_ROOT)
+    row = next(row for row in inventory["uncataloged"]["rest"] if row["path"] == path)
+
+    assert row["method"] == "POST"
+    assert row["status"] == "transport_only"
+    assert row["reason"] == (
+        "Records the user's decision for CLI authentication; owns no entity state."
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "reason"),
+    [
+        (
+            "/auth/impersonate/{user_id}",
+            "Starts a browser authentication impersonation session; owns no entity state.",
+        ),
+        (
+            "/auth/impersonation/end",
+            "Ends a browser authentication impersonation session; owns no entity state.",
+        ),
+    ],
+)
+def test_browser_impersonation_routes_are_authentication_transport(
+    path: str, reason: str
+) -> None:
+    inventory = build_operation_inventory(app, REPO_ROOT)
+    row = next(row for row in inventory["uncataloged"]["rest"] if row["path"] == path)
+
+    assert row["method"] == "POST"
+    assert row["status"] == "transport_only"
+    assert row["reason"] == reason
+
+
+def test_organization_listing_is_available_to_application_sdks() -> None:
+    inventory = build_operation_inventory(app, REPO_ROOT)
+    operation = next(
+        row for row in inventory["catalog_operations"]
+        if row["operation"]["operation_id"] == "organizations.list"
+    )
+
+    assert operation["observed"]["sdk"] == {
+        "status": "exact_parity",
+        "binding": {"method": "GET", "path": "/api/organizations"},
+    }
+    assert "sdk" not in operation["operation"]["exclusions"]
+
+
+def test_documentation_mcp_tool_is_dispositioned_not_pending() -> None:
+    """The docs reader never enters the catalog.
+
+    It returns generated platform documentation and owns no entity or state,
+    so reporting it as catalog work still to do would overstate the remaining
+    surface. (Main has no Builder runtime yet, so there is no Builder-local
+    tool set to disposition alongside it.)
+    """
+    inventory = build_operation_inventory(app, REPO_ROOT)
+    dispositioned = {
+        row["name"]: row
+        for row in inventory["uncataloged"]["mcp"]
+        if row["status"] == "transport_only"
+    }
+
+    assert set(dispositioned) == {"get_docs"}
+    for row in dispositioned.values():
+        assert "has not entered" not in row["reason"], row
+
+
+def test_catalog_operations_report_exact_rest_parity() -> None:
+    """Every catalog operation's REST binding matches a real main route.
+
+    R1a only adds `operation_route` metadata to existing REST decorators, so
+    REST is the one surface where every catalog operation must already show
+    exact parity. CLI/MCP naming parity is each domain's R1b migration.
+    """
+    inventory = build_operation_inventory(app, REPO_ROOT)
+    operations = {
+        row["operation"]["operation_id"]: row for row in inventory["catalog_operations"]
+    }
+    for operation_id, row in operations.items():
+        assert row["observed"]["rest"]["status"] == "exact_parity", operation_id
+
+
+def test_generated_operation_files_are_fresh() -> None:
+    import importlib.util
+
+    generator_path = API_ROOT / "scripts" / "operation_catalog" / "generate.py"
+    spec = importlib.util.spec_from_file_location(
+        "operation_catalog_generate", generator_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert (
+        module.INVENTORY_PATH.read_text(encoding="utf-8") == module.render_inventory()
+    )
+    assert (
+        module.OPERATIONS_PATH.read_text(encoding="utf-8") == module.render_operations()
+    )
+
+
+def test_operation_reference_marks_scopes_that_only_widen() -> None:
+    import importlib.util
+
+    generator_path = API_ROOT / "scripts" / "operation_catalog" / "generate.py"
+    spec = importlib.util.spec_from_file_location(
+        "operation_catalog_generate", generator_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    rows = {
+        line.split(" | ")[0].strip("| `"): line
+        for line in module.render_operations().splitlines()
+        if line.startswith("| `")
+    }
+    assert rows["platform.jobs.get"].endswith(
+        "| `platformjobs.read.all` (only for other people's items) |"
+    )
+    assert rows["agents.create"].endswith(
+        "| `agents.readwrite` (not for your own private agents) |"
+    )
+    assert rows["tables.list"].endswith("| `tables.read` |")

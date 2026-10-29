@@ -7,14 +7,13 @@ from uuid import UUID
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only, raiseload
 
 from src.core.auth import ExecutionContext
-from src.core.org_filter import resolve_target_org
 from src.models.orm.applications import Application
 from src.models.orm.solution_file_location import SolutionFileLocation
 from src.models.orm.solutions import Solution
 from src.models.orm.tables import Table
-from src.repositories.tables import TableRepository
 
 
 @dataclass(frozen=True)
@@ -39,16 +38,232 @@ def parse_ctx_solution_id(ctx) -> UUID | None:
         return None
 
 
+def is_engine_user(user) -> bool:
+    """True for a verified workflow execution runtime credential."""
+    runtime = getattr(user, "runtime_authority", None)
+    return runtime is not None and runtime.kind == "workflow_execution"
+
+
+def is_service_principal(user) -> bool:
+    """True for a verified durable service-attempt credential."""
+    runtime = getattr(user, "runtime_authority", None)
+    return runtime is not None and runtime.kind == "service_attempt"
+
+
+async def resolve_trustworthy_caller(db: AsyncSession, ctx) -> UUID | None:
+    """Return the verified runtime or local-dev caller install.
+
+    Runtime authority resolves its install from durable execution, service,
+    or agent-run state. Query parameters and app headers never attest an
+    inbound caller install.
+    """
+    runtime = getattr(getattr(ctx, "user", None), "runtime_authority", None)
+    if runtime is not None:
+        return runtime.solution_id
+    dev_solution_id = getattr(ctx, "dev_solution_id", None)
+    if dev_solution_id is not None:
+        try:
+            return UUID(str(dev_solution_id))
+        except (ValueError, AttributeError, TypeError):
+            return None
+    return None
+
+
+def _is_ordinary_human_principal(user) -> bool:
+    """Whether ``user`` can select an App context for their own request.
+
+    An App header identifies UI context; it is not runtime provenance.  Only a
+    direct human request may use that context to access its own sealed
+    Solution.  Runtime, embed, engine, and service credentials retain the
+    durable caller behavior in :func:`resolve_trustworthy_caller` instead.
+    """
+    return bool(
+        user is not None
+        and not getattr(user, "embed", False)
+        and getattr(user, "runtime_authority", None) is None
+        and not getattr(user, "engine_execution_id", None)
+        and not getattr(user, "engine_solution_id", None)
+        and not getattr(user, "service_id", None)
+        and not getattr(user, "service_attempt_id", None)
+    )
+
+
+async def is_authorized_human_app_context(
+    db: AsyncSession,
+    ctx,
+    target_id: UUID,
+    *,
+    app_id: str | None = None,
+) -> bool:
+    """Return whether a visible App selects its own active Solution install.
+
+    The App remains a selector, never a caller identity.  Its current
+    visibility is checked through ``ApplicationRepository`` using the human's
+    current authorization context, so a stale, foreign, or revoked App header
+    cannot open a sealed install.
+    """
+    user = getattr(ctx, "user", None)
+    if not _is_ordinary_human_principal(user):
+        return False
+
+    raw_app_id = app_id if app_id is not None else getattr(ctx, "app_id", None)
+    if raw_app_id is None:
+        return False
+    try:
+        app_uuid = UUID(str(raw_app_id))
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+    target = await get_active_solution(db, target_id)
+    if target is None:
+        return False
+
+    from src.repositories.applications import ApplicationRepository
+    from src.services.authorization.enforce import load_caller
+
+    app = await ApplicationRepository(
+        db,
+        target.organization_id,
+        caller=await load_caller(db, user),
+    ).get(id=app_uuid)
+    return bool(
+        app is not None
+        and app.solution_id == target.id
+        and app.organization_id == target.organization_id
+    )
+
+
+async def inbound_allowed_for_context(
+    db: AsyncSession,
+    ctx,
+    target_id: UUID,
+    *,
+    app_id: str | None = None,
+) -> bool:
+    """Apply the inbound gate with verified callers and human App selection."""
+    caller = await resolve_trustworthy_caller(db, ctx)
+    if await check_inbound_allowed(db, target_id, caller):
+        return True
+    return await is_authorized_human_app_context(
+        db, ctx, target_id, app_id=app_id
+    )
+
+
+async def check_inbound_allowed(
+    db: AsyncSession,
+    target_id: UUID,
+    caller_id: UUID | None,
+) -> bool:
+    """SPIKE: may ``caller_id`` reach ``target_id``'s resources?
+
+    Own-install calls (caller == target) always pass. Otherwise the target's
+    ``allow_inbound_access`` decides. Inactive/missing targets deny (callers
+    see 404, never a reason).
+    """
+    if caller_id is not None and caller_id == target_id:
+        return True
+    row = (
+        await db.execute(
+            select(Solution.status, Solution.allow_inbound_access).where(
+                Solution.id == target_id
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return False
+    status, allow_inbound = row._tuple()
+    return bool(status == "active" and allow_inbound)
+
+
+class SolutionInboundDenied(Exception):
+    """An explicitly targeted install refused inbound access (sealed,
+    inactive, or unknown ref).
+
+    Distinct from "no scope" (None): routers must 404 WITHOUT shared
+    fallback — a denied target must never execute a loose same-path
+    workflow (Codex review P1).
+    """
+
+    def __init__(self, ref: str | None = None) -> None:
+        super().__init__(ref or "solution inbound denied")
+        self.ref = ref
+
+
 async def get_active_solution(db: AsyncSession, solution_id: UUID) -> Solution | None:
-    solution = await db.get(Solution, solution_id)
+    """Load only the active-install fields used by runtime scope checks."""
+    solution = await db.get(
+        Solution,
+        solution_id,
+        options=(
+            load_only(
+                Solution.id,
+                Solution.status,
+                Solution.organization_id,
+                Solution.allow_outbound_access,
+                raiseload=True,
+            ),
+            raiseload("*"),
+        ),
+    )
     if solution is None or solution.status != "active":
         return None
     return solution
 
 
+async def resolve_solution_ref(
+    db: AsyncSession,
+    ref: str | None,
+    target_org_id: UUID | None,
+) -> UUID | None:
+    """SPIKE: resolve a per-call ``solution=`` ref inside the resolved org scope.
+
+    ``ref`` is a solution install UUID or a slug/name. UUIDs pass through
+    (downstream resolvers + org gates enforce reachability, as today — keeps
+    the deprecated body-UUID compat path unchanged). Slugs/names resolve to
+    the active install in ``target_org_id`` (None = global install), then to a
+    global install; no extra permission check since the scope resolver
+    already gated the scope and the inbound gate still applies.
+    """
+    if not ref:
+        return None
+    raw = str(ref).strip()
+    if not raw:
+        return None
+    try:
+        return UUID(raw)
+    except ValueError:
+        pass
+    scopes: list[UUID | None] = [target_org_id]
+    if target_org_id is not None:
+        # A global install serves every org, so an org-scoped caller can
+        # reference it by slug or name. The org's own install wins a tie, and
+        # the inbound-access gate still decides whether the call is allowed.
+        scopes.append(None)
+    for scope in scopes:
+        stmt = select(Solution).where(
+            Solution.status == "active",
+            Solution.organization_id.is_(None)
+            if scope is None
+            else Solution.organization_id == scope,
+        )
+        rows = (await db.execute(stmt)).scalars().all()
+        for sol in rows:
+            if sol.slug == raw:
+                return sol.id
+        for sol in rows:
+            if sol.name == raw:
+                return sol.id
+    return None
+
+
 async def solution_allows_global(db: AsyncSession, solution_id: UUID) -> bool:
-    solution = await db.get(Solution, solution_id)
-    return bool(solution and solution.global_repo_access)
+    # Select only the scalar needed at this request boundary. Loading the
+    # Solution ORM also selectin-loads its file locations and connection schema,
+    # turning this boolean check into three queries on every execution.
+    result = await db.execute(
+        select(Solution.allow_outbound_access).where(Solution.id == solution_id)
+    )
+    return bool(result.scalar_one_or_none())
 
 
 async def solution_declares_file_location(
@@ -93,6 +308,15 @@ async def solution_context_id(
     if ctx_scope is not None:
         return ctx_scope
 
+    # SPIKE: slug/name ref in ?solution= (auth passes it through raw) — needs
+    # target_org to resolve, so this path stays UUID-only; use
+    # resolve_effective_solution_id() where the scope is known.
+    raw = getattr(ctx, "solution_id", None)
+    if raw is not None and str(raw).strip():
+        try:
+            UUID(str(raw))
+        except ValueError:
+            pass  # slug — resolved by caller with scope, not here.
     if not ctx.app_id:
         return None
     try:
@@ -107,6 +331,28 @@ async def solution_context_id(
     ).scalar_one_or_none()
 
 
+async def resolve_effective_solution_id(
+    db: AsyncSession,
+    ctx,
+    target_org_id: UUID | None,
+) -> UUID | None:
+    """SPIKE: request-scoped install id for tables/files.
+
+    ``ctx.solution_id`` holds the raw ``?solution=`` value (UUID or slug/name —
+    auth passes slugs through). UUIDs keep today's behavior; slugs resolve via
+    ``resolve_solution_ref`` inside the already-resolved ``target_org_id``.
+    """
+    raw = getattr(ctx, "solution_id", None)
+    if raw is not None and str(raw).strip():
+        try:
+            return UUID(str(raw))
+        except ValueError:
+            resolved = await resolve_solution_ref(db, str(raw), target_org_id)
+            if resolved is not None:
+                return resolved
+    return await solution_context_id(db, ctx)
+
+
 async def derive_execution_solution_scope(
     db: AsyncSession,
     ctx,
@@ -114,49 +360,106 @@ async def derive_execution_solution_scope(
     solution_id: str | None,
     form_id: str | None,
     app_id: str | None,
+    target_org_id: UUID | None = None,
+    caller_solution_id: str | None = None,
 ) -> UUID | None:
     """Resolve the calling install's scope for workflow execution.
 
     THE canonical derivation for /api/workflows/execute. Precedence:
     request context (auth already resolved ?solution= / X-Bifrost-App —
     the same signal tables/files scope by) > body solution_id (a Solution
-    form/agent that knows its own install) > form_id (Form.solution_id)
-    > app_id (Application.solution_id). The body fields are DEPRECATED
-    compatibility inputs — live SDKs still send them; removal requires a
-    MIN_CLI_VERSION raise. A bad/foreign/missing reference yields None →
-    no narrowing (the path ref resolves the _repo/ row, or 404s for a
-    scoped caller). Each source is client-supplied; the resolver's own
-    org gate (cascade scope) prevents a foreign scope from reaching
-    another org's workflow.
+    form/agent that knows its own install, or a per-call ``solution=`` SDK
+    target) > form_id (Form.solution_id) > app_id (Application.solution_id).
+    The body fields are DEPRECATED compatibility inputs — live SDKs still
+    send them; removal requires a MIN_CLI_VERSION raise. A bad/foreign/
+    missing reference yields None → no narrowing (the path ref resolves the
+    _repo/ row, or 404s for a scoped caller). Each source is client-supplied;
+    the resolver's own org gate (cascade scope) prevents a foreign scope from
+    reaching another org's workflow.
+
+    SPIKE: every resolved install passes the inbound gate — own-install
+    callers always pass, otherwise the target's ``allow_inbound_access``
+    decides. An EXPLICIT ref (``?solution=`` UUID or body ``solution_id``)
+    that is unknown, inactive, or sealed raises :class:`SolutionInboundDenied`
+    (routers 404 WITHOUT shared fallback — a denied target must never execute
+    a loose same-path workflow). Unset/compat sources (app header, form,
+    app) keep the old None semantics (no narrowing).
+
+    Raises:
+        SolutionInboundDenied: an explicit ref did not resolve to a
+            reachable install.
     """
     from src.models.orm.forms import Form
 
+    # Precedence (unchanged): ctx (?solution=/app header) > body > form > app.
+    # Body accepts UUID (passthrough, as today) or slug/name (SPIKE: resolved
+    # inside target_org_id). SDK per-call override flows through body with
+    # ctx unset, so it resolves; direct HTTP callers with both keep ctx-wins.
+    target: UUID | None = None
+    explicit = False
+    # The authenticated header wins, while the deprecated body app id retains
+    # its role as the selector for existing SDK callers that have no header.
+    app_context_id = getattr(ctx, "app_id", None) or app_id
     ctx_scope = await solution_context_id(db, ctx)
     if ctx_scope is not None:
-        return ctx_scope
-    if solution_id:
-        try:
-            return UUID(solution_id)
-        except ValueError:
-            return None
-    if form_id:
-        try:
-            form_uuid = UUID(form_id)
-        except ValueError:
-            return None
-        return (
-            await db.execute(select(Form.solution_id).where(Form.id == form_uuid))
-        ).scalar_one_or_none()
-    if app_id:
-        try:
-            app_uuid = UUID(app_id)
-        except ValueError:
-            return None
-        return (
-            await db.execute(
-                select(Application.solution_id).where(Application.id == app_uuid)
+        target = ctx_scope
+        # ?solution= carries an explicit UUID (SDK-forwarded own install or a
+        # direct targeting attempt) while the app-header path carries the
+        # caller's own install implicitly. Gate the former; the latter passes
+        # via the own-call bypass below.
+        explicit = parse_ctx_solution_id(ctx) is not None
+    else:
+        raw_ctx_solution = getattr(ctx, "solution_id", None)
+        if raw_ctx_solution:
+            # ?solution= slug/name (auth passes it through raw): resolve
+            # inside the target org like a body ref. Unresolvable garbage
+            # falls through to the compat sources below (pre-spike
+            # behavior); a resolved install is always explicit.
+            slug_target = await resolve_solution_ref(
+                db, str(raw_ctx_solution), target_org_id
             )
-        ).scalar_one_or_none()
+            if slug_target is not None:
+                target = slug_target
+                explicit = True
+        if target is None and solution_id:
+            target = await resolve_solution_ref(db, solution_id, target_org_id)
+            explicit = target is not None
+            if solution_id and target is None:
+                # Explicit body ref that resolves nowhere: denial, not
+                # fallback (a dangling id must not execute a loose workflow).
+                raise SolutionInboundDenied(solution_id)
+        if target is None and form_id:
+            try:
+                form_uuid = UUID(form_id)
+            except ValueError:
+                return None
+            target = (
+                await db.execute(select(Form.solution_id).where(Form.id == form_uuid))
+            ).scalar_one_or_none()
+        if target is None and app_id:
+            try:
+                app_uuid = UUID(app_id)
+            except ValueError:
+                return None
+            target = (
+                await db.execute(
+                    select(Application.solution_id).where(Application.id == app_uuid)
+                )
+            ).scalar_one_or_none()
+            # A known App-derived install is a concrete target.  If its own
+            # App context is no longer visible, do not fall back to a loose
+            # same-path workflow outside a sealed install.
+            explicit = target is not None
+    if target is None:
+        if explicit:
+            raise SolutionInboundDenied(solution_id)
+        return None
+    if await inbound_allowed_for_context(
+        db, ctx, target, app_id=app_context_id
+    ):
+        return target
+    if explicit:
+        raise SolutionInboundDenied(solution_id)
     return None
 
 
@@ -175,8 +478,13 @@ async def resolve_solution_table_by_name(
     The fallback table, when returned, is still a shared _repo table with
     ``solution_id IS NULL``. Callers that mutate documents must reject that case.
     """
-    solution_id = await solution_context_id(db, ctx)
+    solution_id = await resolve_effective_solution_id(db, ctx, target_org_id)
     if solution_id is None:
+        return None
+
+    # SPIKE inbound gate: own-install callers always pass, otherwise the
+    # target's allow_inbound_access decides. Denied → None (404 downstream).
+    if not await inbound_allowed_for_context(db, ctx, solution_id):
         return None
 
     solution = await get_active_solution(db, solution_id)
@@ -187,32 +495,43 @@ async def resolve_solution_table_by_name(
         Table.name == name,
         Table.solution_id == solution_id,
     )
-    # Bypass = is_platform_admin OR is_provider_org (repositories/README.md):
-    # provider-org members (portal-hopping platform staff) reach any org's
-    # install-owned table, same as platform admins. Row access is still decided
-    # by the client org's table/file policies after resolution.
-    if not (ctx.user.is_superuser or ctx.user.is_provider_org):
-        own_stmt = own_stmt.where(
-            or_(
-                Table.organization_id == target_org_id,
-                Table.organization_id.is_(None),
-            )
+    own_stmt = own_stmt.where(
+        or_(
+            Table.organization_id == target_org_id,
+            Table.organization_id.is_(None),
         )
+    )
     own = (await db.execute(own_stmt)).scalar_one_or_none()
     if own is not None:
         return own
 
-    if not solution.global_repo_access:
+    if not solution.allow_outbound_access:
         return None
 
-    repo = TableRepository(
-        db,
-        target_org_id,
-        user_id=ctx.user.user_id,
-        is_superuser=ctx.user.is_superuser,
-        is_external=ctx.user.is_external,
-    )
-    return await repo.get_by_name(name)
+    # ``target_org_id`` was resolved through the original user's reach before
+    # this helper is called. Resolve the ordinary table cascade explicitly so
+    # this install path cannot regain repository bypass semantics.
+    if target_org_id is not None:
+        org_table = (
+            await db.execute(
+                select(Table).where(
+                    Table.name == name,
+                    Table.solution_id.is_(None),
+                    Table.organization_id == target_org_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if org_table is not None:
+            return org_table
+    return (
+        await db.execute(
+            select(Table).where(
+                Table.name == name,
+                Table.solution_id.is_(None),
+                Table.organization_id.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
 
 
 async def file_read_tiers(
@@ -223,7 +542,7 @@ async def file_read_tiers(
 ) -> list[FileTier]:
     """Return candidate storage tiers for file read/list/exists operations."""
     if ctx.solution_id is None:
-        org_id = _file_org_id(ctx, location, requested_scope)
+        org_id = await _file_org_id(ctx, location, requested_scope)
         return [
             FileTier(
                 "global" if org_id is None else "org",
@@ -238,9 +557,26 @@ async def file_read_tiers(
 
     solution_id = parse_ctx_solution_id(ctx)
     if solution_id is None:
+        # SPIKE: slug/name in ?solution= — resolve inside the requested scope.
+        raw = str(getattr(ctx, "solution_id", ""))
+        solution_id = await resolve_solution_ref(
+            db, raw, await _file_org_id(ctx, location, requested_scope)
+        )
+    if solution_id is None:
         return []
-    solution = await db.get(Solution, solution_id)
+    solution = await get_active_solution(db, solution_id)
     if solution is None:
+        return []
+    from src.services.authorization.enforce import load_caller, user_reach
+
+    if not user_reach(await load_caller(db, ctx.user)).covers(
+        solution.organization_id
+    ):
+        return []
+    # The same shared inbound gate as tables accepts a visible direct-human
+    # App context for its own sealed install. Runtime callers use durable
+    # provenance only.
+    if not await inbound_allowed_for_context(db, ctx, solution_id):
         return []
 
     tiers = [
@@ -251,7 +587,7 @@ async def file_read_tiers(
             solution_id,
         )
     ]
-    if solution.global_repo_access:
+    if solution.allow_outbound_access:
         if solution.organization_id is not None:
             tiers.append(
                 FileTier(
@@ -265,14 +601,14 @@ async def file_read_tiers(
     return tiers
 
 
-def _file_org_id(
+async def _file_org_id(
     ctx: ExecutionContext,
     location: str,
     requested_scope: str | None,
 ) -> UUID | None:
-    if location == "workspace":
-        return None
-    return resolve_target_org(ctx.user, requested_scope, ctx.org_id)
+    from shared.file_access import file_org_id
+
+    return await file_org_id(ctx, location, requested_scope)
 
 
 def _storage_scope(org_id: UUID | None) -> str:

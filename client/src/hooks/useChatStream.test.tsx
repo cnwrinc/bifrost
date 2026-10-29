@@ -4,46 +4,52 @@ import type { ReactNode } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
+import type { ChatProjection } from "@/lib/chat-runtime";
 
-type ChatCallback = (chunk: Record<string, unknown>) => void;
-type JobCallback = (update: Record<string, unknown>) => void;
+type ChatCallback = (event: Record<string, unknown>) => void;
+type ConnectionCallback = (connected: boolean) => void;
 
 const mocks = vi.hoisted(() => {
 	const callbacks = {
 		chat: undefined as ChatCallback | undefined,
-		job: undefined as JobCallback | undefined,
+		connection: undefined as ConnectionCallback | undefined,
+		platformJob: undefined as ChatCallback | undefined,
 	};
-	const unsubscribeJob = vi.fn();
+	const generatedIds: string[] = [];
 	const store = {
-		isStreaming: false,
-		startStreaming: vi.fn(),
-		completeStream: vi.fn(),
+		projectionsByConversation: {} as Record<string, ChatProjection>,
+		applyChatRunEvent: vi.fn(),
+		applyChatRunEvents: vi.fn(),
+		hydrateConversationProjection: vi.fn(),
+		stageOptimisticUserTurn: vi.fn(),
 		setStreamError: vi.fn(),
-		resetStream: vi.fn(),
-		addSystemEvent: vi.fn(),
-		addMessage: vi.fn(),
-		setTodos: vi.fn(),
-		updateMessage: vi.fn(),
-		messagesByConversation: {} as Record<string, Array<Record<string, unknown>>>,
-		streamingMessageIds: {} as Record<string, string | null>,
-		setStreamingMessageIdForConversation: vi.fn(),
-		mapLocalIdToServerId: vi.fn(),
-		setMessages: vi.fn(),
 	};
-	return { callbacks, store, unsubscribeJob };
+	return { callbacks, generatedIds, store };
 });
 
 vi.mock("@/stores/chatStore", () => ({
-	useChatStore: Object.assign(() => mocks.store, {
-		getState: () => mocks.store,
-	}),
+	useChatStore: Object.assign(
+		(selector?: (state: typeof mocks.store) => unknown) =>
+			selector ? selector(mocks.store) : mocks.store,
+		{ getState: () => mocks.store },
+	),
+}));
+
+vi.mock("@/lib/chat-utils", () => ({
+	generateMessageId: vi.fn(
+		() => mocks.generatedIds.shift() ?? "generated-id",
+	),
 }));
 
 vi.mock("sonner", () => ({
-	toast: {
-		success: vi.fn(),
-		error: vi.fn(),
-	},
+	toast: { success: vi.fn(), error: vi.fn() },
+}));
+
+vi.mock("@/services/chatRuns", () => ({
+	createChatRun: vi.fn(),
+	getChatRunState: vi.fn(),
+	cancelChatRun: vi.fn(),
 }));
 
 vi.mock("@/services/websocket", () => ({
@@ -54,249 +60,424 @@ vi.mock("@/services/websocket", () => ({
 			mocks.callbacks.chat = callback;
 			return vi.fn();
 		}),
-		onConnectionStatusChange: vi.fn(() => vi.fn()),
-		onPlatformJobUpdate: vi.fn((_id: string, callback: JobCallback) => {
-			mocks.callbacks.job = callback;
-			return mocks.unsubscribeJob;
+		onConnectionStatusChange: vi.fn((callback: ConnectionCallback) => {
+			mocks.callbacks.connection = callback;
+			return vi.fn();
 		}),
-		sendChatMessage: vi.fn(() => true),
-		sendChatAnswer: vi.fn(),
-		sendChatStop: vi.fn(),
+		onPlatformJobUpdate: vi.fn((_id: string, callback: ChatCallback) => {
+			mocks.callbacks.platformJob = callback;
+			return vi.fn();
+		}),
 	},
 }));
 
-import { toast } from "sonner";
+import {
+	cancelChatRun,
+	createChatRun,
+	getChatRunState,
+} from "@/services/chatRuns";
 import { webSocketService } from "@/services/websocket";
 import { useChatStream } from "./useChatStream";
+
+function makeState(
+	status: string | null = null,
+	contextUsage: Record<string, unknown> | null = null,
+) {
+	return {
+		conversation: {
+			id: "conversation-1",
+			user_id: "user-1",
+			channel: "chat",
+			is_active: true,
+			created_at: "2026-09-02T00:00:00Z",
+			updated_at: "2026-09-02T00:00:00Z",
+		},
+		active_run: status
+			? {
+					id: "run-1",
+					conversation_id: "conversation-1",
+					status,
+					created_at: "2026-09-02T00:00:00Z",
+				}
+			: null,
+		messages: [],
+		events: [],
+		latest_sequence: status ? 1 : 0,
+		context_usage: contextUsage,
+	};
+}
+
+function wrapper() {
+	const queryClient = new QueryClient({
+		defaultOptions: { queries: { retry: false } },
+	});
+	return ({ children }: { children: ReactNode }) => (
+		<QueryClientProvider client={queryClient}>
+			{children}
+		</QueryClientProvider>
+	);
+}
 
 beforeEach(() => {
 	vi.clearAllMocks();
 	mocks.callbacks.chat = undefined;
-	mocks.callbacks.job = undefined;
-	mocks.store.messagesByConversation = {};
-	mocks.store.streamingMessageIds = {};
-	mocks.store.setStreamingMessageIdForConversation.mockImplementation(
-		(conversationId: string, messageId: string | null) => {
-			mocks.store.streamingMessageIds = {
-				...mocks.store.streamingMessageIds,
-				[conversationId]: messageId,
-			};
-		},
-	);
+	mocks.callbacks.connection = undefined;
+	mocks.callbacks.platformJob = undefined;
+	mocks.generatedIds.splice(0);
+	mocks.store.projectionsByConversation = {};
+	vi.mocked(webSocketService.isConnected).mockReturnValue(true);
+	vi.mocked(webSocketService.connectToChat).mockResolvedValue(undefined);
+	vi.mocked(createChatRun).mockResolvedValue({
+		run_id: "run-1",
+		status: "queued",
+	} as never);
+	vi.mocked(getChatRunState).mockResolvedValue(makeState() as never);
+	vi.mocked(cancelChatRun).mockResolvedValue({
+		run_id: "run-1",
+		status: "cancelled",
+	});
 });
 
-describe("useChatStream video jobs", () => {
-	it("does not end an active run when the new conversation subscription mounts", async () => {
-		const queryClient = new QueryClient();
-		const wrapper = ({ children }: { children: ReactNode }) => (
-			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-		);
-
-		renderHook(
-			() => useChatStream({ conversationId: "conversation-1" }),
-			{ wrapper },
-		);
-
-		await waitFor(() => expect(mocks.callbacks.chat).toBeDefined());
-		expect(mocks.store.resetStream).not.toHaveBeenCalled();
-	});
-
-	it("reconciles intermediate and final stream IDs around tool calls", async () => {
-		const queryClient = new QueryClient();
-		const wrapper = ({ children }: { children: ReactNode }) => (
-			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-		);
-		renderHook(
-			() => useChatStream({ conversationId: "conversation-1" }),
-			{ wrapper },
-		);
-		await waitFor(() => expect(mocks.callbacks.chat).toBeDefined());
-
-		act(() => {
-			mocks.callbacks.chat?.({
-				type: "message_start",
-				assistant_message_id: "assistant-summary",
-			});
-			mocks.callbacks.chat?.({
-				type: "assistant_message_end",
-				message_id: "assistant-progress",
-			});
-			mocks.callbacks.chat?.({
-				type: "delta",
-				content: "Final answer",
-			});
+describe("useChatStream", () => {
+	it("subscribes before hydrating the durable conversation state", async () => {
+		renderHook(() => useChatStream({ conversationId: "conversation-1" }), {
+			wrapper: wrapper(),
 		});
 
-		expect(mocks.store.updateMessage).toHaveBeenCalledWith(
+		await waitFor(() =>
+			expect(webSocketService.connectToChat).toHaveBeenCalledWith(
+				"conversation-1",
+			),
+		);
+		expect(webSocketService.onChatStream).toHaveBeenCalledWith(
 			"conversation-1",
-			"assistant-summary",
-			expect.objectContaining({
-				id: "assistant-progress",
-				isStreaming: false,
-			}),
-		);
-		const finalSegment = mocks.store.addMessage.mock.calls.at(-1)?.[1] as {
-			id: string;
-		};
-		expect(finalSegment.id).toBeTruthy();
-
-		act(() => {
-			mocks.callbacks.chat?.({
-				type: "done",
-				message_id: "assistant-summary",
-				duration_ms: 2_400,
-			});
-		});
-
-		expect(mocks.store.updateMessage).toHaveBeenCalledWith(
-			"conversation-1",
-			finalSegment.id,
-			expect.objectContaining({
-				id: "assistant-summary",
-				isStreaming: false,
-				duration_ms: 2_400,
-			}),
-		);
-		expect(mocks.store.streamingMessageIds["conversation-1"]).toBeNull();
-	});
-
-	it("applies final duration after the text segment already ended", async () => {
-		const queryClient = new QueryClient();
-		const wrapper = ({ children }: { children: ReactNode }) => (
-			<QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
-		);
-		renderHook(
-			() => useChatStream({ conversationId: "conversation-1" }),
-			{ wrapper },
-		);
-		await waitFor(() => expect(mocks.callbacks.chat).toBeDefined());
-
-		act(() => {
-			mocks.callbacks.chat?.({
-				type: "message_start",
-				assistant_message_id: "assistant-summary",
-			});
-			mocks.callbacks.chat?.({ type: "assistant_message_end" });
-			mocks.callbacks.chat?.({
-				type: "done",
-				message_id: "assistant-summary",
-				duration_ms: 8_500,
-				token_count_input: 12,
-				token_count_output: 3,
-			});
-		});
-
-		expect(mocks.store.updateMessage).toHaveBeenCalledWith(
-			"conversation-1",
-			"assistant-summary",
-			expect.objectContaining({ duration_ms: 8_500 }),
-		);
-	});
-
-	it("adds an opaque artifact reference to the completed tool message", async () => {
-		const queryClient = new QueryClient({
-			defaultOptions: { queries: { retry: false } },
-		});
-		const wrapper = ({ children }: { children: ReactNode }) => (
-			<QueryClientProvider client={queryClient}>
-				{children}
-			</QueryClientProvider>
-		);
-		mocks.store.messagesByConversation = {
-			"conversation-1": [{ id: "tool-message-1", attachments: [] }],
-		};
-
-		renderHook(
-			() => useChatStream({ conversationId: "conversation-1" }),
-			{ wrapper },
-		);
-		await waitFor(() => expect(mocks.callbacks.chat).toBeDefined());
-
-		act(() => {
-			mocks.callbacks.chat?.({
-				type: "artifact_ready",
-				message_id: "tool-message-1",
-				artifact: {
-					type: "bifrost_artifact",
-					id: "artifact-1",
-					filename: "Launch Brief.pdf",
-					content_type: "application/pdf",
-					size_bytes: 42,
-				},
-			});
-		});
-
-		expect(mocks.store.updateMessage).toHaveBeenCalledWith(
-			"conversation-1",
-			"tool-message-1",
-			{
-				attachments: [
-					{
-						id: "artifact-1",
-						filename: "Launch Brief.pdf",
-						content_type: "application/pdf",
-						size_bytes: 42,
-						kind: "artifact",
-					},
-				],
-			},
-		);
-	});
-
-	it("refreshes Chat and Artifacts when durable video generation finishes", async () => {
-		const queryClient = new QueryClient({
-			defaultOptions: { queries: { retry: false } },
-		});
-		const invalidate = vi.spyOn(queryClient, "invalidateQueries");
-		const wrapper = ({ children }: { children: ReactNode }) => (
-			<QueryClientProvider client={queryClient}>
-				{children}
-			</QueryClientProvider>
-		);
-
-		renderHook(
-			() => useChatStream({ conversationId: "conversation-1" }),
-			{ wrapper },
-		);
-		await waitFor(() => expect(mocks.callbacks.chat).toBeDefined());
-
-		act(() => {
-			mocks.callbacks.chat?.({
-				type: "tool_result",
-				conversation_id: "conversation-1",
-				message_id: "tool-message-1",
-				tool_result: {
-					tool_call_id: "call-1",
-					tool_name: "create_video_artifact",
-					result: {
-						type: "platform_job",
-						kind: "video_generation",
-						job_id: "job-1",
-						conversation_id: "conversation-1",
-					},
-					duration_ms: 10,
-				},
-			});
-		});
-
-		expect(webSocketService.onPlatformJobUpdate).toHaveBeenCalledWith(
-			"job-1",
 			expect.any(Function),
 		);
+		expect(getChatRunState).toHaveBeenCalledWith("conversation-1");
+		expect(mocks.store.hydrateConversationProjection).toHaveBeenCalledWith(
+			"conversation-1",
+			expect.objectContaining({ conversation_id: "conversation-1" }),
+			[],
+		);
+	});
+
+	it("hydrates the latest context usage from the durable snapshot", async () => {
+		const contextUsage = {
+			input_tokens: 1_000,
+			context_window: 10_000,
+			cache_read_tokens: 0,
+			model_profile_id: "profile-balanced",
+		};
+		vi.mocked(getChatRunState).mockResolvedValue(
+			makeState(null, contextUsage) as never,
+		);
+
+		renderHook(() => useChatStream({ conversationId: "conversation-1" }), {
+			wrapper: wrapper(),
+		});
+
+		await waitFor(() =>
+			expect(mocks.store.hydrateConversationProjection).toHaveBeenCalledWith(
+				"conversation-1",
+				expect.objectContaining({ context_usage: contextUsage }),
+				expect.any(Array),
+			),
+		);
+	});
+
+	it("does not probe the server while a first-turn command is still pending", async () => {
+		mocks.store.projectionsByConversation = {
+			"conversation-1": {
+				conversation_id: "conversation-1",
+				messages: [],
+				system_events: [],
+				runs: {
+					"run-1": {
+						run_id: "run-1",
+						conversation_id: "conversation-1",
+						status: "pending",
+						last_sequence: 0,
+						last_event_id: null,
+						applied_event_ids: [],
+						user_message_id: "user-1",
+						assistant_message_id: null,
+						streaming_message_id: null,
+					},
+				},
+				run_order: ["run-1"],
+				active_run_id: "run-1",
+				last_sequence: 0,
+				context_usage: null,
+				context_usage_sequence: 0,
+			},
+		};
+
+		renderHook(() => useChatStream({ conversationId: "conversation-1" }), {
+			wrapper: wrapper(),
+		});
+
+		expect(webSocketService.onChatStream).toHaveBeenCalledWith(
+			"conversation-1",
+			expect.any(Function),
+		);
+		expect(webSocketService.connectToChat).not.toHaveBeenCalled();
+		expect(getChatRunState).not.toHaveBeenCalled();
+	});
+
+	it("stages immediately, then creates the server run with the same IDs", async () => {
+		mocks.generatedIds.push("run-1", "user-message-1");
+		const { result } = renderHook(
+			() => useChatStream({ conversationId: "conversation-1" }),
+			{ wrapper: wrapper() },
+		);
+
+		await act(async () => {
+			await result.current.sendMessage(
+				"hello",
+				undefined,
+				[
+					{
+						id: "attachment-1",
+						filename: "brief.pdf",
+						content_type: "application/pdf",
+						size_bytes: 10,
+						kind: "attachment",
+					},
+				],
+				"profile-pro",
+			);
+		});
+
+		expect(mocks.store.stageOptimisticUserTurn).toHaveBeenCalledWith(
+			"conversation-1",
+			expect.objectContaining({
+				run_id: "run-1",
+				user_message_id: "user-message-1",
+				local_id: "user-message-1",
+				content: "hello",
+				model: "profile-pro",
+			}),
+		);
+		expect(createChatRun).toHaveBeenCalledWith({
+			conversation_id: "conversation-1",
+			content: "hello",
+			client_run_id: "run-1",
+			user_message_id: "user-message-1",
+			attachment_ids: ["attachment-1"],
+			model_profile_id: "profile-pro",
+		});
+		expect(
+			mocks.store.stageOptimisticUserTurn.mock.invocationCallOrder[0],
+		).toBeLessThan(vi.mocked(createChatRun).mock.invocationCallOrder[0]);
+	});
+
+	it("batches token events before updating the projection", async () => {
+		renderHook(() => useChatStream({ conversationId: "conversation-1" }), {
+			wrapper: wrapper(),
+		});
+		await waitFor(() => expect(mocks.callbacks.chat).toBeDefined());
+
+		const first = {
+			type: "chat_run_event",
+			event_id: "event-1",
+			sequence: 1,
+			conversation_id: "conversation-1",
+			run_id: "run-1",
+			payload: { type: "delta", content: "Hel" },
+		};
+		const second = {
+			...first,
+			event_id: "event-2",
+			sequence: 2,
+			payload: { type: "delta", content: "lo" },
+		};
+		act(() => {
+			mocks.callbacks.chat?.(first);
+			mocks.callbacks.chat?.(second);
+		});
+		expect(mocks.store.applyChatRunEvents).not.toHaveBeenCalled();
+
+		await act(
+			() => new Promise((resolve) => window.setTimeout(resolve, 40)),
+		);
+		expect(mocks.store.applyChatRunEvents).toHaveBeenCalledWith(
+			"conversation-1",
+			[first, second],
+		);
+	});
+
+	it("stops observing an artifact job that requires action", async () => {
+		renderHook(() => useChatStream({ conversationId: "conversation-1" }), {
+			wrapper: wrapper(),
+		});
+		await waitFor(() => expect(mocks.callbacks.chat).toBeDefined());
 
 		act(() => {
-			mocks.callbacks.job?.({ status: "succeeded" });
+			mocks.callbacks.chat?.({
+				type: "chat_run_event",
+				event_id: "event-tool-result",
+				sequence: 1,
+				conversation_id: "conversation-1",
+				run_id: "run-1",
+				payload: {
+					type: "tool_result",
+					tool_result: {
+						tool_call_id: "tool-1",
+						result: {
+							type: "platform_job",
+							kind: "video_generation",
+							job_id: "job-1",
+						},
+					},
+				},
+			});
+		});
+		await waitFor(() => expect(mocks.callbacks.platformJob).toBeDefined());
+
+		act(() => {
+			mocks.callbacks.platformJob?.({ status: "requires_action" });
 		});
 
-		expect(invalidate).toHaveBeenCalledWith({
-			queryKey: ["chat-artifacts"],
-		});
-		expect(mocks.store.updateMessage).toHaveBeenLastCalledWith(
-			"conversation-1",
-			"tool-message-1",
-			expect.objectContaining({ tool_state: "completed" }),
+		expect(toast.error).toHaveBeenCalledWith(
+			"Video generation did not finish",
+			expect.any(Object),
 		);
-		expect(toast.success).toHaveBeenCalledWith("Video ready");
-		expect(mocks.unsubscribeJob).toHaveBeenCalledOnce();
 	});
+
+	it("replays state again after the websocket reconnects", async () => {
+		renderHook(() => useChatStream({ conversationId: "conversation-1" }), {
+			wrapper: wrapper(),
+		});
+		await waitFor(() => expect(mocks.callbacks.connection).toBeDefined());
+		await waitFor(() => expect(getChatRunState).toHaveBeenCalled());
+		vi.mocked(getChatRunState).mockClear();
+
+		act(() => {
+			mocks.callbacks.connection?.(false);
+			mocks.callbacks.connection?.(true);
+		});
+
+		await waitFor(() =>
+			expect(getChatRunState).toHaveBeenCalledWith("conversation-1"),
+		);
+	});
+
+	it("does not resubscribe or rehydrate when callback props change identity", async () => {
+		const firstOnError = vi.fn();
+		const secondOnError = vi.fn();
+		const { rerender } = renderHook(
+			({ onError }: { onError: (message: string) => void }) =>
+				useChatStream({
+					conversationId: "conversation-1",
+					onError,
+				}),
+			{
+				wrapper: wrapper(),
+				initialProps: { onError: firstOnError },
+			},
+		);
+
+		await waitFor(() => expect(getChatRunState).toHaveBeenCalledTimes(1));
+		rerender({ onError: secondOnError });
+
+		await act(async () => Promise.resolve());
+		expect(webSocketService.onChatStream).toHaveBeenCalledTimes(1);
+		expect(getChatRunState).toHaveBeenCalledTimes(1);
+
+		act(() => {
+			mocks.callbacks.chat?.({
+				type: "chat_run_event",
+				event_id: "event-error",
+				sequence: 1,
+				conversation_id: "conversation-1",
+				run_id: "run-1",
+				payload: { type: "error", error: "latest callback" },
+			});
+		});
+
+		expect(firstOnError).not.toHaveBeenCalled();
+		expect(secondOnError).toHaveBeenCalledWith("latest callback");
+	});
+
+	it("restores the chat callback after Strict Mode replays mount effects", async () => {
+		renderHook(() => useChatStream({ conversationId: "conversation-1" }), {
+			wrapper: wrapper(),
+			reactStrictMode: true,
+		});
+
+		await waitFor(() =>
+			expect(webSocketService.onChatStream).toHaveBeenCalledTimes(2),
+		);
+		expect(mocks.callbacks.chat).toEqual(expect.any(Function));
+	});
+
+	it("cancels the active durable run and refreshes its state", async () => {
+		mocks.store.projectionsByConversation = {
+			"conversation-1": {
+				conversation_id: "conversation-1",
+				messages: [],
+				system_events: [],
+				runs: {
+					"run-1": {
+						run_id: "run-1",
+						conversation_id: "conversation-1",
+						status: "running",
+						last_sequence: 1,
+						last_event_id: null,
+						applied_event_ids: [],
+						user_message_id: "user-1",
+						assistant_message_id: null,
+						streaming_message_id: null,
+					},
+				},
+				run_order: ["run-1"],
+				active_run_id: "run-1",
+				last_sequence: 1,
+				context_usage: null,
+				context_usage_sequence: 0,
+			},
+		};
+		vi.mocked(getChatRunState).mockResolvedValue(
+			makeState("cancelled") as never,
+		);
+		const { result } = renderHook(
+			() => useChatStream({ conversationId: "conversation-1" }),
+			{ wrapper: wrapper() },
+		);
+
+		await act(async () => {
+			await result.current.stopStreaming();
+		});
+
+		expect(cancelChatRun).toHaveBeenCalledWith("run-1");
+		expect(getChatRunState).toHaveBeenCalledWith("conversation-1");
+	});
+});
+
+it("surfaces restoration failure and retries through projection hydration", async () => {
+	vi.mocked(getChatRunState).mockRejectedValueOnce(new Error("Synthetic restore failure"));
+	const { result } = renderHook(() => useChatStream({ conversationId: "conversation-1" }), { wrapper: wrapper() });
+	await waitFor(() => expect(result.current.restoreError).toBe(true));
+	expect(mocks.store.hydrateConversationProjection).not.toHaveBeenCalled();
+	act(() => result.current.retryRestore());
+	await waitFor(() => expect(result.current.restoreError).toBe(false));
+	await waitFor(() => expect(result.current.isRestoring).toBe(false));
+	expect(getChatRunState).toHaveBeenCalledTimes(2);
+	expect(mocks.store.hydrateConversationProjection).toHaveBeenCalledWith("conversation-1", expect.objectContaining({ conversation_id: "conversation-1" }), []);
+});
+
+it("clears restoration errors after reconnect and ignores an older failed replay", async () => {
+	vi.mocked(getChatRunState).mockRejectedValueOnce(new Error("Synthetic initial failure"));
+	const { result } = renderHook(() => useChatStream({ conversationId: "conversation-1" }), { wrapper: wrapper() });
+	await waitFor(() => expect(result.current.restoreError).toBe(true));
+	let rejectOld!: (error: Error) => void;
+	vi.mocked(getChatRunState).mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject; }));
+	act(() => mocks.callbacks.connection?.(true));
+	await waitFor(() => expect(result.current.isRestoring).toBe(true));
+	act(() => mocks.callbacks.connection?.(true));
+	await waitFor(() => expect(result.current.isRestoring).toBe(false));
+	expect(result.current.restoreError).toBe(false);
+	await act(async () => rejectOld(new Error("Synthetic stale failure")));
+	expect(result.current.restoreError).toBe(false);
+	expect(mocks.store.hydrateConversationProjection).toHaveBeenCalledTimes(1);
 });

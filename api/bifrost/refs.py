@@ -13,9 +13,17 @@ Accepted ref shapes (by kind):
   ``function_name`` + ``source_file_path``.
 - **slug** — ``app`` only; resolved via
   ``GET /api/applications/{slug}`` directly.
+- **email** — ``user`` only; exact, case-insensitive match against
+  ``GET /api/users?search=<email>``.
+- **identity name** — ``identity``, and ``user`` when no person's email
+  matches; exact, case-insensitive match of the name or of the label the CLI
+  prints (``Default Identity (Contoso)``) against ``GET /api/identities``.
 
 Config is keyed by ``key`` (the stored column name), not by a ``name`` field —
 callers pass the config key as the ``value`` for ``kind="config"``.
+
+Service definitions are keyed by definition UUID; the friendly alias is the
+source workflow name (``kind="service"`` matches ``id`` or ``workflow_name``).
 
 Ambiguous name matches raise :class:`AmbiguousRefError` with the full candidate
 list so the CLI can tell the user to pass the UUID directly. There is no
@@ -38,6 +46,10 @@ RefKind = Literal[
     "table",
     "event_source",
     "config",
+    "solution",
+    "service",
+    "user",
+    "identity",
 ]
 
 
@@ -237,9 +249,7 @@ async def _resolve_event_source(
     return "", candidates
 
 
-async def _resolve_config(
-    client: Any, value: str
-) -> tuple[str, list[dict[str, Any]]]:
+async def _resolve_config(client: Any, value: str) -> tuple[str, list[dict[str, Any]]]:
     # Configs are keyed by ``key`` + ``org_id``; "name" == ``key`` for this helper.
     items = await _get_json(client, "/api/config")
     matches = [c for c in items if c.get("key") == value]
@@ -254,6 +264,95 @@ async def _resolve_config(
         )
     if len(candidates) == 1:
         return candidates[0]["uuid"], candidates
+    return "", candidates
+
+
+async def _resolve_solution(
+    client: Any, value: str
+) -> tuple[str, list[dict[str, Any]]]:
+    data = await _get_json(client, "/api/solutions")
+    items = data.get("solutions", []) if isinstance(data, dict) else data
+    matches = [
+        s
+        for s in items
+        if s.get("slug") == value or s.get("name") == value or s.get("title") == value
+    ]
+    candidates = [
+        _candidate(
+            str(s.get("slug") or s.get("name") or s.get("title") or value),
+            str(s["id"]),
+            _as_opt_str(s.get("organization_id")),
+        )
+        for s in matches
+    ]
+    if len(matches) == 1:
+        return str(matches[0]["id"]), candidates
+    return "", candidates
+
+
+async def _resolve_service(
+    client: Any, value: str
+) -> tuple[str, list[dict[str, Any]]]:
+    # Services are keyed by definition UUID; the source workflow name is the
+    # friendly alias (matched against the list's workflow_name).
+    # NOTE: request the max page — the server defaults limit=100, which would
+    # silently miss definitions past 100 and break ambiguity detection.
+    # Sibling resolvers are left unpaged deliberately: each list endpoint has
+    # its own paging contract (different param names/limits, some unpaged),
+    # so a shared paging helper risks 422s. Revisit if a sibling grows a
+    # matching limit=1000 contract.
+    data = await _get_json(client, "/api/services", params={"limit": 1000})
+    items = data.get("items", []) if isinstance(data, dict) else data
+    matches = [
+        s
+        for s in items
+        if str(s.get("id")) == value or s.get("workflow_name") == value
+    ]
+    candidates = [
+        _candidate(
+            str(s.get("workflow_name") or s.get("id")),
+            str(s["id"]),
+            _as_opt_str(s.get("organization_id")),
+        )
+        for s in matches
+    ]
+    if len(matches) == 1:
+        return str(matches[0]["id"]), candidates
+    return "", candidates
+
+
+async def _resolve_user(client: Any, value: str) -> tuple[str, list[dict[str, Any]]]:
+    items = await _get_json(client, "/api/users", params={"search": value})
+    matches = [u for u in items if str(u.get("email", "")).lower() == value.lower()]
+    candidates = [
+        _candidate(u["email"], str(u["id"]), _as_opt_str(u.get("organization_id")))
+        for u in matches
+    ]
+    if not matches:
+        return await _resolve_identity(client, value)
+    if len(matches) == 1:
+        return str(matches[0]["id"]), candidates
+    return "", candidates
+
+
+def identity_label(identity: dict[str, Any]) -> str:
+    """How the CLI names an identity: with its place, since every default
+    identity is named Default Identity — ``Default Identity (Contoso)``,
+    ``Nightly (Global)``. Matches the server's ``shared.identities.identity_label``."""
+    return f"{identity['name']} ({identity['organization_name'] or 'Global'})"
+
+
+async def _resolve_identity(
+    client: Any, value: str
+) -> tuple[str, list[dict[str, Any]]]:
+    items = await _get_json(client, "/api/identities")
+    matches = [i for i in items if value.lower() in (str(i["name"]).lower(), identity_label(i).lower())]
+    candidates = [
+        _candidate(identity_label(i), str(i["id"]), _as_opt_str(i.get("organization_id")))
+        for i in matches
+    ]
+    if len(matches) == 1:
+        return str(matches[0]["id"]), candidates
     return "", candidates
 
 
@@ -274,6 +373,10 @@ _RESOLVERS = {
     "table": _resolve_table,
     "event_source": _resolve_event_source,
     "config": _resolve_config,
+    "solution": _resolve_solution,
+    "service": _resolve_service,
+    "user": _resolve_user,
+    "identity": _resolve_identity,
 }
 
 
@@ -290,7 +393,8 @@ async def resolve_ref(
         client: Async HTTP client exposing ``async def get(path) -> Response``
             (e.g. :class:`bifrost.client.BifrostClient`).
         kind: Entity kind.
-        value: UUID, name, ``path::func`` (workflow), or slug (app).
+        value: UUID, name, ``path::func`` (workflow), slug (app), email or
+            identity name (user), or identity name (identity).
         cache: Optional per-invocation cache, keyed by ``(kind, value)``.
             The CLI command instance owns one cache dict per invocation.
 
@@ -356,5 +460,6 @@ __all__ = [
     "RefNotFoundError",
     "RefResolutionError",
     "RefResolver",
+    "identity_label",
     "resolve_ref",
 ]

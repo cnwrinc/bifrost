@@ -14,10 +14,15 @@ from src.models.orm.agent_runs import AgentRun, AgentRunStep
 from src.models.orm.summary_backfill_job import SummaryBackfillJob
 from src.models.orm.agents import Agent, AgentDelegation, AgentRole, AgentTool, Conversation, Message, MessageAttachment
 from src.models.orm.ai_usage import AIModelPricing, AIUsage
+from src.models.orm.ai_models import AIEmbeddingConfig, AIModelAssignment, AIModelCatalog, AIModelProfile, AIProviderConnection
 from src.models.orm.app_embed_secrets import AppEmbedSecret
 from src.models.orm.artifacts import Artifact
 from src.models.orm.platform_jobs import PlatformJob
+from src.models.orm.platform_job_memory_profiles import PlatformJobMemoryProfile
 from src.models.orm.scheduler_leases import SchedulerLease
+from src.models.orm.work_dispatches import WorkDispatch
+from src.models.orm.execution_workers import ExecutionWorker, ExecutionWorkerClaim
+from src.models.orm.package_changes import PackageChange
 from src.models.orm.scheduler_diagnostics import (
     SchedulerReplica,
     SchedulerTaskRun,
@@ -29,9 +34,9 @@ from src.models.orm.form_publications import FormPublication
 from src.models.orm.app_roles import AppRole
 from src.models.orm.applications import Application
 from src.models.orm.audit import AuditLog
+from src.models.orm.audit_archive import AuditArchiveSegment
 from src.models.orm.base import Base
 from src.models.orm.branding import GlobalBranding
-from src.models.orm.cli import CLISession
 from src.models.orm.config import Config, SystemConfig
 from src.models.orm.events import Event, EventDelivery, EventSource, EventSubscription, WebhookSource
 from src.models.orm.executions import Execution, ExecutionLog
@@ -45,7 +50,6 @@ from src.models.orm.external_mcp import (
 from src.models.orm.forms import Form, FormField, FormRole
 from src.models.orm.integrations import Integration, IntegrationConfigSchema, IntegrationMapping
 from src.models.orm.knowledge import KnowledgeStore
-from src.models.orm.knowledge_sources import KnowledgeNamespaceRole
 from src.models.orm.memory import MemoryEntry, MemoryStore
 from src.models.orm.metrics import ExecutionMetricsDaily, KnowledgeStorageDaily, PlatformMetricsSnapshot, WorkflowROIDaily
 from src.models.orm.mfa import MFARecoveryCode, TrustedDevice, UserMFAMethod, UserOAuthAccount
@@ -56,20 +60,28 @@ from src.models.orm.solution_config_schema import SolutionConfigSchema
 from src.models.orm.solution_deploy_jobs import SolutionDeployJob
 from src.models.orm.solution_connection_schema import SolutionConnectionSchema
 from src.models.orm.solution_file_location import SolutionFileLocation
+from src.models.orm.solution_workflow_permission_requests import SolutionWorkflowPermissionRequest
 from src.models.orm.solutions import Solution
 from src.models.orm.solution_export_jobs import SolutionExportJob
 from src.models.orm.custom_claims import CustomClaim
 from src.models.orm.tables import Document, Table
-from src.models.orm.users import Role, User, UserRole
+from src.models.orm.users import Role, RolePermission, User, UserRole, UserRoleBoundary
 from src.models.orm.user_invites import UserInvite
+from src.models.orm.workflow_operation_usage import WorkflowOperationUsage
+from src.models.orm.workflow_permissions import WorkflowPermissionGrant
 from src.models.orm.workflow_roles import WorkflowRole
+from src.models.orm.workflow_run_daily import WorkflowRunDaily
 from src.models.orm.workflows import Workflow
-from src.models.orm.file_index import FileIndex
+from src.models.orm.file_index import FileIndex, SolutionFileIndex
 from src.models.orm.file_metadata import FileMetadata, FilePolicy
 from src.models.orm.policy_rule import PolicyRule
+from src.models.orm.product_updates import ProductUpdateReceipt
+from src.models.orm.services import ServiceAttempt, ServiceDefinition, ServiceLog
 from src.models.orm.worker_metric import WorkerMetric
 
 __all__ = [
+    "HomeCollection",
+    "HomeResourcePreference",
     # Base
     "Base",
     # Organizations
@@ -79,6 +91,7 @@ __all__ = [
     "SolutionConfigSchema",
     "SolutionConnectionSchema",
     "SolutionFileLocation",
+    "SolutionWorkflowPermissionRequest",
     "SolutionDeployJob",
     "SolutionExportJob",
     "PendingCaptureORM",
@@ -86,7 +99,12 @@ __all__ = [
     "Application",
     "Artifact",
     "PlatformJob",
+    "PlatformJobMemoryProfile",
     "SchedulerLease",
+    "WorkDispatch",
+    "ExecutionWorker",
+    "ExecutionWorkerClaim",
+    "PackageChange",
     "SchedulerReplica",
     "SchedulerTaskRun",
     "SchedulerTaskState",
@@ -96,8 +114,11 @@ __all__ = [
     # Users and Roles
     "User",
     "Role",
+    "RolePermission",
     "UserRole",
+    "UserRoleBoundary",
     "UserInvite",
+    "ProductUpdateReceipt",
     # Agent Runs
     "AgentRun",
     "AgentRunFlagConversation",
@@ -116,6 +137,11 @@ __all__ = [
     # AI Usage
     "AIModelPricing",
     "AIUsage",
+    "AIModelAssignment",
+    "AIEmbeddingConfig",
+    "AIModelCatalog",
+    "AIModelProfile",
+    "AIProviderConnection",
     # Forms
     "Form",
     "FormField",
@@ -125,14 +151,18 @@ __all__ = [
     # Executions
     "Execution",
     "ExecutionLog",
-    # CLI Sessions
-    "CLISession",
     # Config
     "Config",
     "SystemConfig",
     # Workflows
     "Workflow",
+    "WorkflowOperationUsage",
+    "WorkflowPermissionGrant",
     "WorkflowRole",
+    # Services (supervised executables)
+    "ServiceDefinition",
+    "ServiceAttempt",
+    "ServiceLog",
     # OAuth
     "OAuthProvider",
     "OAuthToken",
@@ -142,13 +172,12 @@ __all__ = [
     "IntegrationMapping",
     # Knowledge Store
     "KnowledgeStore",
-    # Knowledge Namespace Roles
-    "KnowledgeNamespaceRole",
     # Memory
     "MemoryStore",
     "MemoryEntry",
     # Audit
     "AuditLog",
+    "AuditArchiveSegment",
     # MFA
     "UserMFAMethod",
     "MFARecoveryCode",
@@ -161,8 +190,10 @@ __all__ = [
     "KnowledgeStorageDaily",
     "PlatformMetricsSnapshot",
     "WorkflowROIDaily",
+    "WorkflowRunDaily",
     # Workspace
     "FileIndex",
+    "SolutionFileIndex",
     "FileMetadata",
     "FilePolicy",
     # Policy Rules
@@ -187,3 +218,5 @@ __all__ = [
     # Custom Claims
     "CustomClaim",
 ]
+
+from src.models.orm.home import HomeCollection, HomeResourcePreference

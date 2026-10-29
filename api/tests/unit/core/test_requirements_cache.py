@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -12,10 +12,79 @@ from src.core.requirements_cache import (
     CachedRequirements,
     append_package_to_requirements,
     get_requirements,
+    get_requirements_sync,
     save_requirements,
     set_requirements,
     warm_requirements_cache,
 )
+
+
+class TestGetRequirementsSync:
+    """Tests for the worker's synchronous requirements lookup."""
+
+    def test_redis_hit_skips_s3(self):
+        redis_client = MagicMock()
+        redis_client.get.return_value = json.dumps(
+            {"content": "requests==2.32.0\n", "hash": "cached"}
+        )
+
+        with (
+            patch(
+                "src.core.module_cache_sync._get_sync_redis",
+                return_value=redis_client,
+            ),
+            patch("src.core.requirements_cache._read_requirements_from_s3") as read_s3,
+        ):
+            assert get_requirements_sync() == "requests==2.32.0\n"
+
+        read_s3.assert_not_called()
+        redis_client.setex.assert_not_called()
+
+    def test_redis_miss_reads_s3_and_recaches(self):
+        redis_client = MagicMock()
+        redis_client.get.return_value = None
+
+        with (
+            patch(
+                "src.core.module_cache_sync._get_sync_redis",
+                return_value=redis_client,
+            ),
+            patch(
+                "src.core.requirements_cache._read_requirements_from_s3",
+                return_value="requests==2.32.0\n",
+            ) as read_s3,
+        ):
+            assert get_requirements_sync() == "requests==2.32.0\n"
+
+        read_s3.assert_called_once()
+        cached = json.loads(redis_client.setex.call_args.args[2])
+        assert cached == {
+            "content": "requests==2.32.0\n",
+            "hash": hashlib.sha256(b"requests==2.32.0\n").hexdigest(),
+        }
+        assert redis_client.setex.call_args.args[:2] == (
+            REQUIREMENTS_KEY,
+            REQUIREMENTS_CACHE_TTL,
+        )
+
+    def test_redis_and_s3_miss_return_none_without_cache(self):
+        redis_client = MagicMock()
+        redis_client.get.return_value = None
+
+        with (
+            patch(
+                "src.core.module_cache_sync._get_sync_redis",
+                return_value=redis_client,
+            ),
+            patch(
+                "src.core.requirements_cache._read_requirements_from_s3",
+                return_value=None,
+            ) as read_s3,
+        ):
+            assert get_requirements_sync() is None
+
+        read_s3.assert_called_once()
+        redis_client.setex.assert_not_called()
 
 
 class TestGetRequirements:
@@ -176,34 +245,34 @@ class TestSaveRequirements:
         mock_client.setex = AsyncMock()
         return mock_client
 
-    async def test_writes_to_s3_and_cache(self, mock_redis_client):
-        """Test save_requirements writes to S3 and updates Redis cache."""
+    async def test_writes_to_s3_index_and_cache(self, mock_redis_client):
+        """save_requirements stores the bytes, indexes them for search, and updates Redis."""
+        from sqlalchemy import select
+
+        from src.core.database import get_db_context
+        from src.models.orm.file_index import FileIndex
+        from src.services.repo_storage import RepoStorage
+
         content = "flask==2.3.0\nrequests==2.31.0\n"
-        mock_repo = AsyncMock()
 
-        with (
-            patch("src.core.requirements_cache.get_redis_client", return_value=mock_redis_client),
-            patch("src.services.repo_storage.RepoStorage", return_value=mock_repo),
-        ):
-            await save_requirements(content)
+        async with get_db_context() as db:
+            with patch("src.core.requirements_cache.get_redis_client", return_value=mock_redis_client):
+                await save_requirements(content, db)
+            indexed = await db.scalar(
+                select(FileIndex.content).where(FileIndex.path == "requirements.txt")
+            )
 
-            # Verify S3 write
-            mock_repo.write.assert_called_once_with("requirements.txt", content.encode())
-
-            # Verify cache was updated
-            mock_redis_client.setex.assert_called_once()
+        assert await RepoStorage().read("requirements.txt") == content.encode()
+        assert indexed == content
+        mock_redis_client.setex.assert_called_once()
 
     async def test_computes_correct_hash(self, mock_redis_client):
         """Test save_requirements computes SHA-256 hash correctly."""
         content = "flask==2.3.0\nrequests==2.31.0\n"
         expected_hash = hashlib.sha256(content.encode()).hexdigest()
-        mock_repo = AsyncMock()
 
-        with (
-            patch("src.core.requirements_cache.get_redis_client", return_value=mock_redis_client),
-            patch("src.services.repo_storage.RepoStorage", return_value=mock_repo),
-        ):
-            await save_requirements(content)
+        with patch("src.core.requirements_cache.get_redis_client", return_value=mock_redis_client):
+            await save_requirements(content, AsyncMock())
 
             # Verify cache received correct hash
             call_args = mock_redis_client.setex.call_args

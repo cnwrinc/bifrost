@@ -1,0 +1,23 @@
+# Optional settings for the Kubernetes Jobs the API starts: worker Jobs and
+# isolated build Jobs. Isolation itself is turned on in Settings ->
+# Kubernetes -> Scaling & Isolation, not here.
+#
+# Jobs copy the API pod's namespace, image and envFrom, so no image tag or
+# ConfigMap name is pinned here. The one identity setting is the service
+# account: bifrost-build-runner (serviceaccounts.yaml) mounts no token and
+# has no RBAC, and unlike the namespace's `default` account it carries
+# nothing an operator or cloud integration attached to `default`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bifrost-build-jobs-config
+  namespace: bifrost
+  labels:
+    app.kubernetes.io/name: bifrost-build-jobs-config
+    app.kubernetes.io/component: build-controller
+    app.kubernetes.io/part-of: bifrost
+data:
+  BIFROST_KUBERNETES_JOB_SERVICE_ACCOUNT: "bifrost-build-runner"
+  BIFROST_KUBERNETES_JOB_PENDING_TIMEOUT_SECONDS: "300"
+  BIFROST_KUBERNETES_JOB_CPU_REQUEST: "250m"
+  BIFROST_KUBERNETES_JOB_CPU_LIMIT: "1"

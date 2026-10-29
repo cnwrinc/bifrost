@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from src.models.enums import ConfigType
 from src.models.orm.config import Config
+from src.models.orm.applications import Application
 from src.models.orm.solutions import Solution
 from src.models.orm.tables import Document, Table
 from src.services.solutions.capture import (
@@ -93,6 +94,132 @@ async def test_capture_table_keeps_rows_and_exports_manifest(db_session) -> None
     exported = tables_yaml["tables"][str(table.id)]
     assert exported["name"] == "documents"
     assert exported["schema"]["columns"][0]["name"] == "title"
+
+
+async def test_solution_bundle_serializes_a_queried_agent_model_profile(db_session) -> None:
+    """Solution capture loads the profile required by ManifestAgent.from_row."""
+    from src.models.orm.agents import Agent
+    from src.models.orm.ai_models import AIModelProfile, AIProviderConnection
+
+    db = db_session
+    sol = await _make_solution(db)
+    connection = AIProviderConnection(
+        id=uuid.uuid4(),
+        name=f"capture-provider-{uuid.uuid4().hex[:8]}",
+        provider="openai",
+        encrypted_api_key="encrypted-fixture-key",
+    )
+    profile = AIModelProfile(
+        id=uuid.uuid4(),
+        name=f"capture-profile-{uuid.uuid4().hex[:8]}",
+        connection_id=connection.id,
+        model="gpt-4o-mini",
+    )
+    agent = Agent(
+        id=uuid.uuid4(),
+        name=f"capture-agent-{uuid.uuid4().hex[:8]}",
+        system_prompt="Capture my configured model profile.",
+        created_by="test",
+        solution_id=sol.id,
+        llm_profile_id=profile.id,
+    )
+    db.add_all([connection, profile, agent])
+    await db.flush()
+    agent_id = agent.id
+    profile_name = profile.name
+    db.expunge_all()
+
+    bundle = await SolutionCaptureService(db).bundle_for(sol)
+
+    exported = next(item for item in bundle.agents if item["id"] == str(agent_id))
+    assert exported["llm_profile"] == profile_name
+
+
+async def test_bundle_for_prebuilt_app_reads_active_versioned_dist(
+    db_session, monkeypatch
+) -> None:
+    from src.services.solutions import app_build
+
+    db = db_session
+    sol = await _make_solution(db)
+    app_id = uuid.uuid4()
+    active = uuid.uuid4()
+    app = Application(
+        id=app_id,
+        name="Dash",
+        slug=f"dash-{uuid.uuid4().hex[:8]}",
+        repo_path="apps/dash",
+        app_model="standalone_v2",
+        organization_id=None,
+        solution_id=sol.id,
+        active_deployment_id=active,
+    )
+    db.add(app)
+    await db.flush()
+
+    calls: list[tuple[str, uuid.UUID | None]] = []
+
+    async def _list_dist(self, listed_app_id, *, deployment_id=None):
+        calls.append(("list", deployment_id))
+        assert listed_app_id == app_id
+        return ["index.html"]
+
+    async def _read_dist(self, read_app_id, rel, *, deployment_id=None):
+        calls.append(("read", deployment_id))
+        assert read_app_id == app_id
+        assert rel == "index.html"
+        return b"<html>active version</html>"
+
+    monkeypatch.setattr(app_build.SolutionAppBuilder, "list_dist", _list_dist)
+    monkeypatch.setattr(app_build.SolutionAppBuilder, "read_dist", _read_dist)
+
+    bundle = await SolutionCaptureService(db, repo=_FakeRepo({})).bundle_for(sol)
+
+    assert calls == [("list", active), ("read", active)]
+    assert bundle.apps[0]["dist_files"] == {"index.html": "<html>active version</html>"}
+
+
+async def test_bundle_for_legacy_prebuilt_app_reads_unversioned_dist(
+    db_session, monkeypatch
+) -> None:
+    from src.services.solutions import app_build
+
+    db = db_session
+    sol = await _make_solution(db)
+    app_id = uuid.uuid4()
+    app = Application(
+        id=app_id,
+        name="Dash",
+        slug=f"dash-{uuid.uuid4().hex[:8]}",
+        repo_path="apps/dash",
+        app_model="standalone_v2",
+        organization_id=None,
+        solution_id=sol.id,
+        active_deployment_id=None,
+    )
+    db.add(app)
+    await db.flush()
+
+    calls: list[tuple[str, uuid.UUID | None]] = []
+
+    async def _list_dist(self, listed_app_id, *, deployment_id=None):
+        calls.append(("list", deployment_id))
+        assert listed_app_id == app_id
+        return ["index.html"]
+
+    async def _read_dist(self, read_app_id, rel, *, deployment_id=None):
+        calls.append(("read", deployment_id))
+        assert read_app_id == app_id
+        assert rel == "index.html"
+        return b"<html>legacy unversioned</html>"
+
+    monkeypatch.setattr(app_build.SolutionAppBuilder, "list_dist", _list_dist)
+    monkeypatch.setattr(app_build.SolutionAppBuilder, "read_dist", _read_dist)
+
+    bundle = await SolutionCaptureService(db, repo=_FakeRepo({})).bundle_for(sol)
+
+    assert calls == [("list", None), ("read", None)]
+    assert bundle.apps[0]["dist_files"] == {"index.html": "<html>legacy unversioned</html>"}
 
 
 async def test_capture_config_declares_existing_value_without_copying_value(db_session) -> None:
@@ -697,6 +824,57 @@ async def test_deploy_schedule_trigger_under_guard(db_session) -> None:
         select(EventSubscription).where(EventSubscription.event_source_id == src.id)
     )).scalar_one()
     assert sub.workflow_id == wf.id  # same-install identity preserved
+
+
+async def test_redeploy_keeps_a_webhook_signing_secret_no_bundle_carries(db_session) -> None:
+    """Capture omits the signing secret, and redeploying, even a legacy bundle
+    whose config still holds a plaintext secret, keeps the stored one."""
+    from src.models.orm.events import EventSource, WebhookSource
+    from src.services.solutions.guard import install_solution_write_guard
+    from src.services.webhooks.signing_secret import (
+        read_signing_secret,
+        with_signing_secret,
+    )
+
+    install_solution_write_guard()
+
+    db = db_session
+    sol = await _make_solution(db)
+    es = EventSource(
+        id=uuid.uuid4(), name=f"signed-{uuid.uuid4().hex[:6]}", source_type="webhook",
+        organization_id=None, solution_id=None, created_by="test",
+    )
+    db.add(es)
+    await db.flush()
+    db.add(WebhookSource(
+        id=uuid.uuid4(), event_source_id=es.id, adapter_name="generic",
+        config={"signature_header": "X-Sig"},
+        state=with_signing_secret({}, "STORED-SECRET"),
+    ))
+    await db.flush()
+
+    await SolutionCaptureService(db).capture(
+        sol,
+        SolutionCaptureSelectors(
+            workflows=[], tables=[], apps=[], forms=[], agents=[], claims=[],
+            configs=[], events=[es.id],
+        ),
+    )
+    await db.flush()
+    bundle = await SolutionCaptureService(db).bundle_for(sol)
+    assert "STORED-SECRET" not in str(bundle.events)
+    assert "secret_encrypted" not in str(bundle.events)
+
+    bundle.events[0]["webhook_config"] = {"signature_header": "X-Sig", "secret": "LEGACY-PLAINTEXT"}
+    await SolutionDeployer(db).deploy(bundle)
+    await db.flush()
+
+    webhook = (await db.execute(
+        select(WebhookSource).where(WebhookSource.event_source_id == es.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one()
+    assert webhook.config == {"signature_header": "X-Sig"}
+    assert read_signing_secret(webhook.state) == "STORED-SECRET"
 
 
 async def test_deploy_reconcile_sweeps_stale_trigger(db_session) -> None:

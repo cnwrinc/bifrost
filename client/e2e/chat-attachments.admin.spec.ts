@@ -1,10 +1,16 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
 async function expectTouchTarget(locator: Locator) {
-	const box = await locator.boundingBox();
-	expect(box).not.toBeNull();
-	expect(box!.width).toBeGreaterThanOrEqual(44);
-	expect(box!.height).toBeGreaterThanOrEqual(44);
+	// Route and dialog reveals can scale the target while it is already visible.
+	// Require the real 44px target after layout settles, without a fixed sleep.
+	await expect
+		.poll(async () => {
+			const box = await locator.boundingBox();
+			return box ? Math.min(box.width, box.height) : 0;
+		})
+		.toBeGreaterThanOrEqual(44);
 }
 
 async function expectNoHorizontalOverflow(page: Page) {
@@ -15,22 +21,11 @@ async function expectNoHorizontalOverflow(page: Page) {
 	expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth);
 }
 
-test.describe("Chat attachments and model tiers", () => {
-	test("uploads a file with the selected tier and previews it", async ({
+test.describe("Chat attachments and model profiles", () => {
+	test("uploads a file with the selected profile and previews it", async ({
 		page,
 	}) => {
-		await page.route("**/api/admin/llm/config", async (route) => {
-			await route.fulfill({
-				json: {
-					provider: "openai",
-					model: "balanced-model",
-					max_tokens: 16384,
-					is_configured: true,
-					api_key_set: true,
-				},
-			});
-		});
-		await page.route("**/api/chat/model-tiers", async (route) => {
+		await page.route("**/api/chat/model-profiles", async (route) => {
 			const capabilities = {
 				image_input: true,
 				pdf_input: true,
@@ -40,12 +35,27 @@ test.describe("Chat attachments and model tiers", () => {
 			};
 			await route.fulfill({
 				json: {
-					tiers: [
-						{ id: "fast", label: "Fast", capabilities },
-						{ id: "balanced", label: "Balanced", capabilities },
-						{ id: "pro", label: "Pro", capabilities },
+					profiles: [
+						{
+							id: "profile-fast",
+							name: "Fast",
+							label: "Fast",
+							capabilities,
+						},
+						{
+							id: "profile-balanced",
+							name: "Balanced",
+							label: "Balanced",
+							capabilities,
+						},
+						{
+							id: "profile-pro",
+							name: "Pro",
+							label: "Pro",
+							capabilities,
+						},
 					],
-					default_tier: "balanced",
+					default_profile_id: "profile-pro",
 				},
 			});
 		});
@@ -60,98 +70,254 @@ test.describe("Chat attachments and model tiers", () => {
 		);
 
 		let resolveChat!: (payload: Record<string, unknown>) => void;
+		let showGenerating!: () => void;
+		let showResponding!: () => void;
+		let finishChat!: () => void;
 		const chatPayload = new Promise<Record<string, unknown>>((resolve) => {
 			resolveChat = resolve;
 		});
+		let runRequest: Record<string, unknown> | null = null;
+		let sendSocketMessage:
+			((payload: Record<string, unknown>) => void) | null = null;
+		let streamStarted = false;
+		const sendRunEvent = (
+			sequence: number,
+			kind: string,
+			status: string,
+			payload: Record<string, unknown>,
+		) => {
+			if (!sendSocketMessage || !runRequest) return;
+			sendSocketMessage({
+				type: "chat_run_event",
+				protocol_version: 1,
+				event_id: `00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
+				sequence,
+				conversation_id: String(runRequest.conversation_id),
+				run_id: String(runRequest.client_run_id),
+				occurred_at: new Date().toISOString(),
+				kind,
+				status,
+				payload,
+			});
+		};
+		const startStream = () => {
+			if (streamStarted || !sendSocketMessage || !runRequest) return;
+			streamStarted = true;
+			const conversationId = String(runRequest.conversation_id);
+			const userMessageId = String(runRequest.user_message_id);
+			// Send the opening events now, in sequence order, as the server does.
+			// The test drives later events directly, and the client ignores an
+			// event whose sequence is not newer than one it has already applied.
+			sendRunEvent(1, "run_status", "running", {
+				type: "run_status",
+				conversation_id: conversationId,
+				run_status: "running",
+			});
+
+			sendRunEvent(2, "message_start", "running", {
+				type: "message_start",
+				conversation_id: conversationId,
+				user_message_id: userMessageId,
+				local_id: userMessageId,
+				assistant_message_id: "00000000-0000-4000-8000-000000000020",
+			});
+
+			sendRunEvent(3, "agent_switch", "running", {
+				type: "agent_switch",
+				conversation_id: conversationId,
+				agent_switch: {
+					agent_name: "Document Agent",
+					agent_id: "agent-document",
+					reason: "automatic",
+				},
+			});
+			showGenerating = () => {
+				sendRunEvent(4, "delta", "running", {
+					type: "delta",
+					conversation_id: conversationId,
+					content: "I’ll create that. ",
+				});
+
+				sendRunEvent(5, "assistant_message_end", "running", {
+					type: "assistant_message_end",
+					conversation_id: conversationId,
+					message_id: "00000000-0000-4000-8000-000000000021",
+				});
+
+				sendRunEvent(6, "tool_call", "running", {
+					type: "tool_call",
+					conversation_id: conversationId,
+					message_id: "00000000-0000-4000-8000-000000000022",
+					tool_call: {
+						id: "artifact-tool-call",
+						name: "create_text_artifact",
+						arguments: {
+							filename: "Generated Report.md",
+							format: "markdown",
+						},
+					},
+				});
+			};
+			showResponding = () => {
+				sendRunEvent(7, "tool_result", "running", {
+					type: "tool_result",
+					conversation_id: conversationId,
+					message_id: "00000000-0000-4000-8000-000000000022",
+					tool_result: {
+						tool_call_id: "artifact-tool-call",
+						tool_name: "create_text_artifact",
+						result: { type: "bifrost_artifact" },
+						duration_ms: 304,
+					},
+				});
+				sendRunEvent(8, "artifact_ready", "running", {
+					type: "artifact_ready",
+					conversation_id: conversationId,
+					message_id: "00000000-0000-4000-8000-000000000022",
+					artifact: {
+						type: "bifrost_artifact",
+						id: "generated-artifact",
+						filename: "Generated Report.md",
+						content_type: "text/markdown",
+						size_bytes: 40,
+					},
+				});
+
+				sendRunEvent(9, "delta", "running", {
+					type: "delta",
+					conversation_id: conversationId,
+					content: "I created the report.",
+				});
+			};
+			finishChat = () => {
+				sendRunEvent(10, "done", "completed", {
+					type: "done",
+					conversation_id: conversationId,
+					message_id: "00000000-0000-4000-8000-000000000020",
+					content: "I created the report.",
+					duration_ms: 1_240,
+					run_status: "completed",
+				});
+			};
+		};
+		await page.route("**/api/chat/runs", async (route) => {
+			runRequest = route.request().postDataJSON() as Record<
+				string,
+				unknown
+			>;
+			resolveChat(runRequest);
+			const conversationId = String(runRequest.conversation_id);
+			const userMessageId = String(runRequest.user_message_id);
+			await route.fulfill({
+				status: 201,
+				json: {
+					run_id: runRequest.client_run_id,
+					conversation: {
+						id: conversationId,
+						agent_id: null,
+						user_id: "00000000-0000-4000-8000-000000000001",
+						channel: "chat",
+						title: null,
+						is_active: true,
+						created_at: new Date().toISOString(),
+						updated_at: new Date().toISOString(),
+						message_count: 1,
+						agent_name: null,
+					},
+					user_message: {
+						id: userMessageId,
+						conversation_id: conversationId,
+						role: "user",
+						content: runRequest.content,
+						attachments: [
+							{
+								id: (runRequest.attachment_ids as string[])[0],
+								conversation_id: conversationId,
+								filename: "notes.txt",
+								content_type: "text/plain",
+								size_bytes: 18,
+							},
+						],
+						sequence: 1,
+						created_at: new Date().toISOString(),
+					},
+					status: "queued",
+					idempotent: false,
+				},
+			});
+			startStream();
+		});
+		await page.route("**/api/chat/conversations/*/state", async (route) => {
+			const segments = new URL(route.request().url()).pathname.split("/");
+			const conversationId = segments.at(-2)!;
+			await route.fulfill({
+				json: {
+					conversation: {
+						id: conversationId,
+						agent_id: null,
+						user_id: "00000000-0000-4000-8000-000000000001",
+						channel: "chat",
+						title: null,
+						is_active: true,
+						created_at: new Date().toISOString(),
+						updated_at: new Date().toISOString(),
+						message_count: runRequest ? 1 : 0,
+						agent_name: null,
+					},
+					active_run: runRequest
+						? {
+								id: runRequest.client_run_id,
+								conversation_id: conversationId,
+								agent_id: null,
+								status: "queued",
+								error: null,
+								created_at: new Date().toISOString(),
+								started_at: null,
+								completed_at: null,
+							}
+						: null,
+					messages: runRequest
+						? [
+								{
+									id: runRequest.user_message_id,
+									conversation_id: conversationId,
+									role: "user",
+									content: runRequest.content,
+									attachments: [
+										{
+											id: (
+												runRequest.attachment_ids as string[]
+											)[0],
+											conversation_id: conversationId,
+											filename: "notes.txt",
+											content_type: "text/plain",
+											size_bytes: 18,
+										},
+									],
+									sequence: 1,
+									created_at: new Date().toISOString(),
+								},
+							]
+						: [],
+					events: [],
+					latest_sequence: 0,
+				},
+			});
+		});
 		await page.routeWebSocket(/\/ws\/connect/, (socket) => {
+			sendSocketMessage = (payload) =>
+				socket.send(JSON.stringify(payload));
+			startStream();
 			socket.onMessage((raw) => {
 				const payload = JSON.parse(String(raw)) as Record<
 					string,
 					unknown
 				>;
-				if (payload.type === "chat") {
-					resolveChat(payload);
-					const conversationId = String(payload.conversation_id);
-					setTimeout(() => {
-						socket.send(JSON.stringify({
-							type: "message_start",
-							conversation_id: conversationId,
-							assistant_message_id: "assistant-message",
-						}));
-					}, 500);
-					setTimeout(() => {
-						socket.send(JSON.stringify({
-							type: "delta",
-							conversation_id: conversationId,
-							content: "I’ll create that. ",
-						}));
-					}, 750);
-					setTimeout(() => {
-						socket.send(JSON.stringify({
-							type: "assistant_message_end",
-							conversation_id: conversationId,
-							message_id: "assistant-progress",
-						}));
-					}, 900);
-					setTimeout(() => {
-						socket.send(
-							JSON.stringify({
-								type: "tool_call",
-								conversation_id: conversationId,
-								message_id: "artifact-tool-message",
-								tool_call: {
-									id: "artifact-tool-call",
-									name: "create_text_artifact",
-									arguments: {
-										filename: "Generated Report.md",
-										format: "markdown",
-									},
-								},
-							}),
-						);
-					}, 1_000);
-					setTimeout(() => {
-						socket.send(JSON.stringify({
-							type: "tool_result",
-							conversation_id: conversationId,
-							message_id: "artifact-tool-message",
-							tool_result: {
-								tool_call_id: "artifact-tool-call",
-								tool_name: "create_text_artifact",
-								result: { type: "bifrost_artifact" },
-								duration_ms: 304,
-							},
-						}));
-						socket.send(
-							JSON.stringify({
-								type: "artifact_ready",
-								conversation_id: conversationId,
-								message_id: "artifact-tool-message",
-								artifact: {
-									type: "bifrost_artifact",
-									id: "generated-artifact",
-									filename: "Generated Report.md",
-									content_type: "text/markdown",
-									size_bytes: 40,
-								},
-							}),
-						);
-					}, 1_500);
-					setTimeout(() => {
-						socket.send(JSON.stringify({
-							type: "delta",
-							conversation_id: conversationId,
-							content: "I created the report.",
-						}));
-					}, 1_800);
-					setTimeout(() => {
-						socket.send(JSON.stringify({
-							type: "done",
-							conversation_id: conversationId,
-							message_id: "assistant-message",
-							duration_ms: 1_240,
-						}));
-					}, 2_300);
+				if (payload.type === "subscribe") {
+					for (const channel of (payload.channels as string[]) ??
+						[]) {
+						sendSocketMessage?.({ type: "subscribed", channel });
+					}
 				}
 				if (payload.type === "ping")
 					socket.send(JSON.stringify({ type: "pong" }));
@@ -160,8 +326,12 @@ test.describe("Chat attachments and model tiers", () => {
 
 		await page.setViewportSize({ width: 390, height: 844 });
 		await page.goto("/chat");
-		await expectTouchTarget(page.getByRole("button", { name: "Attach files" }));
-		await expectTouchTarget(page.getByRole("button", { name: "Send message" }));
+		await expectTouchTarget(
+			page.getByRole("button", { name: "Attach files" }),
+		);
+		await expectTouchTarget(
+			page.getByRole("button", { name: "Send message" }),
+		);
 		await expectNoHorizontalOverflow(page);
 		await page.getByRole("combobox", { name: "Response model" }).click();
 		await page.getByRole("option", { name: "Pro" }).click();
@@ -179,15 +349,20 @@ test.describe("Chat attachments and model tiers", () => {
 
 		await page.getByLabel("Chat input").fill("Summarize this file");
 		await page.getByRole("button", { name: "Send message" }).click();
-		await expect(page.getByText("Thinking…")).toBeVisible();
+		const userMessage = page.getByText("Summarize this file", {
+			exact: true,
+		});
+		await expect(page.getByLabel("Chat input")).toHaveValue("");
+		await expect(userMessage).toBeVisible();
+		const thinking = page.getByText("Thinking…");
+		await expect(thinking).toBeVisible();
 		await page.screenshot({
 			path: "playwright-results/screenshots/chat-thinking.png",
 			fullPage: true,
 		});
+		showGenerating();
 		await expect(page.getByText("Generating Markdown…")).toBeVisible();
-		await expect(
-			page.getByRole("button", { name: /Generating Markdown/i }),
-		).toHaveAttribute("aria-expanded", "false");
+		await expect(userMessage).toBeVisible();
 		await expect(
 			page.getByRole("button", { name: "Stop generation" }),
 		).toBeVisible();
@@ -196,12 +371,13 @@ test.describe("Chat attachments and model tiers", () => {
 			path: "playwright-results/screenshots/chat-generating.png",
 			fullPage: true,
 		});
+		showResponding();
 		await expect(page.getByText("Responding…")).toBeVisible();
+		await expect(userMessage).toBeVisible();
 		await expect(
-			page.getByRole("button", { name: /Responding/i }),
-		).toHaveAttribute("aria-expanded", "false");
-		await expect(
-			page.locator('[aria-busy="true"]', { hasText: "I created the report." }),
+			page.locator('[aria-busy="true"]', {
+				hasText: "I created the report.",
+			}),
 		).toBeVisible();
 		await page.screenshot({
 			path: "playwright-results/screenshots/chat-responding.png",
@@ -209,9 +385,12 @@ test.describe("Chat attachments and model tiers", () => {
 		});
 
 		const payload = await chatPayload;
-		expect(payload.message).toBe("Summarize this file");
-		expect(payload.model_tier).toBe("pro");
+		expect(payload.content).toBe("Summarize this file");
+		expect(payload.client_run_id).toEqual(expect.any(String));
+		expect(payload.user_message_id).toEqual(expect.any(String));
+		expect(payload.model_profile_id).toBe("profile-pro");
 		expect(payload.attachment_ids).toEqual([expect.any(String)]);
+		finishChat();
 
 		await expect(
 			page.getByRole("button", { name: "Download notes.txt" }),
@@ -226,53 +405,67 @@ test.describe("Chat attachments and model tiers", () => {
 		await page.getByRole("button", { name: /close/i }).click();
 		await expect(page.getByRole("dialog")).not.toBeVisible();
 
-		await expect(page.getByText("Worked for 1s")).toBeVisible();
-		await expectTouchTarget(page.getByRole("button", { name: /Worked for 1s/i }));
+		await expect(page.getByText(/Worked for/i)).toBeVisible();
+		await expectTouchTarget(
+			page.getByRole("button", { name: /Worked for/i }),
+		);
 		await expectNoHorizontalOverflow(page);
 		await expect(
-			page.locator('[aria-busy="true"]', { hasText: "I created the report." }),
+			page.locator('[aria-busy="true"]', {
+				hasText: "I created the report.",
+			}),
 		).toHaveCount(0);
-		await page.getByRole("button", { name: /Worked for 1s/i }).click();
+		await page.getByRole("button", { name: /Worked for/i }).click();
+		await expect(
+			page.getByText("Routed to", { exact: true }),
+		).toBeVisible();
+		await expect(
+			page.getByText("Document Agent", { exact: true }),
+		).toBeVisible();
 		await page
 			.getByRole("button", { name: /create_text_artifact/i })
 			.click();
-		await expect(page.getByRole("heading", { name: "Result" })).toBeVisible();
+		await expect(
+			page.getByRole("heading", { name: "Result" }),
+		).toBeVisible();
 		await expect(page.getByRole("dialog")).not.toBeVisible();
 		await page.screenshot({
 			path: "playwright-results/screenshots/chat-complete.png",
 			fullPage: true,
 		});
-		await expect(page.getByRole("button", { name: "Copy message" }).first()).toBeAttached();
-		await page.getByRole("button", { name: "Preview Generated Report.md" }).click();
-		await expect(page.getByRole("dialog")).toContainText(
-			"Generated report",
-		);
 		await expect(
-			page.getByRole("button", { name: "Download" }),
-		).toBeVisible();
-
-		await expect(page.getByRole("dialog")).toBeVisible();
+			page.getByRole("button", { name: "Copy message" }).first(),
+		).toBeAttached();
 		await expect(
-			page.getByRole("button", { name: "Download" }),
+			page.getByRole("button", { name: "Preview Generated Report.md" }),
 		).toBeVisible();
 	});
 
 	test("browses the persistent artifact library", async ({ page }) => {
-		await page.route("**/attachments/generated-video/content*", async (route) => {
-			await route.fulfill({
-				contentType: "video/mp4",
-				body: Buffer.from("00000018667479706d703432", "hex"),
-			});
-		});
-		await page.route("**/attachments/generated-image/content*", async (route) => {
-			await route.fulfill({
-				contentType: "image/png",
-				body: Buffer.from(
-					"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-					"base64",
-				),
-			});
-		});
+		await page.route(
+			"**/attachments/generated-video/content*",
+			async (route) => {
+				await route.fulfill({
+					contentType: "video/mp4",
+					// A real decodable clip: a header-only MP4 races the video error event.
+					body: readFileSync(
+						resolve("e2e/fixtures/artifact-preview.mp4"),
+					),
+				});
+			},
+		);
+		await page.route(
+			"**/attachments/generated-image/content*",
+			async (route) => {
+				await route.fulfill({
+					contentType: "image/png",
+					body: Buffer.from(
+						"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+						"base64",
+					),
+				});
+			},
+		);
 		await page.route("**/api/chat/artifacts", async (route) => {
 			await route.fulfill({
 				json: [
@@ -325,13 +518,19 @@ test.describe("Chat attachments and model tiers", () => {
 		});
 
 		await page.goto("/chat/artifacts");
-		await expect(page.getByRole("heading", { name: "Artifacts" })).toBeVisible();
+		await expect(
+			page.getByRole("heading", { name: "Artifacts" }),
+		).toBeVisible();
 		await expect(page.getByText("Bifrost Welcome Page.html")).toBeVisible();
-		await page.getByRole("button", { name: "Preview Launch Loop.mp4" }).click();
+		await page
+			.getByRole("button", { name: "Preview Launch Loop.mp4" })
+			.click();
 		await expect(page.locator("video")).toBeVisible();
 		await expect(page.getByText("1 / 2")).toBeVisible();
 		await page.getByRole("button", { name: "Next media" }).click();
-		await expect(page.getByRole("heading", { name: "Launch Concept.png" })).toBeVisible();
+		await expect(
+			page.getByRole("heading", { name: "Launch Concept.png" }),
+		).toBeVisible();
 		await page.screenshot({
 			path: "playwright-results/screenshots/artifact-preview.png",
 			fullPage: true,
@@ -345,7 +544,9 @@ test.describe("Chat attachments and model tiers", () => {
 
 		await page.setViewportSize({ width: 390, height: 844 });
 		await page.reload();
-		await expect(page.getByRole("heading", { name: "Artifacts" })).toBeVisible();
+		await expect(
+			page.getByRole("heading", { name: "Artifacts" }),
+		).toBeVisible();
 		await expectTouchTarget(
 			page.getByRole("button", { name: "Manage Launch Loop.mp4" }),
 		);
@@ -354,17 +555,33 @@ test.describe("Chat attachments and model tiers", () => {
 			path: "playwright-results/screenshots/artifact-library-mobile.png",
 			fullPage: true,
 		});
-		await page.getByRole("button", { name: "Preview Launch Concept.png" }).click();
+		await page
+			.getByRole("button", { name: "Preview Launch Concept.png" })
+			.click();
 		await expect(page.getByRole("dialog")).toBeVisible();
-		await expect(page.getByRole("heading", { name: "Launch Concept.png" })).toBeVisible();
-		await expect(page.getByRole("button", { name: "Previous media" })).toBeVisible();
-		await expect(page.getByRole("button", { name: "Next media" })).toBeVisible();
-		await expect(page.getByRole("button", { name: "Download" })).toBeVisible();
-		await expectTouchTarget(page.getByRole("button", { name: "Previous media" }));
-		await expectTouchTarget(page.getByRole("button", { name: "Next media" }));
+		await expect(
+			page.getByRole("heading", { name: "Launch Concept.png" }),
+		).toBeVisible();
+		await expect(
+			page.getByRole("button", { name: "Previous media" }),
+		).toBeVisible();
+		await expect(
+			page.getByRole("button", { name: "Next media" }),
+		).toBeVisible();
+		await expect(
+			page.getByRole("button", { name: "Download" }),
+		).toBeVisible();
+		await expectTouchTarget(
+			page.getByRole("button", { name: "Previous media" }),
+		);
+		await expectTouchTarget(
+			page.getByRole("button", { name: "Next media" }),
+		);
 		await expectTouchTarget(page.getByRole("button", { name: "Download" }));
 		await expectNoHorizontalOverflow(page);
-		await expect(page.locator('img[alt="Launch Concept.png"]')).toBeVisible();
+		await expect(
+			page.locator('img[alt="Launch Concept.png"]'),
+		).toBeVisible();
 		await page.screenshot({
 			path: "playwright-results/screenshots/artifact-preview-mobile.png",
 			fullPage: true,

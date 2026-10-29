@@ -20,6 +20,12 @@ const mockAuth = vi.fn();
 vi.mock("@/contexts/AuthContext", () => ({
 	useAuth: () => mockAuth(),
 }));
+vi.mock("@/services/authorization", () => ({
+	useAuthorization: () => ({
+		canAnywhere: () => mockAuth().isPlatformAdmin,
+		canAt: () => true,
+	}),
+}));
 
 const mockWorkflows = vi.fn();
 vi.mock("@/hooks/useWorkflows", () => ({
@@ -141,5 +147,53 @@ describe("FormInfoDialog — sharing ownership", () => {
 			screen.queryByText(/confirmation message/i),
 		).not.toBeInTheDocument();
 		expect(screen.queryByText(/hmac/i)).not.toBeInTheDocument();
+	});
+});
+
+describe("FormInfoDialog — launch defaults", () => {
+	const initialData = {
+		name: "Form",
+		workflow_id: "wf-1",
+		launch_workflow_id: "wf-1",
+		default_launch_params: { count: 3, enabled: false },
+		access_level: "role_based",
+	};
+	it("removes a cleared numeric default and preserves false", async () => {
+		mockWorkflows.mockReturnValue({
+			data: {
+				workflows: [
+					{
+						id: "wf-1",
+						name: "Onboarding",
+						parameters: [
+							{ name: "count", type: "int", required: false },
+						],
+					},
+				],
+			},
+			isLoading: false,
+		});
+		const { user, onSave } = renderDialog({ initialData });
+		await user.clear(screen.getByRole("spinbutton"));
+		await user.click(screen.getByRole("button", { name: "Save" }));
+		expect(onSave).toHaveBeenCalledWith(
+			expect.objectContaining({
+				default_launch_params: { enabled: false },
+			}),
+		);
+	});
+	it("clears stale defaults when another launch workflow is selected", async () => {
+		const { user, onSave } = renderDialog({ initialData });
+		await user.click(
+			screen.getByRole("combobox", { name: /Launch Workflow/ }),
+		);
+		await user.click(screen.getByRole("option", { name: "Disable" }));
+		await user.click(screen.getByRole("button", { name: "Save" }));
+		expect(onSave).toHaveBeenCalledWith(
+			expect.objectContaining({
+				launch_workflow_id: "wf-2",
+				default_launch_params: {},
+			}),
+		);
 	});
 });

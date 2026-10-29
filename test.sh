@@ -14,8 +14,13 @@
 #   ./test.sh all                       All backend tests, including slow tests.
 #   ./test.sh tests/path/... [args]     Pass through to pytest.
 #
+# Local Kubernetes spike (isolated Kind cluster):
+#   ./test.sh kubernetes up|status|down|collect|kubectl
+#   ./test.sh bench up|run|down       (performance benchmark, scripts/bench/README.md)
+#
 # Quality checks:
 #   ./test.sh quality api               Run API pyright + ruff inside Docker.
+#   ./test.sh quality repo              Run local repository CI hygiene checks.
 #
 # Client tests:
 #   ./test.sh client unit               Vitest on the host (no stack).
@@ -26,18 +31,28 @@
 #   ./test.sh client e2e e2e/auth.unauth.spec.ts   Pass through to playwright.
 #
 # CI escape hatch:
-#   ./test.sh pre-pr                    Required local PR/merge gate for a clean commit.
+#   ./test.sh pr-preflight              Local repository, changed E2E, unit, quality, and CodeQL gate before opening a PR.
+#   ./test.sh pre-pr                    Optional full local reproduction of the merge gate (diagnostic).
 #   ./test.sh ci                        Full isolated run: up, all tests, down.
 #
-# Global flags (apply to most subcommands):
-#   --no-reset    Skip state reset before running tests.
-#   --coverage    Enable coverage reporting (backend only).
-#   --wait        On failure, pause before cleanup.
+# Pytest flags follow a test selector (for example, `./test.sh tests/unit/test_foo.py -v`).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Kubernetes uses an isolated kubeconfig and local fixtures, never Compose secrets.
+if [ "${1:-}" = "kubernetes" ]; then
+    shift
+    exec "$SCRIPT_DIR/scripts/kubernetes/local-kind.sh" "$@"
+fi
+
+# Performance benchmark on the same Kind cluster (scripts/bench/README.md).
+if [ "${1:-}" = "bench" ]; then
+    shift
+    exec python3 "$SCRIPT_DIR/scripts/bench/run.py" "$@"
+fi
 
 # shellcheck source=scripts/lib/test_helpers.sh
 source "$SCRIPT_DIR/scripts/lib/test_helpers.sh"
@@ -45,6 +60,18 @@ source "$SCRIPT_DIR/scripts/lib/test_helpers.sh"
 COMPOSE_FILE="docker-compose.test.yml"
 export COMPOSE_PROJECT_NAME
 COMPOSE_PROJECT_NAME="$(compute_project_name .)"
+
+# Each worktree builds and runs its own API image, so a parallel worktree's
+# build cannot replace the image this one tests. CI pre-builds :latest and
+# sets BIFROST_SKIP_BUILD=1.
+if [ -z "${BIFROST_TEST_IMAGE_TAG:-}" ]; then
+    if [ "${BIFROST_SKIP_BUILD:-0}" = "1" ]; then
+        BIFROST_TEST_IMAGE_TAG=latest
+    else
+        BIFROST_TEST_IMAGE_TAG="$COMPOSE_PROJECT_NAME"
+    fi
+fi
+export BIFROST_TEST_IMAGE_TAG
 
 LOG_DIR="/tmp/bifrost-$COMPOSE_PROJECT_NAME"
 mkdir -p "$LOG_DIR"
@@ -91,6 +118,11 @@ require_stack_up() {
         echo "  ./test.sh stack up" >&2
         exit 1
     fi
+    # A unit-only run stops the API; every caller resets state next, which
+    # starts it again and waits for it to serve.
+    if [ -z "$(docker compose -f "$COMPOSE_FILE" ps -q --status running api)" ]; then
+        return 0
+    fi
     # Containers may report "running" before the API is actually serving
     # traffic (uvicorn boot, alembic, app startup hooks). Block here until
     # /health/ready returns 200 so callers don't race the API. Idempotent
@@ -111,6 +143,14 @@ reset_state() {
     docker compose -f "$COMPOSE_FILE" stop \
         api worker scheduler scheduler-fixtures pgbouncer 2>/dev/null || true
 
+    # A reset creates a new DB/object-store generation. Application containers
+    # keep writable worktrees such as GitHubSyncService's /tmp/git, so merely
+    # stopping them can pair stale on-disk Git state with an empty object store.
+    # Recreate only those ephemeral application containers; infrastructure and
+    # fixture volumes remain intact. Remove anonymous dependency volumes with
+    # the containers so repeated resets do not leave their contents on disk.
+    docker compose -f "$COMPOSE_FILE" rm -sfv api worker scheduler > /dev/null
+
     docker compose -f "$COMPOSE_FILE" exec -T postgres psql -U bifrost -d postgres -c \
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'bifrost_test' AND pid <> pg_backend_pid();" \
         > /dev/null 2>&1 || true
@@ -130,8 +170,11 @@ reset_state() {
 
     docker compose -f "$COMPOSE_FILE" start pgbouncer > /dev/null
     wait_for_service "$COMPOSE_FILE" pgbouncer pg_isready -h localhost -p 5432 -U bifrost
-    docker compose -f "$COMPOSE_FILE" --profile e2e start \
-        api worker scheduler scheduler-fixtures > /dev/null
+    docker compose -f "$COMPOSE_FILE" --profile e2e start scheduler-fixtures > /dev/null
+    wait_for_service "$COMPOSE_FILE" scheduler-fixtures \
+        python -c "import ssl,urllib.request; urllib.request.urlopen('http://localhost:8080/health'); urllib.request.urlopen('https://fixture.openrouter.ai:8443/health', context=ssl.create_default_context(cafile='/fixture-tls/trust.pem'))"
+    docker compose -f "$COMPOSE_FILE" --profile e2e up -d --no-build \
+        api worker scheduler > /dev/null
     wait_for_api_ready "$COMPOSE_FILE"
 
     echo "State reset complete."
@@ -177,9 +220,22 @@ cmd_stack() {
 }
 
 stack_up() {
+    local api_container_id api_fixture_source expected_fixture_source
     print_project
 
     if stack_is_up "$COMPOSE_PROJECT_NAME" "$COMPOSE_FILE"; then
+        # Reconcile long-lived containers with the current Compose definition
+        # before declaring the stack ready. Without this, an already-running
+        # API can retain stale bind mounts or environment after the harness
+        # changes, while one-off test runners use the new configuration.
+        docker compose -f "$COMPOSE_FILE" --profile e2e up -d --no-build
+        api_container_id="$(docker compose -f "$COMPOSE_FILE" ps -q api)"
+        expected_fixture_source="$LOG_DIR/solution-repo-fixtures"
+        api_fixture_source="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/tmp/bifrost/solution-repo-fixtures"}}{{.Source}}{{end}}{{end}}' "$api_container_id")"
+        if [ "$api_fixture_source" != "$expected_fixture_source" ]; then
+            echo "API fixture mount is stale — recreating API with the worktree-specific mount."
+            docker compose -f "$COMPOSE_FILE" up -d --no-build --force-recreate api
+        fi
         # Idempotent: still confirm API is serving traffic before returning
         # success. A previous `stack up` may have exited before the API
         # finished booting; without this, the next test command would race.
@@ -192,17 +248,17 @@ stack_up() {
     fi
 
     echo "Booting infrastructure..."
-    docker compose -f "$COMPOSE_FILE" up -d postgres rabbitmq redis seaweedfs
+    docker compose -f "$COMPOSE_FILE" up -d postgres redis seaweedfs
 
     wait_for_service "$COMPOSE_FILE" postgres pg_isready -U bifrost -d postgres
-    wait_for_service "$COMPOSE_FILE" rabbitmq rabbitmq-diagnostics check_running
     wait_for_service "$COMPOSE_FILE" redis redis-cli ping
 
     docker compose -f "$COMPOSE_FILE" up -d pgbouncer
     wait_for_service "$COMPOSE_FILE" pgbouncer pg_isready -h localhost -p 5432 -U bifrost
 
     # CI pre-builds the API dev image via docker/build-push-action with GHA cache
-    # and tags it as bifrost-test-api-dev:latest before calling stack up.
+    # and tags it as bifrost-test-api-dev:latest before calling stack up
+    # (BIFROST_TEST_IMAGE_TAG; locally each worktree uses its project name).
     # Setting BIFROST_SKIP_BUILD=1 tells compose to
     # use those local images directly instead of building. Local dev leaves
     # this unset so `--build` continues to apply (image layer cache makes the
@@ -262,7 +318,18 @@ stack_status() {
 # =============================================================================
 
 run_pytest() {
-    local runner_lock_fd runner_name runner_status
+    local runner_lock_fd runner_name runner_status target unit_only
+
+    unit_only="${BIFROST_TEST_UNIT_ONLY:-0}"
+    if [[ "${1:-}" == tests/unit/* ]]; then
+        unit_only=1
+        for target in "$@"; do
+            if [[ "$target" == tests/e2e/* ]]; then
+                unit_only=0
+                break
+            fi
+        done
+    fi
 
     # One worktree owns one mutable Docker test stack.  A second pytest process
     # against that stack can reset the database underneath the first process and
@@ -296,6 +363,14 @@ run_pytest() {
     # changed migrations they should run `./test.sh stack reset` once.
     require_stack_up
     prepare_test_state
+    if [[ "$unit_only" == "1" ]]; then
+        # Unit tests create committed dispatch and service rows while
+        # exercising claim and reconcile logic. The live executors (scheduler
+        # and worker) would claim them and the API's control plane would
+        # reconcile them before the test does, making the result depend on an
+        # unrelated process tick. The next e2e run's state reset starts them.
+        docker compose -f "$COMPOSE_FILE" stop api worker scheduler > /dev/null
+    fi
     # LOG_DIR is mkdir'd on the host as the runner/host user, then bind-mounted
     # into the test-runner container at /tmp/bifrost. The container runs as
     # uid 1000 (non-root, hardened), so it cannot write pytest's --junitxml file
@@ -320,7 +395,7 @@ run_pytest() {
 # not the ms a unit test should cost). Those still run in `all` and nightly, so
 # no coverage is dropped — just moved off the per-PR critical path. A caller can
 # re-include them ad hoc with `./test.sh unit -m slow` or `-m ""`.
-cmd_unit() { run_pytest tests/ --ignore=tests/e2e/ -m "not slow" -v "$@"; }
+cmd_unit() { BIFROST_TEST_UNIT_ONLY=1 run_pytest tests/ --ignore=tests/e2e/ -m "not slow" -v "$@"; }
 cmd_e2e()  { run_pytest tests/e2e/ -v "$@"; }
 cmd_all()  { run_pytest tests/ -v "$@"; }
 
@@ -329,8 +404,9 @@ cmd_quality() {
     shift || true
     case "$sub" in
         api) quality_api "$@" ;;
+        repo) repository_ci_checks "$@" ;;
         *)
-            echo "Usage: ./test.sh quality api [args]" >&2
+            echo "Usage: ./test.sh quality {api|repo} [args]" >&2
             exit 2
             ;;
     esac
@@ -361,8 +437,9 @@ cmd_client() {
         smoke) client_smoke "$@" ;;
         nightly) client_nightly "$@" ;;
         docs) client_docs "$@" ;;
+        preview) client_product_updates_preview "$@" ;;
         *)
-            echo "Usage: ./test.sh client {unit|e2e|smoke|nightly|docs} [args]" >&2
+            echo "Usage: ./test.sh client {unit|e2e|smoke|nightly|docs|preview} [args]" >&2
             exit 2
             ;;
     esac
@@ -373,6 +450,10 @@ client_unit() {
     (cd client && npm test "$@")
 }
 
+client_product_updates_preview() {
+    bash scripts/test-product-updates-preview.sh "$@"
+}
+
 client_ci_checks() {
     echo "Building the production client and running Node 26 CI checks..."
     docker compose -f "$COMPOSE_FILE" --profile client-check build client-check-runner
@@ -381,16 +462,24 @@ client_ci_checks() {
 }
 
 repository_ci_checks() {
+    bash scripts/lib/test_stack_lock_test.sh
+    python3 -m unittest scripts.test_codeql_changed_lines
+    python3 -m unittest scripts.test_e2e_shard
+    python3 -m unittest scripts.test_pool_drills
+    python3 -m unittest scripts.test_product_updates
+    python3 -m unittest scripts.test_release_gate
+    bash scripts/test_release_check.sh
+    bash scripts/test_prepare_release_body.sh
+    node --test scripts/test_product_updates_scope.cjs
     echo "Checking GitHub Action pins..."
     python3 api/scripts/check_github_action_pins.py --verify-versions
 
     echo "Checking generated Codex skill mirrors..."
-    scripts/sync-codex-skills.sh
-    if ! git diff --quiet -- plugins/bifrost/skills .codex/skills; then
-        echo "ERROR: Codex skill mirrors were stale and have been regenerated." >&2
-        echo "Commit the generated changes, then rerun ./test.sh pre-pr." >&2
-        return 1
-    fi
+    # scripts/check_skill_mirrors.py encapsulates the previous host gate:
+    # scripts/sync-codex-skills.sh, then
+    # git diff --quiet -- plugins/bifrost/skills .codex/skills.
+    # It also enforces the public plugin skill-name namespace contract.
+    python3 scripts/check_skill_mirrors.py
 }
 
 build_local_api_candidate() {
@@ -417,10 +506,18 @@ start_test_client() {
     # startup out of stack_up so backend-only lanes never build or boot a
     # client they do not use. Both product and documentation browser projects
     # call this helper before starting the Playwright runner.
-    if [ "${BIFROST_SKIP_BUILD:-0}" != "1" ]; then
-        docker compose -f "$COMPOSE_FILE" build client
-    fi
-    docker compose -f "$COMPOSE_FILE" --profile client up -d --no-build --no-deps client
+    # The client service uses the shared bifrost-test-client-e2e:latest tag.
+    # Always rebuild it here, even when BIFROST_SKIP_BUILD=1 asks backend lanes
+    # to reuse cached API/test-runner images, so one worktree cannot silently
+    # run browser tests against another worktree's previously tagged client.
+    docker compose -f "$COMPOSE_FILE" build client
+    # reset_state stops and starts the API, which can change its container IP.
+    # Nginx resolves the `api` upstream when it starts, so retaining a client
+    # from a previous browser run can pin it to a dead address and make every
+    # auth request fail with 502. Recreate the lightweight client container so
+    # each run resolves the current API container.
+    docker compose -f "$COMPOSE_FILE" --profile client up -d \
+        --force-recreate --no-build --no-deps client
     echo "Waiting for production client to be healthy..."
     for i in {1..120}; do
         local client_cid
@@ -459,6 +556,11 @@ client_e2e() {
     if [ "$screenshots_all" = true ]; then
         env_args=(-e PLAYWRIGHT_SCREENSHOT_ALL=1)
     fi
+    # Preserve the candidate identity in browser reports, including scoped runs.
+    # Dirty runs are useful iteration evidence, never clean-release evidence.
+    local source_dirty=false
+    if [ -n "$(git status --porcelain)" ]; then source_dirty=true; fi
+    env_args+=(-e "TEST_SOURCE_REVISION=$(git rev-parse HEAD)" -e "TEST_SOURCE_DIRTY=$source_dirty")
 
     if [ ${#passthrough[@]} -gt 0 ]; then
         docker compose -f "$COMPOSE_FILE" --profile client run --rm --no-deps "${env_args[@]}" \
@@ -574,9 +676,49 @@ cmd_pre_pr() {
     fi
 }
 
+cmd_pr_preflight() {
+    local path
+    local -a changed_e2e_tests=()
+    git fetch --quiet origin main
+    repository_ci_checks
+    quality_api
+    stack_up
+    cmd_unit
+    while IFS= read -r path; do
+        if [[ "${path##*/}" == test_*.py ]]; then
+            changed_e2e_tests+=("${path#api/}")
+        fi
+    done < <(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- api/tests/e2e/)
+    if ((${#changed_e2e_tests[@]})); then
+        echo "Running changed backend E2E test files: ${changed_e2e_tests[*]}"
+        # Match CI's credential-free E2E lane; optional live GitHub tests use
+        # a separate external repository and do not run in the merge queue.
+        GITHUB_TEST_PAT= run_pytest "${changed_e2e_tests[@]}" -v
+    fi
+    client_ci_checks
+    scripts/codeql-local.sh --rebuild --changed-only --fail-on-alerts
+    scripts/codeql-local.sh --rebuild --lang javascript --changed-only --fail-on-alerts
+}
+
 # =============================================================================
 # Dispatch
 # =============================================================================
+
+# All stack-mutating commands share one lock, including Playwright and lifecycle
+# resets. Pytest's inner runner lock alone cannot prevent a browser run resetting
+# its database, or two browser runs replacing each other's API containers.
+case "${1:-}:${2:-}" in
+    help:*|-h:*|--help:*|stack:status|client:unit) ;;
+    *)
+        exec {test_command_lock_fd}>"$LOG_DIR/test-stack.lock"
+        if ! flock -n "$test_command_lock_fd"; then
+            echo "ERROR: another test command owns this worktree's test stack." >&2
+            echo "Wait for it to finish before starting tests or changing the stack." >&2
+            exit 1
+        fi
+        ;;
+esac
+
 
 if [ $# -eq 0 ]; then
     cmd_unit
@@ -590,6 +732,7 @@ case "$1" in
     all) shift; cmd_all "$@" ;;
     quality) shift; cmd_quality "$@" ;;
     client) shift; cmd_client "$@" ;;
+    pr-preflight) shift; cmd_pr_preflight "$@" ;;
     pre-pr) shift; cmd_pre_pr "$@" ;;
     ci) cmd_ci ;;
     -h|--help|help)

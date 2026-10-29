@@ -86,7 +86,7 @@ def external_user(e2e_client, platform_admin, org1, portal_role) -> E2EUser:
     )
     assert assign.status_code == 204, assign.text
 
-    user = _register_and_authenticate_user(e2e_client, user, skip_registration=False)
+    user = _register_and_authenticate_user(user, skip_registration=False)
     user.organization_id = UUID(org1["id"])
     return user
 
@@ -152,15 +152,14 @@ async def global_integration(e2e_client, platform_admin, db_session, org1):
     db_session.add(provider)
     await db_session.flush()
 
-    db_session.add(
-        OAuthToken(
-            organization_id=None,
-            provider_id=provider.id,
-            user_id=None,
-            encrypted_access_token=encrypt_secret(GLOBAL_ACCESS_TOKEN).encode(),
-            scopes=["read"],
-        )
+    token = OAuthToken(
+        organization_id=None,
+        provider_id=provider.id,
+        user_id=None,
+        encrypted_access_token=encrypt_secret(GLOBAL_ACCESS_TOKEN).encode(),
+        scopes=["read"],
     )
+    db_session.add(token)
     await db_session.commit()
 
     # Org-scoped mapping in the external user's own org (org1), with a
@@ -184,6 +183,13 @@ async def global_integration(e2e_client, platform_admin, db_session, org1):
         "org_id": org1["id"],
     }
 
+    # Integration deletion is soft, so its provider and client-credentials
+    # token do not cascade away. Remove them explicitly: otherwise each
+    # function-scoped fixture invocation leaves another refreshable token for
+    # the live scheduler to sweep later in the E2E run.
+    await db_session.delete(token)
+    await db_session.delete(provider)
+    await db_session.commit()
     e2e_client.delete(
         f"/api/integrations/{integration_id}", headers=platform_admin.headers
     )
@@ -199,44 +205,38 @@ class TestExternalIntegrationsGet:
     """OPEN-E: sdk_integrations_get must return NONE of the global tier to an
     external caller on default scope."""
 
-    def _get(self, e2e_client, user, name):
+    def _get(self, e2e_client, headers, name):
         return e2e_client.post(
             "/api/sdk/integrations/get",
-            headers=user.headers,
+            headers=headers,
             json={"name": name},
         )
 
-    def test_external_gets_no_global_secret_or_token(
+    def test_external_user_token_is_refused(
         self, e2e_client, external_user, global_integration
     ):
-        resp = self._get(e2e_client, external_user, global_integration["name"])
-        # Either an empty/None body or a body with no global tier — never the
-        # decrypted global secrets.
-        assert resp.status_code == 200, resp.text
-        blob = _serialize(resp.json())
-        assert GLOBAL_CONFIG_SECRET not in blob, (
-            "external user received the global integration SECRET config"
-        )
-        assert GLOBAL_CLIENT_SECRET not in blob, (
-            "external user received the global OAuth client_secret"
-        )
-        assert GLOBAL_ACCESS_TOKEN not in blob, (
-            "external user received the global OAuth access_token"
-        )
+        """An external user's own login token carries no execution
+        credential and is not a bypass principal, so the gated
+        ``/api/sdk/integrations/get`` route refuses it outright — it never
+        reaches the point of merging (or dropping) the global tier."""
+        resp = self._get(e2e_client, external_user.headers, global_integration["name"])
+        assert resp.status_code == 403, resp.text
 
     def test_normal_user_still_gets_global_tier(
-        self, e2e_client, org1_user, global_integration
+        self, e2e_client, org1_service_headers, global_integration
     ):
-        resp = self._get(e2e_client, org1_user, global_integration["name"])
+        """A regular org caller (here, an org1-scoped execution credential,
+        since the route no longer admits a normal user's own token) still
+        unions the global tier: the integration config default AND the
+        global OAuth token surface."""
+        resp = self._get(e2e_client, org1_service_headers, global_integration["name"])
         assert resp.status_code == 200, resp.text
         blob = _serialize(resp.json())
-        # A normal org user's default-scope read still unions the global tier:
-        # the integration config default AND the global OAuth token surface.
         assert GLOBAL_CONFIG_SECRET in blob, (
-            "normal org user must still receive the global integration default"
+            "normal org caller must still receive the global integration default"
         )
         assert GLOBAL_ACCESS_TOKEN in blob, (
-            "normal org user must still receive the global OAuth access_token"
+            "normal org caller must still receive the global OAuth access_token"
         )
 
 
@@ -248,25 +248,25 @@ class TestExternalIntegrationsGet:
 # =============================================================================
 
 
-def _call_endpoint(e2e_client, user, endpoint, integ):
-    """Invoke one config-returning SDK endpoint as ``user`` for the seeded
-    integration, returning the response. ``scope`` is the external user's own
+def _call_endpoint(e2e_client, headers, endpoint, integ):
+    """Invoke one config-returning SDK endpoint with ``headers`` for the
+    seeded integration, returning the response. ``scope`` is the caller's own
     org (default-scope reads resolve there)."""
     name = integ["name"]
     if endpoint == "get":
         return e2e_client.post(
-            "/api/sdk/integrations/get", headers=user.headers, json={"name": name}
+            "/api/sdk/integrations/get", headers=headers, json={"name": name}
         )
     if endpoint == "list_mappings":
         return e2e_client.post(
             "/api/sdk/integrations/list_mappings",
-            headers=user.headers,
+            headers=headers,
             json={"name": name},
         )
     if endpoint == "get_mapping":
         return e2e_client.post(
             "/api/sdk/integrations/get_mapping",
-            headers=user.headers,
+            headers=headers,
             json={"name": name},
         )
     if endpoint == "upsert_mapping":
@@ -274,7 +274,7 @@ def _call_endpoint(e2e_client, user, endpoint, integ):
         # echoes merged config (the post-write echo — cli.py:1110, a NEW-G site).
         return e2e_client.post(
             "/api/sdk/integrations/upsert_mapping",
-            headers=user.headers,
+            headers=headers,
             json={
                 "name": name,
                 "scope": str(integ["org_id"]),
@@ -290,37 +290,35 @@ _CONFIG_ENDPOINTS = ["get", "list_mappings", "get_mapping", "upsert_mapping"]
 
 @pytest.mark.parametrize("endpoint", _CONFIG_ENDPOINTS)
 class TestExternalIntegrationsSurface:
-    """NEW-G: EVERY config-returning /api/sdk/integrations/* endpoint must drop
-    the global SECRET default for an external caller, and keep it for a normal
-    org user."""
+    """NEW-G: EVERY config-returning /api/sdk/integrations/* endpoint refuses
+    an external caller's own token outright (the C2 gate), and still returns
+    the global SECRET default for a regular org caller."""
 
-    def test_external_never_sees_global_secret(
+    def test_external_user_token_is_refused(
         self, e2e_client, external_user, global_integration, endpoint
     ):
-        resp = _call_endpoint(e2e_client, external_user, endpoint, global_integration)
-        assert resp.status_code in (200, 201), f"{endpoint}: {resp.status_code} {resp.text}"
-        blob = _serialize(resp.json())
-        assert GLOBAL_CONFIG_SECRET not in blob, (
-            f"external user received the global SECRET default via {endpoint}"
+        """An external user's own login token is not an execution credential
+        or a bypass principal, so every config-returning endpoint 403s before
+        it ever reaches the global-secret merge logic."""
+        resp = _call_endpoint(
+            e2e_client, external_user.headers, endpoint, global_integration
         )
-        assert GLOBAL_CLIENT_SECRET not in blob, (
-            f"external user received the global client_secret via {endpoint}"
-        )
-        assert GLOBAL_ACCESS_TOKEN not in blob, (
-            f"external user received the global access_token via {endpoint}"
-        )
+        assert resp.status_code == 403, f"{endpoint}: {resp.status_code} {resp.text}"
 
     def test_normal_user_sees_global_secret(
-        self, e2e_client, org1_user, global_integration, endpoint
+        self, e2e_client, org1_service_headers, global_integration, endpoint
     ):
-        resp = _call_endpoint(e2e_client, org1_user, endpoint, global_integration)
+        """A regular org caller (an org1-scoped execution credential, since
+        the route no longer admits a normal user's own token) still receives
+        the global SECRET default — the restriction is external-specific,
+        not a blanket break."""
+        resp = _call_endpoint(
+            e2e_client, org1_service_headers, endpoint, global_integration
+        )
         assert resp.status_code in (200, 201), f"{endpoint}: {resp.status_code} {resp.text}"
         blob = _serialize(resp.json())
-        # The mapping-echo siblings (and get) merge the global SECRET default
-        # into the org mapping's config for a normal org user — proving the
-        # restriction is external-specific, not a blanket break.
         assert GLOBAL_CONFIG_SECRET in blob, (
-            f"normal org user must still receive the global SECRET default via {endpoint}"
+            f"normal org caller must still receive the global SECRET default via {endpoint}"
         )
 
 
@@ -328,37 +326,54 @@ class TestExternalIntegrationsRefreshToken:
     """OPEN-E: sdk_integrations_refresh_token must not let an external refresh /
     receive the GLOBAL OAuth token."""
 
-    def _refresh(self, e2e_client, user, provider_name):
+    def _refresh(self, e2e_client, headers, provider_name):
         return e2e_client.post(
             "/api/sdk/integrations/refresh_token",
-            headers=user.headers,
+            headers=headers,
             json={"connection_name": provider_name},
         )
 
-    def test_external_cannot_refresh_global_provider(
+    def test_external_user_token_is_refused(
         self, e2e_client, external_user, global_integration
     ):
+        """An external user's own login token is not an execution credential
+        or a bypass principal, so the C2 gate refuses it before the by-name
+        cascade even runs — it never gets a chance to reach (or be denied)
+        the global provider."""
         provider_name = global_integration["provider_name"]
-        resp = self._refresh(e2e_client, external_user, provider_name)
-        # The provider is GLOBAL; an external's by-name cascade drops the global
-        # tier → 404 (provider not found). It must NOT return a fresh global
-        # access_token.
-        assert resp.status_code in (400, 404, 502), (
-            f"external must not reach the global provider: "
+        resp = self._refresh(e2e_client, external_user.headers, provider_name)
+        assert resp.status_code == 403, (
+            f"external user's own token must be refused: "
             f"{resp.status_code} {resp.text}"
         )
-        assert GLOBAL_ACCESS_TOKEN not in resp.text
-        assert GLOBAL_CLIENT_SECRET not in resp.text
 
     def test_normal_user_reaches_global_provider(
-        self, e2e_client, org1_user, global_integration
+        self, e2e_client, org1_service_headers, global_integration
     ):
-        # A normal org user's by-name cascade DOES reach the global provider —
-        # it then attempts a real HTTP refresh against example.com (which
-        # fails with 502), proving the provider resolved (not a 404 denial).
+        # A regular org caller's (org1-scoped execution credential) by-name
+        # cascade DOES reach the global provider — it then attempts a real
+        # HTTP refresh against example.com (which fails with 502), proving
+        # the provider resolved (not a 404 denial).
         provider_name = global_integration["provider_name"]
-        resp = self._refresh(e2e_client, org1_user, provider_name)
+        resp = self._refresh(e2e_client, org1_service_headers, provider_name)
         assert resp.status_code != 404, (
-            f"normal org user must reach the global provider (not 404): "
+            f"normal org caller must reach the global provider (not 404): "
             f"{resp.status_code} {resp.text}"
         )
+
+
+@pytest.mark.asyncio
+async def test_global_integration_fixture_removes_refreshable_oauth_state(db_session):
+    """Repeated fixture use must not pollute the later live scheduler tests."""
+    from sqlalchemy import func, select
+
+    from src.models.orm import OAuthProvider
+    from src.models.orm.oauth import OAuthToken
+
+    leaked_tokens = await db_session.scalar(
+        select(func.count())
+        .select_from(OAuthToken)
+        .join(OAuthProvider)
+        .where(OAuthProvider.provider_name.like("ext_integ_provider_%"))
+    )
+    assert leaked_tokens == 0

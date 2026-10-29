@@ -7,10 +7,14 @@ Tests that workflow parameters are correctly:
 3. Handled with/without ExecutionContext parameter
 """
 
+import asyncio
 import pytest
+from enum import Enum
+from typing import Literal
 
 from src.sdk.context import ExecutionContext, Organization
 from src.sdk.decorators import workflow
+from src.sdk.errors import WorkflowExecutionException
 from src.services.execution.engine import _execute_workflow_with_trace
 
 
@@ -83,6 +87,52 @@ class TestWorkflowParameterParsing:
         assert types["flag"] == "bool"
         assert types["items"] == "list"
         assert types["config"] == "json"
+
+    def test_parameters_preserve_nested_list_and_enum_schema(self):
+        """Test that richer annotations survive onto workflow metadata."""
+
+        class Status(str, Enum):
+            OPEN = "open"
+            CLOSED = "closed"
+
+        @workflow(name="test_workflow", description="Test")
+        async def test_func(
+            payload_items: list[dict[str, int]],
+            status: Literal["open", "closed"],
+            severity: Status,
+        ):
+            return {}
+
+        metadata = test_func._executable_metadata
+        params = {param.name: param for param in metadata.parameters}
+
+        assert params["payload_items"].type == "list"
+        assert params["payload_items"].python_type == "list[dict[str, int]]"
+        assert params["payload_items"].json_schema == {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": {"type": "integer"},
+            },
+        }
+
+        assert params["status"].options == [
+            {"label": "open", "value": "open"},
+            {"label": "closed", "value": "closed"},
+        ]
+        assert params["status"].json_schema == {
+            "enum": ["open", "closed"],
+            "type": "string",
+        }
+
+        assert params["severity"].options == [
+            {"label": "open", "value": "open"},
+            {"label": "closed", "value": "closed"},
+        ]
+        assert params["severity"].json_schema == {
+            "enum": ["open", "closed"],
+            "type": "string",
+        }
 
 
 class TestWorkflowParameterExecution:
@@ -261,6 +311,45 @@ class TestWorkflowParameterExecution:
         assert result["name"] == "Alice"
         assert result["optional"] == "extra"
         assert result["org"] == "test-org-456"
+
+
+class TestWorkflowVariableCapture:
+    @pytest.mark.asyncio
+    async def test_await_suspensions_do_not_recapture_large_locals(self, mock_context):
+        scans: list[int] = []
+
+        class CountedDict(dict[str, str]):
+            def items(self):
+                scans.append(1)
+                return super().items()
+
+        @workflow(name="capture_after_awaits", description="Capture locals once")
+        async def capture_after_awaits():
+            payload = CountedDict({"data": "x" * 1_000})
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return len(payload["data"])
+
+        result, captured, _ = await _execute_workflow_with_trace(
+            capture_after_awaits, mock_context, {}
+        )
+
+        assert result == 1_000
+        assert captured["payload"] == {"data": "x" * 1_000}
+        assert scans == [1]
+
+    @pytest.mark.asyncio
+    async def test_failure_still_captures_locals_after_await(self, mock_context):
+        @workflow(name="capture_failure", description="Capture failure locals")
+        async def capture_failure():
+            marker = "available on error"
+            await asyncio.sleep(0)
+            raise ValueError(marker)
+
+        with pytest.raises(WorkflowExecutionException) as exc:
+            await _execute_workflow_with_trace(capture_failure, mock_context, {})
+
+        assert exc.value.captured_vars["marker"] == "available on error"
 
 
 class TestContextParameterDetection:

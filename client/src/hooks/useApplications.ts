@@ -17,8 +17,11 @@ export type ApplicationListResponse =
 	components["schemas"]["ApplicationListResponse"];
 export type ApplicationPublishRequest =
 	components["schemas"]["ApplicationPublishRequest"];
-export type PlatformJobAccepted =
-	components["schemas"]["PlatformJobAccepted"];
+export type PlatformJobAccepted = components["schemas"]["PlatformJobAccepted"];
+export type ApplicationSdkUpdateAccepted =
+	components["schemas"]["ApplicationSdkUpdateAccepted"];
+export type ApplicationSdkUpdateBatchResponse =
+	components["schemas"]["ApplicationSdkUpdateBatchResponse"];
 
 // Export type for applications
 export type ApplicationExport = ApplicationPublic;
@@ -92,7 +95,9 @@ export function useApplication(slug: string | undefined) {
 /**
  * Hook to create a new application
  */
-export function useCreateApplication() {
+export function useCreateApplication({
+	errorToast = true,
+}: { errorToast?: boolean } = {}) {
 	const queryClient = useQueryClient();
 
 	return $api.useMutation("post", "/api/applications", {
@@ -105,6 +110,7 @@ export function useCreateApplication() {
 			});
 		},
 		onError: (error) => {
+			if (!errorToast) return;
 			toast.error("Failed to create application", {
 				description: getErrorMessage(error, "Unknown error"),
 			});
@@ -115,7 +121,9 @@ export function useCreateApplication() {
 /**
  * Hook to update application metadata
  */
-export function useUpdateApplication() {
+export function useUpdateApplication({
+	errorToast = true,
+}: { errorToast?: boolean } = {}) {
 	const queryClient = useQueryClient();
 
 	return $api.useMutation("patch", "/api/applications/{app_id}", {
@@ -131,6 +139,7 @@ export function useUpdateApplication() {
 			});
 		},
 		onError: (error) => {
+			if (!errorToast) return;
 			toast.error("Failed to update application", {
 				description: getErrorMessage(error, "Unknown error"),
 			});
@@ -141,7 +150,9 @@ export function useUpdateApplication() {
 /**
  * Hook to repoint an application's source directory (repo_path).
  */
-export function useReplaceApplication() {
+export function useReplaceApplication({
+	toastNotifications = true,
+}: { toastNotifications?: boolean } = {}) {
 	const queryClient = useQueryClient();
 
 	return $api.useMutation("post", "/api/applications/{app_id}/replace", {
@@ -152,11 +163,13 @@ export function useReplaceApplication() {
 			queryClient.invalidateQueries({
 				queryKey: ["get", "/api/applications/{slug}"],
 			});
+			if (!toastNotifications) return;
 			toast.success("Path replaced", {
 				description: `"${data.name}" now points to ${data.repo_path}`,
 			});
 		},
 		onError: (error) => {
+			if (!toastNotifications) return;
 			toast.error("Failed to replace path", {
 				description: getErrorMessage(error, "Unknown error"),
 			});
@@ -174,7 +187,9 @@ export function useValidateApplication() {
 /**
  * Hook to delete an application
  */
-export function useDeleteApplication() {
+export function useDeleteApplication({
+	errorToast = true,
+}: { errorToast?: boolean } = {}) {
 	const queryClient = useQueryClient();
 
 	return $api.useMutation("delete", "/api/applications/{app_id}", {
@@ -185,6 +200,7 @@ export function useDeleteApplication() {
 			toast.success("Application deleted");
 		},
 		onError: (error) => {
+			if (!errorToast) return;
 			toast.error("Failed to delete application", {
 				description: getErrorMessage(error, "Unknown error"),
 			});
@@ -196,7 +212,7 @@ export function useDeleteApplication() {
  * Queue application publishing. Live progress and the terminal result are
  * delivered by the existing notification WebSocket channel.
  */
-export function usePublishApplication() {
+export function usePublishApplication(options?: { errorToast?: boolean }) {
 	return $api.useMutation("post", "/api/applications/{app_id}/publish", {
 		onSuccess: (operation) => {
 			toast.success(
@@ -211,7 +227,35 @@ export function usePublishApplication() {
 			);
 		},
 		onError: (error) => {
+			if (options?.errorToast === false) return;
 			toast.error("Failed to queue application publish", {
+				description: getErrorMessage(error, "Unknown error"),
+			});
+		},
+	});
+}
+
+/**
+ * Queue an SDK rebuild for one retained-source application. Progress and
+ * terminal state arrive through platform-job notification WebSocket updates.
+ */
+export function useUpdateApplicationSdk(options?: { errorToast?: boolean }) {
+	return $api.useMutation("post", "/api/applications/{app_id}/sdk/update", {
+		onSuccess: (operation) => {
+			toast.success(
+				operation.reused
+					? "Following existing SDK update"
+					: "SDK update queued",
+				{
+					description: operation.notification_id
+						? "Progress will appear in notifications."
+						: `Track durable job ${operation.job_id}.`,
+				},
+			);
+		},
+		onError: (error) => {
+			if (options?.errorToast === false) return;
+			toast.error("Failed to queue SDK update", {
 				description: getErrorMessage(error, "Unknown error"),
 			});
 		},
@@ -269,9 +313,7 @@ export async function listApplications(
 /**
  * Get an application by slug (imperative)
  */
-export async function getApplication(
-	slug: string,
-): Promise<ApplicationPublic> {
+export async function getApplication(slug: string): Promise<ApplicationPublic> {
 	const { data, error } = await apiClient.GET("/api/applications/{slug}", {
 		params: {
 			path: { slug },
@@ -345,7 +387,47 @@ export async function publishApplication(
 		},
 	);
 	if (error) {
-		throw new Error(getErrorMessage(error, "Failed to queue application publish"));
+		throw new Error(
+			getErrorMessage(error, "Failed to queue application publish"),
+		);
+	}
+	return data;
+}
+
+/**
+ * Queue one application SDK update (imperative).
+ */
+export async function updateApplicationSdk(
+	appId: string,
+): Promise<PlatformJobAccepted> {
+	const { data, error } = await apiClient.POST(
+		"/api/applications/{app_id}/sdk/update",
+		{
+			params: { path: { app_id: appId } },
+		},
+	);
+	if (error) {
+		throw new Error(getErrorMessage(error, "Failed to queue SDK update"));
+	}
+	return data;
+}
+
+/**
+ * Queue SDK updates for selected applications (imperative).
+ */
+export async function batchUpdateApplicationSdks(
+	applicationIds?: string[],
+): Promise<ApplicationSdkUpdateBatchResponse> {
+	const { data, error } = await apiClient.POST(
+		"/api/applications/sdk/update",
+		{
+			body: { application_ids: applicationIds ?? null },
+		},
+	);
+	if (error) {
+		throw new Error(
+			getErrorMessage(error, "Failed to queue SDK updates"),
+		);
 	}
 	return data;
 }

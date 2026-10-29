@@ -5,22 +5,19 @@ import {
 	Globe,
 	MoreVertical,
 	Pencil,
-	PlayCircle,
 	Power,
 	Share2,
 	Trash2,
 } from "lucide-react";
+import { Link } from "react-router-dom";
 
+import { RecordActionsMenu } from "@/components/common/RecordActionsMenu";
+import { ResourceCatalogCard } from "@/components/catalog/ResourceCatalogCard";
+import { ResourceIcon } from "@/components/ResourceIcon";
 import { SolutionManagedBadge } from "@/components/solutions/SolutionManagedBadge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-	Card,
-	CardContent,
-	CardDescription,
-	CardHeader,
-	CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import {
 	DataTable,
 	DataTableBody,
@@ -60,9 +57,12 @@ export interface FormValidationState {
 export interface FormListSurfaceProps {
 	forms: FormListItem[];
 	viewMode: "grid" | "table";
+	/** Query string to preserve the originating page in native navigation links. */
+	navigationSearch?: string;
 	isLoading?: boolean;
 	isPlatformAdmin: boolean;
 	canManageForms: boolean;
+	canManageForm?: (form: FormListItem) => boolean;
 	getOrgName: (orgId: string | null | undefined) => string;
 	formValidation: Map<string, FormValidationState>;
 	onLaunch: (form: FormListItem) => void;
@@ -77,9 +77,11 @@ export interface FormListSurfaceProps {
 export function FormListSurface({
 	forms,
 	viewMode,
+	navigationSearch = "",
 	isLoading = false,
 	isPlatformAdmin,
 	canManageForms,
+	canManageForm: canManageFormAt,
 	getOrgName,
 	formValidation,
 	onLaunch,
@@ -91,10 +93,12 @@ export function FormListSurface({
 	emptySearchActive = false,
 }: FormListSurfaceProps) {
 	const terminology = useTerminology();
+	const canManageForm = (form: FormListItem) =>
+		canManageFormAt?.(form) ?? canManageForms;
 
 	if (isLoading) {
 		return viewMode === "grid" || !canManageForms ? (
-			<div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
+			<div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(min(100%,280px),1fr))]">
 				{[...Array(6)].map((_, i) => (
 					<Skeleton key={i} className="h-48 w-full" />
 				))}
@@ -128,7 +132,7 @@ export function FormListSurface({
 					{canManageForms && !emptySearchActive && onCreateEmpty && (
 						<Button
 							variant="outline"
-							size="icon"
+							size="icon-lg"
 							onClick={onCreateEmpty}
 							className="mt-4"
 							title={`Create ${term(terminology, "form", "singular")}`}
@@ -162,9 +166,28 @@ export function FormListSurface({
 					</DataTableHeader>
 					<DataTableBody>
 						{forms.map((form) => {
+							const canManage = canManageForm(form);
 							const validation = formValidation.get(form.id);
+							const launchHref = `/execute/${form.id}${navigationSearch}`;
+							const canLaunch =
+								(form.is_active || canManage) &&
+								validation?.valid;
+							const unavailableReason = !validation?.valid
+								? `Cannot launch: Missing ${validation?.missingParams.join(", ")}`
+								: !form.is_active && !canManage
+									? `${term(terminology, "form", "singular")} is disabled`
+									: undefined;
 							return (
-								<DataTableRow key={form.id}>
+								<DataTableRow
+									key={form.id}
+									clickable={canLaunch}
+									href={canLaunch ? launchHref : undefined}
+									onClick={
+										canLaunch
+											? () => onLaunch(form)
+											: undefined
+									}
+								>
 									{isPlatformAdmin && (
 										<DataTableCell className="w-0 whitespace-nowrap">
 											{form.organization_id ? (
@@ -179,7 +202,7 @@ export function FormListSurface({
 												</Badge>
 											) : (
 												<Badge
-													variant="default"
+													variant="outline"
 													className="text-xs"
 												>
 													<Globe className="mr-1 h-3 w-3" />
@@ -189,7 +212,36 @@ export function FormListSurface({
 										</DataTableCell>
 									)}
 									<DataTableCell className="font-medium">
-										{form.name}
+										<div className="flex min-w-0 items-center gap-2">
+											<ResourceIcon
+												kind="form"
+												id={form.id}
+												logo={form.logo_url ?? null}
+												cacheKey={
+													form.logo_version ??
+													undefined
+												}
+												size="table"
+											/>
+											{canLaunch ? (
+												<Link
+													to={launchHref}
+													className="min-w-0 [overflow-wrap:anywhere] hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+												>
+													{form.name}
+												</Link>
+											) : (
+												<span className="min-w-0 [overflow-wrap:anywhere]">
+													<span
+														title={
+															unavailableReason
+														}
+													>
+														{form.name}
+													</span>
+												</span>
+											)}
+										</div>
 									</DataTableCell>
 									<DataTableCell className="max-w-xs truncate text-muted-foreground">
 										{form.description || (
@@ -199,10 +251,15 @@ export function FormListSurface({
 										)}
 									</DataTableCell>
 									<DataTableCell className="w-0 whitespace-nowrap">
-										{canManageForms && onToggleActive ? (
+										{canManage && onToggleActive ? (
 											<Tooltip>
 												<TooltipTrigger asChild>
-													<div className="w-fit">
+													<div
+														className="w-fit"
+														onClick={(event) =>
+															event.stopPropagation()
+														}
+													>
 														<Switch
 															checked={
 																form.is_active
@@ -226,7 +283,7 @@ export function FormListSurface({
 											<Badge
 												variant={
 													form.is_active
-														? "default"
+														? "outline"
 														: "secondary"
 												}
 											>
@@ -236,27 +293,13 @@ export function FormListSurface({
 											</Badge>
 										)}
 									</DataTableCell>
-									<DataTableCell className="w-0 whitespace-nowrap text-right">
+									<DataTableCell
+										className="w-0 whitespace-nowrap text-right"
+										onClick={(event) =>
+											event.stopPropagation()
+										}
+									>
 										<div className="flex gap-1 justify-end">
-											<Button
-												size="sm"
-												onClick={() => onLaunch(form)}
-												disabled={
-													(!form.is_active &&
-														!canManageForms) ||
-													!validation?.valid
-												}
-												title={
-													!validation?.valid
-														? `Cannot launch: Missing ${validation?.missingParams.join(", ")}`
-														: !form.is_active &&
-															  !canManageForms
-															? `${term(terminology, "form", "singular")} is disabled`
-															: `Launch ${term(terminology, "form", "singularLower")}`
-												}
-											>
-												<PlayCircle className="h-4 w-4" />
-											</Button>
 											{form.is_solution_managed && (
 												<SolutionManagedBadge
 													solutionId={
@@ -264,7 +307,7 @@ export function FormListSurface({
 													}
 												/>
 											)}
-											{canManageForms &&
+											{canManage &&
 												(onShare ||
 													onEdit ||
 													onDelete) && (
@@ -274,7 +317,7 @@ export function FormListSurface({
 														>
 															<Button
 																variant="ghost"
-																size="icon"
+																size="icon-lg"
 																aria-label={`${form.name} actions`}
 															>
 																<MoreVertical className="h-4 w-4" />
@@ -286,7 +329,7 @@ export function FormListSurface({
 														>
 															{onShare && (
 																<DropdownMenuItem
-																	className="min-h-9 whitespace-nowrap px-3"
+																	className="min-h-11 whitespace-nowrap px-3"
 																	onClick={() =>
 																		onShare(
 																			form,
@@ -300,7 +343,7 @@ export function FormListSurface({
 															{!form.is_solution_managed &&
 																onEdit && (
 																	<DropdownMenuItem
-																		className="min-h-9 whitespace-nowrap px-3"
+																		className="min-h-11 whitespace-nowrap px-3"
 																		onClick={() =>
 																			onEdit(
 																				form,
@@ -318,7 +361,7 @@ export function FormListSurface({
 																		<DropdownMenuSeparator />
 																		<DropdownMenuItem
 																			variant="destructive"
-																			className="min-h-9 whitespace-nowrap px-3"
+																			className="min-h-11 whitespace-nowrap px-3"
 																			onClick={() =>
 																				onDelete(
 																					form,
@@ -346,51 +389,146 @@ export function FormListSurface({
 	}
 
 	return (
-		<div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
+		<div className="grid grid-cols-1 gap-3 sm:grid-cols-[repeat(auto-fill,minmax(min(100%,280px),1fr))]">
 			{forms.map((form) => {
+				const canManage = canManageForm(form);
 				const validation = formValidation.get(form.id);
+				const launchHref = `/execute/${form.id}${navigationSearch}`;
+				const canLaunch =
+					(form.is_active || canManage) && validation?.valid;
 				return (
-					<Card
+					<ResourceCatalogCard
 						key={form.id}
-						className="hover:border-primary transition-colors flex flex-col"
-					>
-						<CardHeader className="pb-3">
-							<div className="flex items-start justify-between gap-2">
-								<CardTitle
-									className="min-w-0 truncate text-base"
-									title={form.name}
-								>
-									{form.name}
-								</CardTitle>
-								<Badge
-									variant={
-										form.is_active ? "default" : "secondary"
-									}
-									className="shrink-0"
-								>
-									{form.is_active ? "Enabled" : "Disabled"}
-								</Badge>
+						icon={
+							<ResourceIcon
+								kind="form"
+								id={form.id}
+								logo={form.logo_url ?? null}
+								cacheKey={form.logo_version ?? undefined}
+								size="card"
+								className="border-amber-500/20 bg-amber-500/10 text-amber-800 dark:text-amber-300 [&_svg]:text-current"
+							/>
+						}
+						title={form.name}
+						subtitle={
+							<>
+								{term(terminology, "form", "singular")}
+								<span> · </span>
+								{form.is_active ? "Enabled" : "Disabled"}
+							</>
+						}
+						description={
+							form.description || (
+								<span className="italic text-muted-foreground/60">
+									No description
+								</span>
+							)
+						}
+						action={
+							<div className="flex items-center gap-1">
+								{form.is_solution_managed && (
+									<SolutionManagedBadge
+										solutionId={form.solution_id}
+									/>
+								)}
+								{canManage &&
+									(onShare ||
+										onEdit ||
+										onDelete ||
+										onToggleActive) && (
+										<RecordActionsMenu
+											label={`${form.name} actions`}
+											contentClassName="w-48"
+										>
+											{onShare && (
+												<DropdownMenuItem
+													className="min-h-11 whitespace-nowrap px-3"
+													onSelect={() =>
+														onShare(form)
+													}
+												>
+													<Share2 /> Share Form
+												</DropdownMenuItem>
+											)}
+											{!form.is_solution_managed &&
+												onEdit && (
+													<DropdownMenuItem
+														className="min-h-11 whitespace-nowrap px-3"
+														onSelect={() =>
+															onEdit(form)
+														}
+													>
+														<Pencil /> Edit Form
+													</DropdownMenuItem>
+												)}
+											{!form.is_solution_managed &&
+												onToggleActive && (
+													<DropdownMenuItem
+														className="min-h-11 whitespace-nowrap px-3"
+														onSelect={() =>
+															onToggleActive(form)
+														}
+													>
+														<Power />{" "}
+														{form.is_active
+															? "Disable Form"
+															: "Enable Form"}
+													</DropdownMenuItem>
+												)}
+											{!form.is_solution_managed &&
+												onDelete && (
+													<>
+														<DropdownMenuSeparator />
+														<DropdownMenuItem
+															variant="destructive"
+															className="min-h-11 whitespace-nowrap px-3"
+															onSelect={() =>
+																onDelete(form)
+															}
+														>
+															<Trash2 /> Delete
+															Form
+														</DropdownMenuItem>
+													</>
+												)}
+										</RecordActionsMenu>
+									)}
 							</div>
-							{!validation?.valid && canManageForms && (
-								<Badge
-									variant="destructive"
-									className="gap-1 w-fit mt-1"
-								>
+						}
+						footer={
+							isPlatformAdmin ? (
+								<p className="flex items-center gap-2">
+									{form.organization_id ? (
+										<>
+											<Building2 className="size-3.5 shrink-0" />
+											<span className="truncate">
+												{getOrgName(
+													form.organization_id,
+												)}
+											</span>
+										</>
+									) : (
+										<>
+											<Globe className="size-3.5 shrink-0" />
+											<span className="truncate">
+												Global
+											</span>
+										</>
+									)}
+								</p>
+							) : undefined
+						}
+						onOpen={() => onLaunch(form)}
+						href={canLaunch ? launchHref : undefined}
+						disabled={!canLaunch}
+					>
+						{!validation?.valid && canManage && (
+							<div className="space-y-3 border-t pt-3">
+								<Badge variant="destructive" className="gap-1">
 									<AlertTriangle className="h-3 w-3" />
 									Invalid
 								</Badge>
-							)}
-							<CardDescription className="mt-1.5 text-sm line-clamp-2">
-								{form.description || (
-									<span className="italic text-muted-foreground/60">
-										No description
-									</span>
-								)}
-							</CardDescription>
-						</CardHeader>
-						<CardContent className="flex-1 flex flex-col pt-0">
-							{!validation?.valid && canManageForms && (
-								<div className="mb-3 pb-3 border-b">
+								<div>
 									<span className="text-destructive font-medium text-sm">
 										Missing required parameters:
 									</span>
@@ -408,136 +546,9 @@ export function FormListSurface({
 										)}
 									</div>
 								</div>
-							)}
-
-							<div className="flex-1" />
-
-							{isPlatformAdmin && (
-								<div className="mb-3">
-									{form.organization_id ? (
-										<Badge
-											variant="outline"
-											className="text-xs"
-										>
-											<Building2 className="mr-1 h-3 w-3" />
-											{getOrgName(form.organization_id)}
-										</Badge>
-									) : (
-										<Badge
-											variant="default"
-											className="text-xs"
-										>
-											<Globe className="mr-1 h-3 w-3" />
-											Global
-										</Badge>
-									)}
-								</div>
-							)}
-
-							<div className="flex items-center gap-2">
-								<Button
-									className="flex-1"
-									onClick={() => onLaunch(form)}
-									disabled={
-										(!form.is_active && !canManageForms) ||
-										!validation?.valid
-									}
-									title={
-										!validation?.valid
-											? `Cannot launch: Missing required parameters (${validation?.missingParams.join(", ")})`
-											: !form.is_active && !canManageForms
-												? `${term(terminology, "form", "singular")} is disabled`
-												: `Launch ${term(terminology, "form", "singularLower")}`
-									}
-								>
-									<PlayCircle className="mr-2 h-4 w-4" />
-									Launch
-								</Button>
-								{form.is_solution_managed && (
-									<SolutionManagedBadge
-										solutionId={form.solution_id}
-									/>
-								)}
-								{canManageForms &&
-									(onShare ||
-										onEdit ||
-										onDelete ||
-										onToggleActive) && (
-										<DropdownMenu>
-											<DropdownMenuTrigger asChild>
-												<Button
-													variant="outline"
-													size="icon"
-													aria-label={`${form.name} actions`}
-												>
-													<MoreVertical className="h-4 w-4" />
-												</Button>
-											</DropdownMenuTrigger>
-											<DropdownMenuContent
-												align="end"
-												className="w-48"
-											>
-												{onShare && (
-													<DropdownMenuItem
-														className="min-h-9 whitespace-nowrap px-3"
-														onClick={() =>
-															onShare(form)
-														}
-													>
-														<Share2 /> Share Form
-													</DropdownMenuItem>
-												)}
-												{!form.is_solution_managed &&
-													onEdit && (
-														<DropdownMenuItem
-															className="min-h-9 whitespace-nowrap px-3"
-															onClick={() =>
-																onEdit(form)
-															}
-														>
-															<Pencil /> Edit Form
-														</DropdownMenuItem>
-													)}
-												{!form.is_solution_managed &&
-													onToggleActive && (
-														<DropdownMenuItem
-															className="min-h-9 whitespace-nowrap px-3"
-															onClick={() =>
-																onToggleActive(
-																	form,
-																)
-															}
-														>
-															<Power />{" "}
-															{form.is_active
-																? "Disable Form"
-																: "Enable Form"}
-														</DropdownMenuItem>
-													)}
-												{!form.is_solution_managed &&
-													onDelete && (
-														<>
-															<DropdownMenuSeparator />
-															<DropdownMenuItem
-																variant="destructive"
-																className="min-h-9 whitespace-nowrap px-3"
-																onClick={() =>
-																	onDelete(
-																		form,
-																	)
-																}
-															>
-																<Trash2 />{" "}
-																Delete Form
-															</DropdownMenuItem>
-														</>
-													)}
-											</DropdownMenuContent>
-										</DropdownMenu>
-									)}
 							</div>
-						</CardContent>
-					</Card>
+						)}
+					</ResourceCatalogCard>
 				);
 			})}
 		</div>

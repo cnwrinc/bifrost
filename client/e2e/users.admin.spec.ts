@@ -38,6 +38,32 @@ test.describe("User Listing", () => {
 		});
 	});
 
+	test("people are on the Users tab, identities on their own", async ({
+		page,
+	}) => {
+		await page.goto("/users");
+
+		const views = page.getByRole("navigation", { name: "User views" });
+		await expect(
+			views.getByRole("link", { name: "Users" }),
+		).toHaveAttribute("aria-current", "page");
+		await page
+			.getByPlaceholder("Search users by email or name...")
+			.fill("Default Identity");
+		await expect(
+			page.getByText("No users match your search"),
+		).toBeVisible();
+
+		await views.getByRole("link", { name: "Identities" }).click();
+		await expect(page).toHaveURL(/\/users\/identities$/);
+		await expect(
+			page
+				.getByRole("row")
+				.filter({ hasText: "Default Identity" })
+				.first(),
+		).toBeVisible();
+	});
+
 	test("should show create user button", async ({ page }) => {
 		await page.goto("/users");
 
@@ -47,53 +73,53 @@ test.describe("User Listing", () => {
 
 		// Admin should see invite/create button
 		await expect(
-			page.getByRole("button", { name: /invite|create|add/i }),
+			page.getByRole("button", { name: "Create User", exact: true }),
 		).toBeVisible();
 	});
 });
 
 test.describe("User Details", () => {
-	test("should show user details when clicked", async ({ page }) => {
+	test("a list row opens the person's page, not a dialog", async ({
+		page,
+	}) => {
 		await page.goto("/users");
 
 		await expect(
 			page.getByRole("heading", { name: /users/i }).first(),
 		).toBeVisible({ timeout: 10000 });
 
-		// Find a user row
 		const userRow = page.locator("table tbody tr").first();
-		const emptyState = page.getByText(/no users/i);
-		await expect(userRow.or(emptyState)).toBeVisible({ timeout: 10000 });
-		const hasUserRow = await userRow.isVisible().catch(() => false);
+		await expect(userRow).toBeVisible({ timeout: 10000 });
+		const emailCell = userRow.locator("td").nth(3);
+		const email = (await emailCell.textContent())?.trim();
+		expect(email).toBeTruthy();
+		await emailCell.getByText(email!, { exact: true }).click();
 
-		if (hasUserRow) {
-			await userRow.click();
-			// Just verify the page responds to the click
-		}
-		// Test passes if either we clicked a user or there were no users
+		await expect(page).toHaveURL(/\/users\/[0-9a-f-]+$/);
+		await expect(page.getByRole("tab", { name: "Access" })).toHaveAttribute(
+			"aria-selected",
+			"true",
+		);
+		await expect(page.getByRole("dialog")).toHaveCount(0);
+
+		await page.getByRole("tab", { name: "Profile" }).click();
+		await expect(page).toHaveURL(/\/users\/[0-9a-f-]+\/profile$/);
 	});
 
-	test("should show user organization membership", async ({ page }) => {
+	test("Edit Profile opens the dialog without leaving the list", async ({
+		page,
+	}) => {
 		await page.goto("/users");
 
+		const userRow = page.locator("table tbody tr").first();
+		await expect(userRow).toBeVisible();
+		await userRow.getByRole("button", { name: /actions$/ }).click();
+		await page.getByRole("menuitem", { name: "Edit Profile" }).click();
+
 		await expect(
-			page.getByRole("heading", { name: /users/i }).first(),
-		).toBeVisible({ timeout: 10000 });
-
-		// Either we see organization info or an empty state
-		const hasOrgInfo = await page
-			.getByText(/organization/i)
-			.first()
-			.isVisible()
-			.catch(() => false);
-		const hasUsers = (await page.locator("table tbody tr").count()) > 0;
-		const hasEmptyState = await page
-			.getByText(/no users/i)
-			.isVisible()
-			.catch(() => false);
-
-		// Test passes if we see org info, have users, or have empty state
-		expect(hasOrgInfo || hasUsers || hasEmptyState).toBe(true);
+			page.getByRole("dialog", { name: /edit user/i }),
+		).toBeVisible();
+		await expect(page).toHaveURL(/\/users$/);
 	});
 });
 
@@ -158,89 +184,122 @@ test.describe("User Invitation", () => {
 		).toBe(true);
 		const { id: userId } = await createResp.json();
 
-		await page.goto("/users");
-		await expect(
-			page.getByRole("heading", { name: /users/i }).first(),
-		).toBeVisible({ timeout: 10000 });
-		const invitedRow = page.locator("tbody tr", { hasText: email }).first();
-		await expect(invitedRow).toBeVisible({ timeout: 10000 });
-		await invitedRow.getByRole("button", { name: /user actions/i }).click();
-		await page
-			.getByRole("menuitem", { name: /generate registration link/i })
-			.click();
-		const registrationDialog = page.getByRole("dialog", {
-			name: /user created/i,
-		});
-		await expect(registrationDialog).toBeVisible();
-		await expect(
-			registrationDialog.getByRole("button", {
-				name: /copy registration link/i,
-			}),
-		).toBeVisible();
-		await expect(registrationDialog.getByRole("textbox")).toHaveCount(0);
-		await expect(registrationDialog.getByRole("link")).toHaveCount(0);
-		await registrationDialog
-			.getByRole("button", { name: /close/i })
-			.click();
+		try {
+			await page.goto("/users");
+			await expect(
+				page.getByRole("heading", { name: /users/i }).first(),
+			).toBeVisible({ timeout: 10000 });
+			await page
+				.getByPlaceholder("Search users by email or name...")
+				.fill(email);
+			const invitedRow = page.getByRole("row").filter({ hasText: email });
+			await expect(invitedRow).toBeVisible({ timeout: 10000 });
+			await invitedRow
+				.getByRole("button", {
+					name: "Playwright Invitee actions",
+					exact: true,
+				})
+				.click();
+			await page
+				.getByRole("menuitem", { name: /generate registration link/i })
+				.click();
+			const registrationDialog = page.getByRole("dialog", {
+				name: "Registration Link Ready",
+			});
+			await expect(registrationDialog).toBeVisible();
+			await expect(
+				registrationDialog.getByRole("button", {
+					name: /copy registration link/i,
+				}),
+			).toBeVisible();
+			await expect(registrationDialog.getByRole("textbox")).toHaveCount(
+				0,
+			);
+			await expect(registrationDialog.getByRole("link")).toHaveCount(0);
+			await registrationDialog
+				.getByRole("button", { name: /close/i })
+				.click();
 
-		// Regenerate invite to get a registration URL (does not send email)
-		const genResp = await api.post(
-			`/api/users/${userId}/invite/regenerate`,
-		);
-		expect(genResp.ok()).toBe(true);
-		const { registration_url } = await genResp.json();
-		expect(registration_url).toContain("/accept-invite?token=");
+			// Regenerate invite to get a registration URL (does not send email)
+			const genResp = await api.post(
+				`/api/users/${userId}/invite/regenerate`,
+			);
+			expect(genResp.ok()).toBe(true);
+			const { registration_url } = await genResp.json();
+			expect(registration_url).toContain("/accept-invite?token=");
 
-		// Extract the token from the URL
-		const token = new URL(registration_url).searchParams.get("token")!;
-		const registerPath = `/accept-invite?token=${token}`;
+			// Extract the token from the URL
+			const token = new URL(registration_url).searchParams.get("token")!;
+			const registerPath = `/accept-invite?token=${token}`;
 
-		// Complete registration in a fresh (unauthenticated) browser context
-		const baseURL = process.env.TEST_BASE_URL || "http://localhost:3000";
-		const guestCtx = await browser.newContext({
-			baseURL,
-			storageState: { cookies: [], origins: [] },
-		});
-		const guestPage = await guestCtx.newPage();
-		// Navigate to login first to warm up the Vite module graph, then go to the invite page.
-		// The Vite dev server transforms modules on-demand; the first cold load of a new browser
-		// context takes 5-15 seconds. Waiting for the login heading ensures modules are cached.
-		await guestPage.goto("/login");
-		await expect(
-			guestPage
-				.getByRole("heading", { name: /sign in/i })
-				.or(guestPage.getByRole("heading", { name: /bifrost/i })),
-		).toBeVisible({ timeout: 30000 });
-		await guestPage.goto(registerPath);
+			// Complete registration in a fresh (unauthenticated) browser context
+			const baseURL =
+				process.env.TEST_BASE_URL || "http://localhost:3000";
+			const guestCtx = await browser.newContext({
+				baseURL,
+				storageState: { cookies: [], origins: [] },
+			});
+			try {
+				const guestPage = await guestCtx.newPage();
+				// Navigate to login first to warm up the Vite module graph, then go to the invite page.
+				// The Vite dev server transforms modules on-demand; the first cold load of a new browser
+				// context takes 5-15 seconds. Waiting for the login heading ensures modules are cached.
+				await guestPage.goto("/login");
+				await expect(
+					guestPage.getByRole("heading", { name: /sign in/i }).or(
+						guestPage.getByRole("heading", {
+							name: /bifrost/i,
+						}),
+					),
+				).toBeVisible({ timeout: 30000 });
+				await guestPage.goto(registerPath);
 
-		await expect(
-			guestPage.getByRole("heading", {
-				name: /complete your registration/i,
-			}),
-		).toBeVisible({ timeout: 15000 });
+				await expect(
+					guestPage.getByRole("heading", {
+						name: /complete your registration/i,
+					}),
+				).toBeVisible({ timeout: 15000 });
 
-		await guestPage
-			.getByRole("button", { name: /use password instead/i })
-			.click();
-		await guestPage
-			.getByRole("textbox", { name: "Password", exact: true })
-			.fill("InviteePass123!");
-		await guestPage
-			.getByRole("textbox", { name: "Confirm password" })
-			.fill("InviteePass123!");
-		await guestPage
-			.getByRole("button", { name: /create account/i })
-			.click();
+				await guestPage
+					.getByRole("button", { name: /use password instead/i })
+					.click();
+				await guestPage
+					.getByRole("textbox", { name: "Password", exact: true })
+					.fill("InviteePass123!");
+				await guestPage
+					.getByRole("textbox", { name: "Confirm password" })
+					.fill("InviteePass123!");
+				await guestPage
+					.getByRole("button", { name: /create account/i })
+					.click();
 
-		// Should redirect to login after successful registration
-		await guestPage.waitForURL(/\/login(?:\?|$)/, { timeout: 10000 });
+				// Should redirect to login after successful registration
+				await guestPage.waitForURL(/\/login(?:\?|$)/, {
+					timeout: 10000,
+				});
+			} finally {
+				await guestCtx.close();
+			}
 
-		await guestCtx.close();
-
-		// Admin verifies the user is now active
-		await page.goto("/users");
-		await expect(
-			page.getByRole("heading", { name: /users/i }).first(),
-		).toBeVisible({ timeout: 10000 });
+			// Admin verifies the user is now active
+			await page.goto("/users");
+			await expect(
+				page.getByRole("heading", { name: /users/i }).first(),
+			).toBeVisible({ timeout: 10000 });
+			await page
+				.getByPlaceholder("Search users by email or name...")
+				.fill(email);
+			await expect(
+				invitedRow.getByText("Active", { exact: true }),
+			).toBeVisible();
+			const persisted = await api.get(`/api/users/${userId}`);
+			expect(persisted.ok()).toBe(true);
+			expect(await persisted.json()).toMatchObject({
+				is_active: true,
+			});
+		} finally {
+			const removed = await api.delete(`/api/users/${userId}`);
+			expect(removed.ok()).toBe(true);
+		}
 	});
 });

@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum as SQLAlchemyEnum, Float, ForeignKey, Index, Integer, Numeric, String, Text, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import BigInteger, DateTime, Enum as SQLAlchemyEnum, Float, ForeignKey, Index, Integer, Numeric, String, Text, func, text
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.enums import ExecutionStatus
@@ -17,7 +17,6 @@ from src.models.orm.base import Base
 
 if TYPE_CHECKING:
     from src.models.orm.ai_usage import AIUsage
-    from src.models.orm.cli import CLISession
     from src.models.orm.forms import Form
     from src.models.orm.organizations import Organization
     from src.models.orm.users import User
@@ -59,6 +58,10 @@ class Execution(Base):
     cpu_user_seconds: Mapped[float | None] = mapped_column(Float, default=None)
     cpu_system_seconds: Mapped[float | None] = mapped_column(Float, default=None)
     cpu_total_seconds: Mapped[float | None] = mapped_column(Float, default=None)
+    peak_cpu_cores: Mapped[float | None] = mapped_column(Float, default=None)
+    peak_process_rss_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # Peak RSS minus RSS at fork: the most memory the run itself added.
+    peak_memory_growth_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
 
     # Economics - final values for this execution
     time_saved: Mapped[int] = mapped_column(Integer, default=0)  # Minutes saved
@@ -66,6 +69,20 @@ class Execution(Base):
 
     executed_by: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), default=None)
     executed_by_name: Mapped[str] = mapped_column(String(255))
+    # Run lineage: who this run is for, who started its run tree, and the
+    # tree's first execution. Recorded by shared.run_lineage; execution reads
+    # use it (shared.execution_visibility). NULL on rows created before
+    # lineage was recorded.
+    run_user_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), default=None)
+    started_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), default=None
+    )
+    root_execution_id: Mapped[UUID | None] = mapped_column(default=None)
+    # Browser impersonation is audit provenance, never execution authority.
+    # These are intentionally not foreign keys so deleting an operator does
+    # not erase attribution from durable history.
+    impersonated_by_user_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), default=None)
+    impersonation_session_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), default=None)
     organization_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("organizations.id"), default=None
     )
@@ -76,13 +93,9 @@ class Execution(Base):
     api_key_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("workflows.id", ondelete="SET NULL", onupdate="CASCADE"), default=None
     )  # Workflow whose API key triggered this execution (null for user-triggered)
-    is_local_execution: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     execution_model: Mapped[str | None] = mapped_column(
         String(20), default=None
     )  # 'process' or 'thread' - tracks which execution model ran the job
-    session_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("cli_sessions.id", ondelete="SET NULL"), default=None
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), server_default=text("NOW()")
     )
@@ -91,8 +104,7 @@ class Execution(Base):
     )
 
     # Relationships
-    executed_by_user: Mapped["User"] = relationship(back_populates="executions")
-    cli_session: Mapped["CLISession | None"] = relationship(back_populates="executions")
+    executed_by_user: Mapped["User"] = relationship(back_populates="executions", foreign_keys=[executed_by])
     workflow: Mapped["Workflow | None"] = relationship(
         foreign_keys=[workflow_id]
     )  # The workflow that was executed
@@ -104,17 +116,31 @@ class Execution(Base):
     )
     form: Mapped["Form | None"] = relationship(back_populates="executions")
     logs: Mapped[list["ExecutionLog"]] = relationship(back_populates="execution")
-    ai_usages: Mapped[list["AIUsage"]] = relationship(back_populates="execution")
+    ai_usages: Mapped[list["AIUsage"]] = relationship(
+        back_populates="execution",
+        primaryjoin="AIUsage.execution_id == Execution.id",
+        foreign_keys="AIUsage.execution_id",
+    )
 
     __table_args__ = (
         Index("ix_executions_org_status", "organization_id", "status"),
+        Index(
+            "ix_executions_history_timeline",
+            func.coalesce(started_at, scheduled_at, completed_at, created_at).desc(),
+            id.desc(),
+        ),
         Index("ix_executions_created", "created_at"),
+        Index("ix_executions_completed_id", "completed_at", "id"),
         Index("ix_executions_started_at", "started_at"),
         Index("ix_executions_user", "executed_by"),
         Index("ix_executions_workflow", "workflow_name"),
-        Index("ix_executions_is_local_execution", "is_local_execution"),
-        Index("ix_executions_session_id", "session_id"),
         Index("ix_executions_workflow_id", "workflow_id"),
+        Index("ix_executions_run_user_id", "run_user_id", postgresql_where=run_user_id.isnot(None)),
+        Index(
+            "ix_executions_started_by_user_id",
+            "started_by_user_id",
+            postgresql_where=started_by_user_id.isnot(None),
+        ),
     )
 
 

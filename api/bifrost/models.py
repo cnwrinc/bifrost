@@ -10,7 +10,7 @@ All SDK types are defined here and used consistently across:
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Organization(BaseModel):
@@ -41,7 +41,7 @@ class UserPublic(BaseModel):
 
     id: str
     email: str
-    name: str
+    name: str | None
     is_active: bool
     is_superuser: bool
     is_verified: bool
@@ -50,6 +50,8 @@ class UserPublic(BaseModel):
     mfa_enabled: bool
     created_at: datetime | None
     updated_at: datetime | None
+    invite_status: str = "active"
+    registration_url: str | None = None
 
 
 class FormPublic(BaseModel):
@@ -57,7 +59,7 @@ class FormPublic(BaseModel):
 
     id: str
     name: str
-    description: str | None
+    description: str | None = None
     confirmation_markdown: str
     workflow_id: str | None
     launch_workflow_id: str | None
@@ -67,7 +69,7 @@ class FormPublic(BaseModel):
     access_level: str
     organization_id: str | None
     is_active: bool
-    file_path: str | None
+    file_path: str | None = None
     created_at: datetime | None
     updated_at: datetime | None
 
@@ -80,7 +82,7 @@ class WorkflowMetadata(BaseModel):
     description: str | None
     category: str | None
     tags: list[str]
-    parameters: dict
+    parameters: list[dict[str, Any]]
     execution_mode: str
     timeout_seconds: int | None
     retry_policy: dict | None
@@ -130,10 +132,64 @@ class WorkflowExecution(BaseModel):
     completed_at: datetime | None
     logs: list[dict] | None = None
     variables: dict | None = None
-    session_id: str | None
     peak_memory_bytes: int | None
     process_rss_bytes: int | None
     cpu_total_seconds: float | None
+
+
+class AgentRunHandle(BaseModel):
+    """Accepted non-blocking agent run."""
+
+    run_id: str
+    status: Literal["queued"] = "queued"
+    run_as_user_id: str | None = None
+
+
+class AgentRunPending(BaseModel):
+    """The SDK wait ended before an agent run's result was observed."""
+
+    run_id: str
+    last_known_status: Literal["queued", "running", "cancelling"] | None = None
+    reason: Literal["wait_timeout", "workflow_deadline"]
+
+
+class AgentRun(BaseModel):
+    """Agent run status and result."""
+
+    id: str
+    agent_id: str
+    agent_name: str | None = None
+    trigger_type: str
+    trigger_source: str | None = None
+    conversation_id: str | None = None
+    event_delivery_id: str | None = None
+    input: dict | None = None
+    output: dict | None = None
+    status: str
+    error: str | None = None
+    org_id: str | None = None
+    caller_user_id: str | None = None
+    caller_email: str | None = None
+    caller_name: str | None = None
+    run_as_user_id: str | None = None
+    run_as_user_name: str | None = None
+    run_as_user_email: str | None = None
+    iterations_used: int = 0
+    tokens_used: int = 0
+    budget_max_iterations: int | None = None
+    budget_max_tokens: int | None = None
+    duration_ms: int | None = None
+    llm_model: str | None = None
+    asked: str | None = None
+    did: str | None = None
+    answered: str | None = None
+    metadata: dict[str, str] = Field(default_factory=dict)
+    confidence: float | None = None
+    confidence_reason: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    parent_run_id: str | None = None
 
 
 class IntegrationData(BaseModel):
@@ -169,6 +225,11 @@ class OAuthCredentials(BaseModel):
         Updates access_token and expires_at in-place and persists
         the new token to the database.
 
+        Sends the ordinary HTTP request through the shared ``BifrostClient``:
+        over the worker's private Unix socket when the engine injected one,
+        and over the network API otherwise. A local failure raises and never
+        falls back to the network API. Error mapping matches the network path.
+
         Returns:
             self (for chaining)
 
@@ -181,7 +242,8 @@ class OAuthCredentials(BaseModel):
         from ._context import register_secret
 
         client = get_client()
-        response = await client.post(
+        response = await client.engine_request(
+            "POST",
             "/api/sdk/integrations/refresh_token",
             json={"connection_name": self.connection_name},
         )
@@ -336,4 +398,10 @@ class BatchDeleteResult(BaseModel):
     """Batch delete result with deleted IDs and count."""
 
     deleted_ids: list[str]
+    count: int
+
+
+class BulkUpsertResult(BaseModel):
+    """Count-only result for privileged table bulk upsert."""
+
     count: int

@@ -79,7 +79,7 @@ Test missing mapping, expired/absent OAuth, API failure, pagination/rate limitin
 
 Roles are permission buckets assigned to users and entities. Permissions are a mapping, not a list. Read role membership and the protected entity before changing either side.
 
-Custom claims are org-scoped, query-derived user facts used by policy expressions. Design the backing query and policy together, and test users with empty, single, and multiple claim values.
+Custom claims are org-scoped, query-derived user facts used by policy expressions. Design the backing query, source-table read policy, and consuming policy together: claim resolution is restricted by the source table's policy. Claims select one scalar value per source row, so flatten list-valued grants into separate rows. Test users with empty, single, and multiple claim values.
 
 Table and file policies are deny-by-absence. Fresh resources commonly begin with an admin bypass only; ordinary users need explicit rules. Policy rules can be referenced by multiple resources, so inspect usages before updating or deleting a shared rule.
 
@@ -93,6 +93,8 @@ An event source is a schedule, webhook, or topic. A subscription targets exactly
 - Subscription target type is inferred from the workflow/agent selector.
 - Changing a subscription's target is not an update: delete and recreate the subscription intentionally.
 - Topic workflows receive event metadata and payload through the execution context; validate missing or malformed payload fields.
+- On a Solution-owned source, deploy replaces only the subscriptions declared in the Solution's `.bifrost/events.yaml`. A subscription you create on that source from outside the Solution (for example, a workspace workflow listening to the Solution's topic or schedule) stays in place across redeploys and is not exported with the Solution. Capture adopts only subscriptions that target the Solution's own workflows or agents; capture the listener's workflow too if it belongs in the Solution.
+- External listeners are still removed with what they depend on: when a redeploy drops the source from the manifest, or when the Solution is hard-deleted (the deletion summary reports them as `external_event_subscriptions`). A non-destructive uninstall leaves them in place.
 
 Use `events.emit()` from a workflow to publish a topic. Confirm source scope, subscription access, idempotency/retry behavior, and downstream failure handling.
 

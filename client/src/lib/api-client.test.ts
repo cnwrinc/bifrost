@@ -1,6 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { apiClient, authFetch } from "./api-client";
-import { ACCESS_TOKEN_KEY } from "./auth-token";
+import { apiClient, authFetch, setRefusedChangeListener } from "./api-client";
+import {
+	ACCESS_TOKEN_KEY,
+	setImpersonationToken,
+} from "./auth-token";
+
+interface TestPlatformAuthBridge {
+	getAccessToken: () => string | null;
+	canRefreshAccessToken: () => boolean;
+	refreshAccessToken: () => Promise<boolean>;
+	handleAuthenticationFailure: () => void;
+}
+
+type TestPlatformAuthGlobal = typeof globalThis & {
+	__BIFROST_PLATFORM_AUTH_V1__?: TestPlatformAuthBridge;
+};
 
 /**
  * Build a mock Response with a given status and an empty body.
@@ -22,6 +36,42 @@ function buildFakeToken(): string {
 	const payload = btoa(JSON.stringify({ exp: farFuture }));
 	return `${header}.${payload}.sig`;
 }
+
+describe("V2 app platform auth bridge", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		localStorage.clear();
+		sessionStorage.clear();
+	});
+
+	it("shares one refresh request across concurrent SDK recovery calls", async () => {
+		const refreshedToken = buildFakeToken();
+		let releaseRefresh!: () => void;
+		const refreshGate = new Promise<void>((resolve) => {
+			releaseRefresh = resolve;
+		});
+		const fetchMock = vi.fn(async () => {
+			await refreshGate;
+			return mockJsonResponse(200, { access_token: refreshedToken });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const bridge = (globalThis as TestPlatformAuthGlobal)
+			.__BIFROST_PLATFORM_AUTH_V1__;
+		expect(bridge).toBeDefined();
+
+		const first = bridge!.refreshAccessToken();
+		const second = bridge!.refreshAccessToken();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		releaseRefresh();
+
+		await expect(Promise.all([first, second])).resolves.toEqual([
+			true,
+			true,
+		]);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(bridge!.getAccessToken()).toBe(refreshedToken);
+	});
+});
 
 /**
  * Drain the microtask queue + advance fake timers so any pending setTimeout
@@ -255,5 +305,144 @@ describe("apiClient (openapi-fetch middleware) transient 5xx retry", () => {
 		expect(JSON.parse(capturedBodies[1])).toEqual({
 			primary_color: "#abcdef",
 		});
+	});
+});
+
+describe.each(["authFetch", "apiClient"] as const)(
+	"%s session versus route denial",
+	(kind) => {
+		let fetchMock: ReturnType<typeof vi.fn>;
+		let token: string;
+		beforeEach(() => {
+			token = buildFakeToken();
+			localStorage.setItem(ACCESS_TOKEN_KEY, token);
+			window.history.replaceState(null, "", "/login");
+			fetchMock = vi.fn();
+			vi.stubGlobal("fetch", fetchMock);
+		});
+		afterEach(() => {
+			vi.unstubAllGlobals();
+			localStorage.clear();
+			sessionStorage.clear();
+			window.history.replaceState(null, "", "/");
+		});
+		const call = async () =>
+			kind === "authFetch"
+				? authFetch("http://localhost/api/version")
+				: (
+						await apiClient.GET("/api/version", {
+							fetch: fetchMock,
+						} as never)
+					).response;
+		it("keeps a valid session when one route returns 401", async () => {
+			fetchMock
+				.mockResolvedValueOnce(mockResponse(401))
+				.mockResolvedValueOnce(mockJsonResponse(200, { id: "user" }));
+			expect((await call()).status).toBe(401);
+			expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe(token);
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(fetchMock.mock.calls[1][0]).toBe("/auth/me");
+		});
+		it("leaves 403 permission failures to the page", async () => {
+			fetchMock.mockResolvedValueOnce(mockResponse(403));
+			expect((await call()).status).toBe(403);
+			expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe(token);
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+		});
+		it("does not sign out when session verification is unavailable", async () => {
+			fetchMock
+				.mockResolvedValueOnce(mockResponse(401))
+				.mockRejectedValueOnce(new TypeError("Network unavailable"));
+			expect((await call()).status).toBe(401);
+			expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe(token);
+		});
+		it("refreshes and retries when identity also rejects the token", async () => {
+			fetchMock
+				.mockResolvedValueOnce(mockResponse(401))
+				.mockResolvedValueOnce(mockResponse(401))
+				.mockResolvedValueOnce(
+					mockJsonResponse(200, { access_token: token }),
+				)
+				.mockResolvedValueOnce(
+					mockJsonResponse(200, { version: "1.0" }),
+				);
+			expect((await call()).status).toBe(200);
+			expect(fetchMock.mock.calls[2][0]).toBe("/api/auth/refresh");
+			expect(fetchMock).toHaveBeenCalledTimes(4);
+		});
+		it("clears a session rejected by both identity and refresh", async () => {
+			fetchMock.mockImplementation(async () => mockResponse(401));
+			expect((await call()).status).toBe(401);
+			expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBeNull();
+		});
+	},
+);
+
+describe("impersonation authentication failures", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		localStorage.clear();
+		sessionStorage.clear();
+	});
+
+	it("does not refresh or replay a rejected mutation as the operator", async () => {
+		const operator = buildFakeToken();
+		localStorage.setItem(ACCESS_TOKEN_KEY, operator);
+		setImpersonationToken(buildFakeToken());
+		const fetchMock = vi.fn().mockResolvedValue(mockResponse(401));
+		vi.stubGlobal("fetch", fetchMock);
+
+		const response = await authFetch("/api/users/user-1", {
+			method: "PATCH",
+			body: JSON.stringify({ name: "No replay" }),
+		});
+
+		expect(response.status).toBe(401);
+		expect(fetchMock).toHaveBeenCalledOnce();
+		expect(localStorage.getItem(ACCESS_TOKEN_KEY)).toBe(operator);
+	});
+});
+
+describe("apiClient refused changes", () => {
+	let fetchMock: ReturnType<typeof vi.fn>;
+	beforeEach(() => {
+		localStorage.setItem(ACCESS_TOKEN_KEY, buildFakeToken());
+		fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+	});
+	afterEach(() => {
+		setRefusedChangeListener(null);
+		vi.restoreAllMocks();
+		vi.unstubAllGlobals();
+		localStorage.clear();
+	});
+
+	it("tells the listener when a change is refused", async () => {
+		const listener = vi.fn();
+		setRefusedChangeListener(listener);
+		fetchMock.mockResolvedValueOnce(
+			mockJsonResponse(403, {
+				detail: "You don't have permission to manage users",
+			}),
+		);
+
+		const { response } = await apiClient.PATCH("/api/users/{user_id}", {
+			params: { path: { user_id: "u1" } },
+			body: { name: "New" },
+			fetch: fetchMock,
+		} as never);
+
+		expect(response.status).toBe(403);
+		expect(listener).toHaveBeenCalledOnce();
+	});
+
+	it("stays quiet when a read is refused", async () => {
+		const listener = vi.fn();
+		setRefusedChangeListener(listener);
+		fetchMock.mockResolvedValueOnce(mockResponse(403));
+
+		await apiClient.GET("/api/version", { fetch: fetchMock } as never);
+
+		expect(listener).not.toHaveBeenCalled();
 	});
 });

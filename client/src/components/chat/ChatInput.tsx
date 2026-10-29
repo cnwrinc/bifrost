@@ -1,3 +1,4 @@
+import { DraftAttachment } from "./DraftAttachment";
 import {
 	useCallback,
 	useEffect,
@@ -5,21 +6,19 @@ import {
 	useState,
 	type ChangeEvent,
 	type ClipboardEvent,
+	type CSSProperties,
 	type DragEvent,
 	type KeyboardEvent,
 } from "react";
-import {
-	ArrowUp,
-	Bot,
-	FileText,
-	Loader2,
-	Paperclip,
-	Square,
-	X,
-} from "lucide-react";
+import { ArrowUp, Bot, Loader2, Paperclip, Square, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import {
+	Popover,
+	PopoverContent,
+	PopoverTrigger,
+} from "@/components/ui/popover";
 import {
 	Select,
 	SelectContent,
@@ -28,6 +27,7 @@ import {
 	SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { formatContextTokens } from "@/lib/run-usage";
 import type { components } from "@/lib/v1";
 import {
 	MAX_ATTACHMENTS_PER_MESSAGE,
@@ -35,12 +35,13 @@ import {
 	validateAttachment,
 } from "@/services/chatAttachments";
 import type {
-	ChatModelTierId,
-	ChatModelTierOption,
+	ChatModelProfileId,
+	ChatModelProfileOption,
 } from "@/services/chatModels";
 import { MentionPicker } from "./MentionPicker";
 
 type AgentSummary = components["schemas"]["AgentSummary"];
+type ChatContextUsage = components["schemas"]["ChatContextUsage"];
 interface MentionChip {
 	name: string;
 }
@@ -54,15 +55,16 @@ interface ChatInputProps {
 	onSend: (
 		message: string,
 		files: File[],
-		modelTier: ChatModelTierId,
+		modelProfileId: ChatModelProfileId | null,
 	) => void | Promise<void>;
 	disabled?: boolean;
 	isLoading?: boolean;
 	placeholder?: string;
 	onStop?: () => void;
-	modelTiers?: ChatModelTierOption[];
-	modelTier?: ChatModelTierId;
-	onModelTierChange?: (tier: ChatModelTierId) => void;
+	modelProfiles?: ChatModelProfileOption[];
+	modelProfileId?: ChatModelProfileId | null;
+	onModelProfileChange?: (profileId: ChatModelProfileId) => void;
+	contextUsage?: ChatContextUsage | null;
 }
 
 export function ChatInput({
@@ -71,33 +73,27 @@ export function ChatInput({
 	isLoading = false,
 	placeholder = "Reply…",
 	onStop,
-	modelTiers = [
-		{
-			id: "balanced",
-			label: "Balanced",
-			capabilities: {
-				image_input: false,
-				pdf_input: false,
-				tool_calling: false,
-				source: "unknown",
-				fingerprint: "",
-			},
-		},
-	],
-	modelTier = "balanced",
-	onModelTierChange,
+	modelProfiles = [],
+	modelProfileId = null,
+	onModelProfileChange,
+	contextUsage = null,
 }: ChatInputProps) {
 	const [message, setMessage] = useState("");
 	const [mentions, setMentions] = useState<MentionChip[]>([]);
 	const [attachments, setAttachments] = useState<AttachmentDraft[]>([]);
 	const [isSubmitting, setIsSubmitting] = useState(false);
+	const [sendError, setSendError] = useState<string | null>(null);
 	const [isDragging, setIsDragging] = useState(false);
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const attachmentsRef = useRef(attachments);
-	const selectedCapabilities = modelTiers.find(
-		(tier) => tier.id === modelTier,
-	)?.capabilities;
+	const selectedProfile = modelProfiles.find(
+		(profile) => profile.id === modelProfileId,
+	);
+	const selectedCapabilities = selectedProfile?.capabilities;
+	const matchingContextUsage =
+		contextUsage?.model_profile_id === modelProfileId ? contextUsage : null;
+	const [contextOpen, setContextOpen] = useState(false);
 
 	const [mentionOpen, setMentionOpen] = useState(false);
 	const [mentionSearch, setMentionSearch] = useState("");
@@ -131,7 +127,7 @@ export function ChatInput({
 						!selectedCapabilities?.image_input
 					) {
 						toast.error(
-							`${modelTiers.find((tier) => tier.id === modelTier)?.label ?? "This model"} cannot inspect images.`,
+							`${selectedProfile?.label ?? "This profile"} cannot inspect images.`,
 						);
 						continue;
 					}
@@ -140,7 +136,7 @@ export function ChatInput({
 						!selectedCapabilities?.pdf_input
 					) {
 						toast.error(
-							`${modelTiers.find((tier) => tier.id === modelTier)?.label ?? "This model"} cannot inspect PDFs.`,
+							`${selectedProfile?.label ?? "This profile"} cannot inspect PDFs.`,
 						);
 						continue;
 					}
@@ -159,7 +155,7 @@ export function ChatInput({
 				return [...current, ...accepted];
 			});
 		},
-		[modelTier, modelTiers, selectedCapabilities],
+		[selectedCapabilities, selectedProfile],
 	);
 
 	const removeAttachment = useCallback((index: number) => {
@@ -187,20 +183,39 @@ export function ChatInput({
 		const finalMessage = mentionPrefixes
 			? `${mentionPrefixes} ${trimmedMessage}`.trim()
 			: trimmedMessage;
+		const submittedMessage = message;
+		const submittedMentions = mentions;
+		const submittedAttachments = attachments;
 		setIsSubmitting(true);
+		setSendError(null);
+		setMessage("");
+		setMentions([]);
+		setAttachments([]);
+		if (textareaRef.current) textareaRef.current.style.height = "auto";
 		try {
 			await onSend(
 				finalMessage,
-				attachments.map((draft) => draft.file),
-				modelTier,
+				submittedAttachments.map((draft) => draft.file),
+				modelProfileId,
 			);
-			for (const draft of attachments) {
+			for (const draft of submittedAttachments) {
 				if (draft.previewUrl) URL.revokeObjectURL(draft.previewUrl);
 			}
-			setMessage("");
-			setMentions([]);
-			setAttachments([]);
-			if (textareaRef.current) textareaRef.current.style.height = "auto";
+		} catch (error) {
+			setSendError(
+				error instanceof Error
+					? error.message
+					: "Could not send this message. Try again.",
+			);
+			// Restore the submitted draft only when
+			// the user has not already started composing a replacement.
+			setMessage((current) => current || submittedMessage);
+			setMentions((current) =>
+				current.length > 0 ? current : submittedMentions,
+			);
+			setAttachments((current) =>
+				current.length > 0 ? current : submittedAttachments,
+			);
 		} finally {
 			setIsSubmitting(false);
 		}
@@ -211,7 +226,7 @@ export function ChatInput({
 		isSubmitting,
 		mentions,
 		message,
-		modelTier,
+		modelProfileId,
 		onSend,
 	]);
 
@@ -221,6 +236,10 @@ export function ChatInput({
 				mentionOpen &&
 				["ArrowUp", "ArrowDown", "Enter", "Escape"].includes(event.key)
 			) {
+				return;
+			}
+			if (mentionOpen && event.key === "Tab") {
+				event.preventDefault();
 				return;
 			}
 			if (event.key === "Enter" && !event.shiftKey && !mentionOpen) {
@@ -310,10 +329,39 @@ export function ChatInput({
 			mentions.length > 0 ||
 			attachments.length > 0) &&
 		!busy;
+	const contextWindow = matchingContextUsage?.context_window ?? null;
+	const contextUsedPercent = contextWindow
+		? Math.min(
+				100,
+				Math.round(
+					(matchingContextUsage!.input_tokens / contextWindow) * 100,
+				),
+			)
+		: null;
+	const cacheReadPercent = matchingContextUsage
+		? matchingContextUsage.input_tokens > 0
+			? Math.min(
+					100,
+					Math.round(
+						(matchingContextUsage.cache_read_tokens /
+							matchingContextUsage.input_tokens) *
+							100,
+					),
+				)
+			: 0
+		: null;
 
 	return (
-		<div className="px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 sm:px-4 sm:pb-4">
-			<div className="mx-auto max-w-3xl">
+		<div className="flex max-h-[65%] min-h-0 shrink-0 flex-col px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 sm:px-4 sm:pb-4">
+			<div className="mx-auto flex min-h-0 w-full max-w-4xl flex-col">
+				{sendError && (
+					<p
+						role="alert"
+						className="mb-2 max-h-20 overflow-y-auto text-sm text-destructive [overflow-wrap:anywhere]"
+					>
+						Message not sent: {sendError}
+					</p>
+				)}
 				<div
 					onDrop={handleDrop}
 					onDragOver={(event) => {
@@ -322,7 +370,7 @@ export function ChatInput({
 					}}
 					onDragLeave={() => setIsDragging(false)}
 					className={cn(
-						"relative rounded-2xl border bg-background shadow-sm transition-colors",
+						"relative flex min-h-0 flex-col rounded-[var(--bf-radius-feature)] border bg-card text-card-foreground shadow-sm transition-colors motion-reduce:transition-none",
 						"focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/20",
 						isDragging && "border-primary bg-primary/5",
 					)}
@@ -332,89 +380,81 @@ export function ChatInput({
 						onOpenChange={setMentionOpen}
 						onSelect={handleMentionSelect}
 						searchTerm={mentionSearch}
+						onSearchChange={(value) => {
+							if (mentionStart === null) return;
+							setMessage(
+								`${message.slice(0, mentionStart + 1)}${value}${message.slice(mentionStart + 1 + mentionSearch.length)}`,
+							);
+							setMentionSearch(value);
+						}}
 						position={{ x: 16, y: 0 }}
 					/>
 
-					{attachments.length > 0 && (
-						<div className="flex gap-2 overflow-x-auto px-3 pt-3">
-							{attachments.map((draft, index) => (
-								<div
-									key={`${draft.file.name}-${draft.file.lastModified}-${index}`}
-									className="group relative flex h-16 min-w-40 max-w-56 items-center gap-2 rounded-xl border bg-muted/40 p-2"
-								>
-									{draft.previewUrl ? (
-										<img
-											src={draft.previewUrl}
-											alt=""
-											className="h-12 w-12 rounded-lg object-cover"
-										/>
-									) : (
-										<div className="flex h-12 w-12 items-center justify-center rounded-lg bg-background">
-											<FileText className="h-5 w-5 text-muted-foreground" />
-										</div>
-									)}
-									<span className="truncate text-xs font-medium">
-										{draft.file.name}
+					<div className="min-h-0 overflow-y-auto">
+						{attachments.length > 0 && (
+							<div className="grid max-h-48 gap-2 overflow-y-auto px-3 pt-3 sm:grid-cols-2">
+								{attachments.map((draft, index) => (
+									<DraftAttachment
+										key={`${draft.file.name}-${draft.file.lastModified}-${index}`}
+										file={draft.file}
+										previewUrl={draft.previewUrl}
+										disabled={busy}
+										onRemove={() => removeAttachment(index)}
+									/>
+								))}
+							</div>
+						)}
+
+						{mentions.length > 0 && (
+							<div className="flex flex-wrap gap-1.5 px-3 pt-3">
+								{mentions.map((mention) => (
+									<span
+										key={mention.name}
+										className="inline-flex max-w-full min-w-0 items-center gap-2 rounded-[var(--bf-radius-control)] bg-primary/10 pl-3 text-xs font-medium text-primary"
+									>
+										<Bot className="h-3 w-3 shrink-0" />
+										<span className="min-w-0 [overflow-wrap:anywhere]">
+											{mention.name}
+										</span>
+										<Button
+											type="button"
+											variant="ghost"
+											size="icon-sm"
+											className="size-11 shrink-0"
+											disabled={busy}
+											aria-label={`Remove ${mention.name}`}
+											onClick={() =>
+												setMentions((current) =>
+													current.filter(
+														(item) =>
+															item.name !==
+															mention.name,
+													),
+												)
+											}
+										>
+											<X className="h-3 w-3" />
+										</Button>
 									</span>
-									<Button
-										type="button"
-										variant="secondary"
-										size="icon-sm"
-										aria-label={`Remove ${draft.file.name}`}
-										className="absolute -right-1.5 -top-1.5 h-7 w-7 rounded-full after:absolute after:-inset-2 sm:h-6 sm:w-6 sm:after:inset-0"
-										onClick={() => removeAttachment(index)}
-									>
-										<X className="h-3 w-3" />
-									</Button>
-								</div>
-							))}
-						</div>
-					)}
+								))}
+							</div>
+						)}
 
-					{mentions.length > 0 && (
-						<div className="flex flex-wrap gap-1.5 px-3 pt-3">
-							{mentions.map((mention) => (
-								<span
-									key={mention.name}
-									className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-1 text-xs font-medium text-primary"
-								>
-									<Bot className="h-3 w-3" />
-									{mention.name}
-									<button
-										type="button"
-										aria-label={`Remove ${mention.name}`}
-										onClick={() =>
-											setMentions((current) =>
-												current.filter(
-													(item) =>
-														item.name !==
-														mention.name,
-												),
-											)
-										}
-									>
-										<X className="h-3 w-3" />
-									</button>
-								</span>
-							))}
-						</div>
-					)}
-
-					<textarea
-						ref={textareaRef}
-						aria-label="Chat input"
-						value={message}
-						onChange={handleInputChange}
-						onKeyDown={handleKeyDown}
-						onPaste={handlePaste}
-						placeholder={placeholder}
-						disabled={disabled}
-						rows={1}
-						className="max-h-[200px] min-h-12 w-full resize-none bg-transparent px-4 py-3 text-base outline-none placeholder:text-muted-foreground disabled:opacity-50"
-					/>
-
-					<div className="flex items-center justify-between gap-2 px-2.5 pb-2.5">
-						<div className="flex min-w-0 items-center gap-1">
+						<textarea
+							ref={textareaRef}
+							aria-label="Chat input"
+							value={message}
+							onChange={handleInputChange}
+							onKeyDown={handleKeyDown}
+							onPaste={handlePaste}
+							placeholder={placeholder}
+							disabled={disabled}
+							rows={1}
+							className="max-h-[200px] min-h-12 w-full resize-none bg-transparent px-4 py-3 text-base outline-none placeholder:text-muted-foreground disabled:opacity-50"
+						/>
+					</div>
+					<div className="flex shrink-0 items-center justify-between gap-2 px-2.5 pb-2.5">
+						<div className="flex min-w-0 flex-1 items-center gap-1">
 							<input
 								ref={fileInputRef}
 								type="file"
@@ -444,7 +484,7 @@ export function ChatInput({
 								size="icon-sm"
 								aria-label="Attach files"
 								title="Attach files"
-								className="size-11 sm:size-7"
+								className="size-11"
 								disabled={
 									busy ||
 									attachments.length >=
@@ -454,33 +494,107 @@ export function ChatInput({
 							>
 								<Paperclip className="h-4 w-4" />
 							</Button>
-							{modelTiers.length > 0 && (
+							{modelProfiles.length > 0 && modelProfileId && (
 								<Select
-									value={modelTier}
+									value={modelProfileId}
 									onValueChange={(value) =>
-										onModelTierChange?.(
-											value as ChatModelTierId,
+										onModelProfileChange?.(
+											value as ChatModelProfileId,
 										)
 									}
 									disabled={busy}
 								>
 									<SelectTrigger
 										aria-label="Response model"
-										className="h-11 w-auto min-w-24 border-0 bg-transparent px-2 text-xs shadow-none sm:h-8"
+										className="h-auto min-h-11 w-full min-w-0 max-w-72 border-0 bg-transparent px-2 text-xs shadow-none [&_[data-slot=select-value]]:truncate"
 									>
 										<SelectValue />
 									</SelectTrigger>
 									<SelectContent>
-										{modelTiers.map((tier) => (
+										{modelProfiles.map((profile) => (
 											<SelectItem
-												key={tier.id}
-												value={tier.id}
+												key={profile.id}
+												value={profile.id}
 											>
-												{tier.label}
+												{profile.label}
 											</SelectItem>
 										))}
 									</SelectContent>
 								</Select>
+							)}
+							{matchingContextUsage && (
+								<Popover
+									open={contextOpen}
+									onOpenChange={setContextOpen}
+								>
+									<PopoverTrigger asChild>
+										<Button
+											type="button"
+											variant="ghost"
+											size="icon-sm"
+											className="size-11 shrink-0 rounded-full p-2"
+											aria-label="Context window"
+											onFocus={() => setContextOpen(true)}
+											onMouseEnter={() => setContextOpen(true)}
+											onMouseLeave={() => setContextOpen(false)}
+											onBlur={() => setContextOpen(false)}
+											onClick={(event) => {
+												event.preventDefault();
+												setContextOpen(true);
+											}}
+										>
+											<span
+												aria-hidden="true"
+												className="grid size-5 place-items-center rounded-full bg-[conic-gradient(var(--primary)_calc(var(--context-used)*1%),var(--muted)_0)]"
+												style={
+													{
+														"--context-used": contextUsedPercent ?? 0,
+											} as CSSProperties
+												}
+											>
+												<span className="size-3 rounded-full bg-card" />
+											</span>
+										</Button>
+									</PopoverTrigger>
+									<PopoverContent
+										side="top"
+										align="center"
+										collisionPadding={16}
+										aria-label="Context window"
+										className="w-64 max-w-[calc(100vw-2rem)] gap-1.5 p-3 text-center"
+										onOpenAutoFocus={(event) => event.preventDefault()}
+										onCloseAutoFocus={(event) => event.preventDefault()}
+									>
+										<p className="text-xs text-muted-foreground">
+											Context window
+										</p>
+										{contextWindow && contextUsedPercent !== null ? (
+											<>
+												<p className="text-sm font-medium">
+													{contextUsedPercent}% used ({100 - contextUsedPercent}% left)
+												</p>
+												<p className="whitespace-nowrap text-xs">
+													{formatContextTokens(matchingContextUsage.input_tokens)} / {formatContextTokens(contextWindow)} tokens{" "}
+													<span className="text-muted-foreground">
+														({cacheReadPercent}% cached)
+													</span>
+												</p>
+											</>
+										) : (
+											<>
+												<p className="text-sm font-medium">
+													Capacity unavailable.
+												</p>
+												<p className="whitespace-nowrap text-xs">
+													{formatContextTokens(matchingContextUsage.input_tokens)} tokens
+													{" "}<span className="text-muted-foreground">
+														({cacheReadPercent}% cached)
+													</span>
+												</p>
+											</>
+										)}
+									</PopoverContent>
+								</Popover>
 							)}
 						</div>
 
@@ -491,7 +605,7 @@ export function ChatInput({
 								variant="destructive"
 								aria-label="Stop generation"
 								title="Stop generation"
-								className="size-11 rounded-full sm:size-7"
+								className="size-11 rounded-full"
 							>
 								<Square className="h-3 w-3 fill-current" />
 							</Button>
@@ -501,10 +615,10 @@ export function ChatInput({
 								disabled={!canSend}
 								size="icon-sm"
 								aria-label="Send message"
-								className="size-11 rounded-full sm:size-7"
+								className="size-11 rounded-full"
 							>
 								{isSubmitting ? (
-									<Loader2 className="h-4 w-4 animate-spin" />
+									<Loader2 className="h-4 w-4 animate-spin motion-reduce:animate-none" />
 								) : (
 									<ArrowUp className="h-4 w-4" />
 								)}
@@ -512,7 +626,7 @@ export function ChatInput({
 						)}
 					</div>
 				</div>
-				<p className="mt-2 text-center text-[11px] text-muted-foreground">
+				<p className="mt-2 shrink-0 text-center text-[11px] text-muted-foreground">
 					AI can make mistakes. Check important results.
 				</p>
 			</div>

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import subprocess
 import uuid
+from contextlib import asynccontextmanager
 
 import pytest
 
 import src.services.sdk_package as sdkpkg
+from shared.app_build_errors import AppBuildMemoryError
 from src.services.solutions import app_build as ab
 from src.services.solutions.app_build import SolutionAppBuilder
 from src.services.solutions.deploy import SolutionDeployConflict
@@ -165,6 +167,74 @@ def test_build_timeout_translated_to_deploy_failure(monkeypatch):
         b.compile_dist(app_id, src_files={}, dependencies={}, prebuilt_dist=None)
 
 
+@pytest.mark.parametrize("stage", ["materialize", "vite"])
+def test_build_v8_memory_failure_is_classified(monkeypatch, stage):
+    """Both SDK materialization and Vite preserve actionable OOM diagnostics."""
+    builder = SolutionAppBuilder()
+
+    def _oom(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            1,
+            ["npx", "vite", "build"],
+            stderr=b"FATAL ERROR: JavaScript heap out of memory",
+        )
+
+    if stage == "materialize":
+        monkeypatch.setattr(builder, "_materialize", _oom)
+    else:
+        monkeypatch.setattr(sdkpkg, "build_sdk_tarball", lambda _version: b"FAKE_TGZ")
+        monkeypatch.setattr(builder, "_run_vite_build", _oom)
+
+    with pytest.raises(AppBuildMemoryError) as error:
+        builder.compile_dist(uuid.uuid4(), src_files={}, dependencies={})
+
+    assert "increase the build container's memory limit" in str(error.value)
+
+
+def test_build_python_memory_error_is_classified(monkeypatch):
+    """An allocation failure in the build path reaches callers as build OOM."""
+    monkeypatch.setattr(sdkpkg, "build_sdk_tarball", lambda _version: b"FAKE_TGZ")
+    builder = SolutionAppBuilder()
+    monkeypatch.setattr(
+        builder,
+        "_run_vite_build",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(MemoryError()),
+    )
+
+    with pytest.raises(AppBuildMemoryError) as error:
+        builder.compile_dist(uuid.uuid4(), src_files={}, dependencies={})
+
+    assert str(error.value).startswith("The app build ran out of memory (OOM).")
+
+
+@pytest.mark.e2e
+def test_build_step_failure_surfaces_tool_output(monkeypatch):
+    """A failing npm/vite step surfaces as the deploy's build-failure exception
+    carrying the tail of the tool's stderr, so the deploy job reports the cause."""
+
+    monkeypatch.setattr(sdkpkg, "build_sdk_tarball", lambda v: b"FAKE_TGZ")
+    app_id = uuid.uuid4()
+    b = SolutionAppBuilder()
+    stderr = b"".join(f"npm verbose line {i}\n".encode() for i in range(40))
+    stderr += b"npm error Cannot read properties of null (reading 'edgesOut')\n"
+
+    def _fail(workdir, base="/"):
+        raise subprocess.CalledProcessError(
+            1, ["npm", "install", "--no-audit"], output=b"", stderr=stderr
+        )
+
+    monkeypatch.setattr(b, "_run_vite_build", _fail)
+
+    with pytest.raises(SolutionDeployConflict) as raised:
+        b.compile_dist(app_id, src_files={}, dependencies={}, prebuilt_dist=None)
+
+    message = str(raised.value)
+    assert message.startswith(f"`npm install` failed for app {app_id} (exit 1):")
+    assert message.endswith("npm error Cannot read properties of null (reading 'edgesOut')")
+    assert "npm verbose line 20" not in message
+    assert len(message.splitlines()) == 1 + ab._FAILURE_OUTPUT_LINES
+
+
 @pytest.mark.e2e
 async def test_redeploy_clears_stale_dist_files(monkeypatch):
     """A second build with a different file set must not leave the old files
@@ -187,3 +257,58 @@ async def test_redeploy_clears_stale_dist_files(monkeypatch):
     )
     assert await b.read_dist(app_id, "assets/new-bbb.js") == b"//new"
     assert "assets/old-aaa.js" not in await b.list_dist(app_id)
+
+
+@pytest.mark.e2e
+async def test_delete_all_app_artifacts_deletes_legacy_and_versioned_paginated(
+    monkeypatch,
+):
+    app_id = uuid.uuid4()
+    prefix = f"_apps/{app_id}/"
+    pages = {
+        None: {
+            "Contents": [
+                {"Key": f"{prefix}dist/index.html"},
+                {"Key": f"{prefix}deployments/{uuid.uuid4()}/dist/index.html"},
+            ],
+            "IsTruncated": True,
+            "NextContinuationToken": "page-2",
+        },
+        "page-2": {
+            "Contents": [
+                {"Key": f"{prefix}deployments/{uuid.uuid4()}/dist/assets/app.js"},
+            ],
+            "IsTruncated": False,
+        },
+    }
+    deleted: list[str] = []
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def list_objects_v2(self, **kwargs):
+            assert kwargs["Prefix"] == prefix
+            return pages[kwargs.get("ContinuationToken")]
+
+        async def delete_object(self, **kwargs):
+            deleted.append(kwargs["Key"])
+
+    b = SolutionAppBuilder()
+
+    @asynccontextmanager
+    async def _client():
+        yield _FakeClient()
+
+    monkeypatch.setattr(b, "_client", _client)
+
+    await b.delete_all_app_artifacts(app_id)
+
+    assert deleted == [
+        pages[None]["Contents"][0]["Key"],
+        pages[None]["Contents"][1]["Key"],
+        pages["page-2"]["Contents"][0]["Key"],
+    ]

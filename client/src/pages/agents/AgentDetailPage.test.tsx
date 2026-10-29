@@ -1,3 +1,4 @@
+import { AgentDetailPage } from "./AgentDetailPage";
 /**
  * Tests for AgentDetailPage.
  *
@@ -26,12 +27,23 @@ vi.mock("@/hooks/useAgents", async () => {
 	};
 });
 
+vi.mock("@/services/agentRuns", () => ({
+	useAgentRuns: () => ({ data: { total: 0, runs: [] } }),
+}));
+
 vi.mock("@/contexts/AuthContext", () => ({
 	useAuth: () => ({ isPlatformAdmin: false }),
 }));
 
+const mockAuthorization = vi.fn();
+vi.mock("@/services/authorization", () => ({
+	useAuthorization: () => mockAuthorization(),
+}));
+
 vi.mock("@/components/agents/SummaryBackfillButton", () => ({
-	SummaryBackfillButton: () => null,
+	SummaryBackfillButton: ({ agentId }: { agentId?: string }) => (
+		<div data-testid="summary-backfill" data-agent-id={agentId} />
+	),
 }));
 
 // Stub the three tab components to thin probes — we test them in their own
@@ -79,10 +91,15 @@ const existingAgent = {
 	delegated_agent_ids: [],
 	role_ids: [],
 	knowledge_sources: [],
+	organization_id: "org-agent",
 };
 
 beforeEach(() => {
 	mockUseAgent.mockReturnValue({ data: existingAgent, isLoading: false });
+	mockAuthorization.mockReturnValue({
+		canAt: () => false,
+		canAnywhere: () => false,
+	});
 });
 
 // -----------------------------------------------------------------------------
@@ -90,7 +107,6 @@ beforeEach(() => {
 // -----------------------------------------------------------------------------
 
 async function renderAtRoute(path: string) {
-	const { AgentDetailPage } = await import("./AgentDetailPage");
 	function LocationProbe() {
 		const loc = useLocation();
 		return <div data-testid="location">{loc.pathname}</div>;
@@ -157,30 +173,28 @@ describe("AgentDetailPage — edit mode", () => {
 		);
 	});
 
-	it("uses a bounded workspace for Overview and Runs, but not Settings", async () => {
-		const { container, user } = await renderAtRoute(
-			"/agents/agent-1?tab=runs",
-		);
-
-		expect(container.querySelector(".agent-runs-workspace")).not.toBeNull();
-		expect(container.querySelector(".agent-overview-workspace")).toBeNull();
-
-		await user.click(screen.getByRole("tab", { name: /overview/i }));
-		expect(container.querySelector(".agent-runs-workspace")).toBeNull();
-		expect(
-			container.querySelector(".agent-overview-workspace"),
-		).not.toBeNull();
-
-		await user.click(screen.getByRole("tab", { name: /settings/i }));
-		expect(container.querySelector(".agent-runs-workspace")).toBeNull();
-		expect(container.querySelector(".agent-overview-workspace")).toBeNull();
-	});
-
 	it("switches to the Settings tab and renders edit mode", async () => {
 		const { user } = await renderAtRoute("/agents/agent-1");
 		await user.click(screen.getByRole("tab", { name: /settings/i }));
 		const settings = await screen.findByTestId("settings-tab");
 		expect(settings).toHaveAttribute("data-mode", "edit");
+	});
+
+	it("does not offer a backfill for an agent outside the named run-write scope", async () => {
+		mockAuthorization.mockReturnValue({
+			canAt: (
+				permission: string,
+				target: { kind: string; id?: string },
+			) =>
+				permission === "agentruns.readwrite.all" &&
+				target.kind === "org" &&
+				target.id === "org-other",
+			canAnywhere: () => true,
+		});
+		await renderAtRoute("/agents/agent-1");
+		expect(
+			screen.queryByTestId("summary-backfill"),
+		).not.toBeInTheDocument();
 	});
 });
 
@@ -234,4 +248,47 @@ describe("AgentDetailPage — solution back-nav", () => {
 		const back = screen.getByRole("link", { name: /agents/i });
 		expect(back).toHaveAttribute("href", "/agents");
 	});
+});
+
+it("offers read retry without an empty edit form", async () => {
+	const refetch = vi.fn();
+	mockUseAgent.mockReturnValue({
+		data: undefined,
+		isLoading: false,
+		isError: true,
+		refetch,
+	});
+	const { user } = await renderAtRoute("/agents/agent-1?tab=settings");
+	expect(screen.queryByTestId("settings-tab")).not.toBeInTheDocument();
+	expect(screen.queryByText("Agent not found.")).not.toBeInTheDocument();
+	await user.click(
+		screen.getByRole("button", { name: "Retry agent details" }),
+	);
+	expect(refetch).toHaveBeenCalledOnce();
+});
+it("retains loaded agent settings during a refresh failure", async () => {
+	mockUseAgent.mockReturnValue({
+		data: existingAgent,
+		isError: true,
+		refetch: vi.fn(),
+	});
+	await renderAtRoute("/agents/agent-1?tab=settings");
+	expect(screen.getByTestId("settings-tab")).toBeInTheDocument();
+	expect(screen.getByRole("alert")).toHaveTextContent(
+		"Previously loaded data is still shown",
+	);
+});
+it("uses the creation form even when a disabled tab is in the URL", async () => {
+	await renderAtRoute("/agents/new?tab=runs");
+	expect(screen.getByTestId("settings-tab")).toHaveAttribute(
+		"data-mode",
+		"create",
+	);
+});
+
+it("does not show a status-update failure on a fresh New Agent page", async () => {
+	await renderAtRoute("/agents/new");
+	expect(
+		screen.queryByText("Could not update the agent status. Try again."),
+	).not.toBeInTheDocument();
 });

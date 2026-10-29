@@ -9,28 +9,38 @@ Tables follow the same scoping pattern as configs:
 - organization_id = UUID: Organization-scoped table
 """
 
-import logging
-from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Body, HTTPException, Query, status
 from pydantic import ValidationError
-from sqlalchemy import String, cast, func, select
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import ColumnElement
 
-from shared.claims.preresolve import preresolve_for_policies
 from shared.claims.registry import referenced_claim_names
-from shared.policies.probe import (
-    compile_read_filter,
-    evaluate_action,
+from shared.table_document_writes import (
+    BatchDocumentInput,
+    TableWriteError,
+    batch_delete_table_documents,
+    batch_write_table_documents,
+    delete_table_document,
+    insert_table_document,
+    update_table_document,
+    upsert_table_document,
 )
-from src.core.auth import Context, CurrentSuperuser
-from src.core.principal import UserPrincipal
-from src.core.constants import SYSTEM_USER_UUID
-from src.core.log_safety import log_safe
-from src.core.org_filter import resolve_org_filter, resolve_target_org
+from shared.table_documents import (
+    count_table_documents,
+    get_table_document,
+    query_table_documents,
+)
+from shared.table_resolution import (
+    assert_explicit_scope_targets_table as _assert_explicit_scope_targets_table,
+    assert_solution_write_targets_owned_table as _assert_solution_write_targets_owned_table,
+    get_table_or_404,
+    resolve_target_org_safe as _resolve_target_org_safe,
+)
+from src.core.auth import Context, CurrentActiveUser
 from src.models.contracts.policies import (
     PolicyRuleRef,
     PolicyValidationError,
@@ -55,458 +65,35 @@ from src.models.contracts.tables import (
     TableUpdate,
 )
 from src.models.orm.custom_claims import CustomClaim as CustomClaimORM
-from src.models.orm.tables import Document, Table
-from src.services.solutions.guard import assert_entity_id_not_solution_managed
-from src.services.solution_scope import (
-    resolve_solution_table_by_name,
-    solution_context_id,
-)
-from src.services.table_policy_loader import load_resolved_table_policies
-from src.repositories.tables import TableRepository
-from src.core.pubsub import publish_document_change, publish_policy_changed
+from src.models.orm.organizations import Organization
+from src.models.orm.tables import Table
 from src.services.audit import emit_audit
-
-logger = logging.getLogger(__name__)
+from src.services.solutions.guard import assert_entity_id_not_solution_managed
+from src.repositories.tables import TableRepository
+from src.core.pubsub import (
+    publish_policy_changed,
+)
+from src.services.operation_catalog import operation_route
+from src.services.authorization.enforce import (
+    load_caller,
+    operation_reach,
+    org_target,
+    require_operation,
+    user_reach,
+)
 
 router = APIRouter(prefix="/api/tables", tags=["Tables"])
 
 
 
-def _resolve_attribution(
-    user: UserPrincipal,
-    body_created_by: str | None,
-    body_updated_by: str | None,
-) -> tuple[str, str]:
-    """Decide attribution (created_by, updated_by) for a document write.
-
-    If the body carries either field, the caller must be the engine
-    (SYSTEM_USER_UUID) or a platform admin (is_superuser); otherwise we 403
-    so a regular user can't forge attribution.
-
-    Defaulting:
-    - both omitted → both default to the caller's id.
-    - only created_by provided → updated_by mirrors it (same actor on first write).
-    - only updated_by provided → created_by defaults to the caller (only meaningful
-      on insert; ignored on the update path).
-    """
-    has_override = body_created_by is not None or body_updated_by is not None
-    if has_override:
-        is_engine = user.user_id == SYSTEM_USER_UUID
-        if not (is_engine or user.is_superuser):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="created_by/updated_by override requires engine or platform-admin caller",
-            )
-    caller = str(user.user_id)
-    created_by = body_created_by or caller
-    updated_by = body_updated_by or body_created_by or caller
-    return (created_by, updated_by)
-
-
-def _row_from_doc(doc: Document) -> dict[str, Any]:
-    """Flatten a Document ORM row into the dict shape the evaluator expects.
-
-    Column-mapped fields (id, created_by, updated_by, created_at, updated_at,
-    table_id) are placed at the top level alongside the JSONB `data` keys, so
-    `{"row": "any_field"}` resolves consistently for both kinds of references.
-    UUIDs are stringified to match what `_resolve_user_field` produces, and
-    datetimes are ISO-stringified so the same dict round-trips cleanly through
-    JSON pubsub / `websocket.send_json` without a custom encoder.
-    """
-    return {
-        **(doc.data or {}),
-        "id": doc.id,
-        "table_id": str(doc.table_id),
-        "created_by": doc.created_by,
-        "updated_by": doc.updated_by,
-        "created_at": doc.created_at.isoformat() if doc.created_at is not None else None,
-        "updated_at": doc.updated_at.isoformat() if doc.updated_at is not None else None,
-    }
-
-
-async def _check_action_or_403(
-    action: str,
-    table: Table,
-    row: dict[str, Any],
-    user: UserPrincipal,
-    *,
-    db: AsyncSession,
-) -> None:
-    """Run evaluate_action; raise 403 with a generic message on deny.
-
-    On denial, emits a `policy.deny` audit row before raising so policy
-    authors can debug "why can't user X read row Y?" via the audit log.
-    The audit record carries actor + table + action metadata only — never
-    the row body or policy names (no info leak via audit). The detail
-    returned to the caller stays intentionally generic.
-
-    IMPORTANT: callers MUST NOT have uncommitted mutations on `db` when
-    calling this — the commit() below would persist them as a side effect
-    of the deny. All current call sites either run this before any
-    mutation or only after read-only operations.
-    """
-    policies = await load_resolved_table_policies(table, db)
-    await preresolve_for_policies(
-        user,
-        policies,
-        db,
-        table.organization_id,
-        table.solution_id,
-    )
-    if evaluate_action(action, policies, row, user):
-        return
-
-    # Resolve the row id only when it's actually a UUID.
-    # Document.id is a string primary key (often non-UUID, e.g. email or
-    # user-provided id). AuditLog.resource_id is UUID | None — try to
-    # coerce, else None.
-    raw_id = row.get("id")
-    resource_id: UUID | None = None
-    if raw_id is not None:
-        try:
-            resource_id = raw_id if isinstance(raw_id, UUID) else UUID(str(raw_id))
-        except (ValueError, TypeError):
-            resource_id = None
-
-    await emit_audit(
-        db,
-        "policy.deny",
-        resource_type="table_document",
-        resource_id=resource_id,
-        outcome="failure",
-        details={
-            "policy_action": action,
-            "table_id": str(table.id),
-            "table_name": table.name,
-        },
-    )
-    # Commit the audit row now — if we let the HTTPException propagate
-    # without committing, the request-scoped session rolls back and the
-    # audit trail is lost. FOOTGUN: this also commits any uncommitted
-    # mutations on `db` from the caller. See docstring — callers must
-    # have a clean session at this point.
-    await db.commit()
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Access denied",
-    )
-
-
-def _escape_like(value: str) -> str:
-    """Escape LIKE/ILIKE wildcard characters in user input."""
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _build_document_filters(base_query: Any, where: dict[str, Any]) -> Any:
-    """Build SQLAlchemy filters from where clause with JSON-native operators.
-
-    Supports:
-    - Simple equality: {"status": "active"}
-    - Comparison operators: {"amount": {"gt": 100, "lte": 1000}}
-    - Contains: {"name": {"contains": "acme"}} (case-insensitive substring)
-    - Starts/ends with: {"name": {"starts_with": "a"}}
-    - IN lists: {"category": {"in": ["a", "b"]}}
-    - NULL checks: {"deleted_at": {"is_null": true}}
-    - Has key: {"field": {"has_key": true}}
-    """
-    for field, value in where.items():
-        json_field = Document.data[field]
-
-        if isinstance(value, dict):
-            # Operator-based filter
-            for op, op_value in value.items():
-                if op == "eq":
-                    if isinstance(op_value, (bool, int, float)):
-                        base_query = base_query.where(Document.data.contains({field: op_value}))
-                    else:
-                        base_query = base_query.where(json_field.astext == str(op_value))
-                elif op == "ne":
-                    if isinstance(op_value, (bool, int, float)):
-                        base_query = base_query.where(~Document.data.contains({field: op_value}))
-                    else:
-                        base_query = base_query.where(json_field.astext != str(op_value))
-                elif op == "contains":
-                    # Case-insensitive substring search
-                    escaped = _escape_like(str(op_value))
-                    base_query = base_query.where(json_field.astext.ilike(f"%{escaped}%"))
-                elif op == "starts_with":
-                    escaped = _escape_like(str(op_value))
-                    base_query = base_query.where(json_field.astext.ilike(f"{escaped}%"))
-                elif op == "ends_with":
-                    escaped = _escape_like(str(op_value))
-                    base_query = base_query.where(json_field.astext.ilike(f"%{escaped}"))
-                elif op == "gt":
-                    base_query = base_query.where(
-                        cast(json_field.astext, String) > str(op_value)
-                    )
-                elif op == "gte":
-                    base_query = base_query.where(
-                        cast(json_field.astext, String) >= str(op_value)
-                    )
-                elif op == "lt":
-                    base_query = base_query.where(
-                        cast(json_field.astext, String) < str(op_value)
-                    )
-                elif op == "lte":
-                    base_query = base_query.where(
-                        cast(json_field.astext, String) <= str(op_value)
-                    )
-                elif op in ("in", "in_"):
-                    if isinstance(op_value, list):
-                        def _jsonb_text(v: Any) -> str:
-                            if isinstance(v, bool):
-                                return str(v).lower()  # True -> "true", False -> "false"
-                            return str(v)
-                        base_query = base_query.where(
-                            json_field.astext.in_([_jsonb_text(v) for v in op_value])
-                        )
-                elif op == "is_null":
-                    if op_value:
-                        base_query = base_query.where(json_field.is_(None))
-                    else:
-                        base_query = base_query.where(json_field.isnot(None))
-                elif op == "has_key":
-                    if op_value:
-                        base_query = base_query.where(Document.data.has_key(field))
-                    else:
-                        base_query = base_query.where(~Document.data.has_key(field))
-        else:
-            # Simple equality — use JSONB containment for type-safe comparison
-            # This handles booleans, numbers, and strings correctly
-            if isinstance(value, (bool, int, float)):
-                base_query = base_query.where(Document.data.contains({field: value}))
-            else:
-                base_query = base_query.where(json_field.astext == str(value))
-
-    return base_query
-
-
-class DocumentRepository:
-    """Repository for document operations within a table."""
-
-    def __init__(self, session: AsyncSession, table: Table):
-        self.session = session
-        self.table = table
-
-    async def insert(
-        self,
-        data: dict[str, Any],
-        created_by: str | None,
-        doc_id: str | None = None,
-        updated_by: str | None = None,
-    ) -> Document:
-        """Insert a new document.
-
-        ``updated_by`` defaults to ``created_by`` so a freshly-inserted row
-        carries a non-null updater (matches the row's ``updated_at`` semantics).
-        Pass an explicit value to attribute the insert to a different actor
-        than the creator (used by the engine when a workflow inserts on
-        behalf of a triggering user).
-        """
-        kwargs: dict[str, Any] = {
-            "table_id": self.table.id,
-            "data": data,
-            "created_by": created_by,
-            "updated_by": updated_by if updated_by is not None else created_by,
-        }
-        if doc_id is not None:
-            kwargs["id"] = doc_id
-        doc = Document(**kwargs)
-        self.session.add(doc)
-        await self.session.flush()
-        await self.session.refresh(doc)
-        return doc
-
-    async def get(self, doc_id: str) -> Document | None:
-        """Get document by ID."""
-        query = select(Document).where(
-            Document.id == doc_id,
-            Document.table_id == self.table.id,
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-
-    async def update(
-        self,
-        doc_id: str,
-        data: dict[str, Any],
-        updated_by: str | None,
-    ) -> Document | None:
-        """Update a document (partial update, merges with existing)."""
-        doc = await self.get(doc_id)
-        if not doc:
-            return None
-
-        # Merge new data with existing
-        merged_data = {**doc.data, **data}
-        doc.data = merged_data
-        doc.updated_by = updated_by
-
-        await self.session.flush()
-        await self.session.refresh(doc)
-        return doc
-
-    async def upsert(
-        self,
-        doc_id: str,
-        data: dict[str, Any],
-        *,
-        created_by: str | None,
-        updated_by: str | None,
-    ) -> tuple[Document, bool]:
-        """Atomic upsert by ``(table_id, id)`` — single round trip.
-
-        Returns ``(doc, inserted)`` where ``inserted`` is True if a new row
-        was created and False if an existing row was updated.
-
-        Replace semantics on conflict (the JSONB ``data`` column is
-        overwritten, not merged). This matches the CLI's prior upsert
-        endpoint and lets workflow callers do an idempotent put without a
-        round trip to fetch + merge first.
-        """
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-        now = datetime.now(timezone.utc)
-        effective_updated_by = updated_by if updated_by is not None else created_by
-        stmt = (
-            pg_insert(Document)
-            .values(
-                id=doc_id,
-                table_id=self.table.id,
-                data=data,
-                created_by=created_by,
-                updated_by=effective_updated_by,
-                created_at=now,
-                updated_at=now,
-            )
-            .on_conflict_do_update(
-                index_elements=["table_id", "id"],
-                set_={
-                    "data": data,
-                    "updated_by": effective_updated_by,
-                    "updated_at": now,
-                },
-            )
-            .returning(Document.id, (Document.created_at == now).label("inserted"))
-        )
-        result = await self.session.execute(stmt)
-        row = result.one()
-        inserted = bool(row.inserted)
-
-        # The upsert ran as raw SQL (bypassing the ORM); any identity-mapped
-        # instance for this row from a prior ``get`` carries pre-write attrs.
-        # Wipe the identity map so the next ``get`` re-reads from the DB.
-        self.session.expunge_all()
-        doc = await self.get(doc_id)
-        assert doc is not None  # we just upserted it
-        return doc, inserted
-
-    async def delete(self, doc_id: str) -> bool:
-        """Delete a document."""
-        doc = await self.get(doc_id)
-        if not doc:
-            return False
-
-        await self.session.delete(doc)
-        await self.session.flush()
-        return True
-
-    async def query(
-        self,
-        query_params: DocumentQuery,
-        *,
-        extra_where: ColumnElement | None = None,
-    ) -> tuple[list[Document], int]:
-        """Query documents with filtering and pagination.
-
-        ``extra_where`` is ANDed into the WHERE clause before pagination —
-        used by the REST handlers to push a compiled policy read-filter
-        down into the SQL query.
-        """
-        base_query = select(Document).where(Document.table_id == self.table.id)
-
-        # Apply where filters using JSON-native operators
-        if query_params.where:
-            base_query = _build_document_filters(base_query, query_params.where)
-
-        if extra_where is not None:
-            base_query = base_query.where(extra_where)
-
-        # Get total count before pagination (skip if caller doesn't need it)
-        if not query_params.skip_count:
-            count_query = base_query.with_only_columns(func.count()).order_by(None)
-            count_result = await self.session.execute(count_query)
-            total = count_result.scalar() or 0
-        else:
-            total = -1
-
-        # Apply ordering. Always append `Document.id` as a secondary sort key
-        # so OFFSET/LIMIT pagination is stable when the primary key has ties
-        # (e.g. rows inserted in the same transaction share `created_at`).
-        # Without a tiebreaker, Postgres returns tied rows in arbitrary order
-        # and the same id can appear on adjacent pages — or be skipped entirely.
-        if query_params.order_by:
-            # Order by JSONB field
-            order_expr = Document.data[query_params.order_by].astext
-            if query_params.order_dir == "desc":
-                order_expr = order_expr.desc()
-            base_query = base_query.order_by(order_expr, Document.id)
-        else:
-            # Default ordering by created_at
-            if query_params.order_dir == "desc":
-                base_query = base_query.order_by(
-                    Document.created_at.desc(), Document.id
-                )
-            else:
-                base_query = base_query.order_by(
-                    Document.created_at.asc(), Document.id
-                )
-
-        # Apply pagination
-        base_query = base_query.offset(query_params.offset).limit(query_params.limit)
-
-        result = await self.session.execute(base_query)
-        documents = list(result.scalars().all())
-
-        return documents, total
-
-    async def count(
-        self,
-        where: dict[str, Any] | None = None,
-        *,
-        extra_where: ColumnElement | None = None,
-    ) -> int:
-        """Count documents matching filter.
-
-        ``extra_where`` is ANDed in alongside the user-provided filters.
-        """
-        base_query = select(Document).where(Document.table_id == self.table.id)
-
-        if where:
-            base_query = _build_document_filters(base_query, where)
-
-        if extra_where is not None:
-            base_query = base_query.where(extra_where)
-
-        count_query = base_query.with_only_columns(func.count()).order_by(None)
-        result = await self.session.execute(count_query)
-        return result.scalar() or 0
+def _table_write_http_error(exc: TableWriteError) -> HTTPException:
+    """Map a transport-neutral service error to its HTTP equivalent."""
+    return HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
 # =============================================================================
 # Helper functions
 # =============================================================================
-
-
-def _resolve_target_org_safe(ctx: Context, scope: str | None) -> UUID | None:
-    """Resolve the target organization ID from scope parameter (with auth check)."""
-    try:
-        return resolve_target_org(ctx.user, scope, ctx.org_id)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
-        )
 
 
 def _validate_policy_claim_refs(
@@ -561,83 +148,27 @@ async def _validate_table_policy_claim_refs(
         _validate_policy_claim_refs(policy.when, known)
 
 
-async def get_table_or_404(
-    ctx: Context,
-    name_or_id: str,
-    scope: str | None = None,
-) -> Table:
-    """Get table by name or UUID, raise 404 if not found.
-
-    Routes both UUID and name lookups through ``OrgScopedRepository.get``,
-    which already enforces the org gate (its ID-lookup branch returns None
-    for non-superusers reaching outside their own-or-global scope). Avoids
-    bypassing the gate with raw SELECT.
-
-    Install-scoped name resolution (a Solution app via ``X-Bifrost-App`` OR a
-    solution workflow via ``ctx.solution_id``) is handled in
-    ``resolve_solution_table_by_name`` — own-first, then the org/_repo/ cascade.
-    Gated by the org check.
-    """
-    target_org_id = _resolve_target_org_safe(ctx, scope)
-    repo = TableRepository(
-        ctx.db,
-        target_org_id,
-        is_superuser=ctx.user.is_superuser,
-        is_external=ctx.user.is_external,
-    )
-
-    # Try UUID lookup first — repo.get(id=...) enforces the org gate for
-    # non-superusers (returns None if entity is in a different org).
-    table: Table | None = None
-    try:
-        table_uuid = UUID(name_or_id)
-        table = await repo.get(id=table_uuid)
-    except ValueError:
-        # Not a UUID — fall through to name-based lookup
-        logger.debug(
-            f"table identifier {log_safe(name_or_id)!r} is not a UUID, "
-            "falling back to name lookup"
-        )
-    solution_id = await solution_context_id(ctx.db, ctx)
-    if table is not None and solution_id is not None and table.solution_id != solution_id:
-        table = None
-
-    # Fall back to name lookup (cascade scoping: org-specific then global).
-    if not table:
-        # A Solution app (X-Bifrost-App header) references a table by NAME but
-        # can't know the per-install remapped id — resolve its OWN install's
-        # table. Without this, the name cascade excludes solution-managed rows
-        # and every row op 404s even though the app deployed the table (Codex #15).
-        # The lookup is GATED to the caller's org scope (Codex #16): the
-        # X-Bifrost-App header is client-supplied, so it must NOT let a caller
-        # reach a table in an org they can't see by passing a foreign app id.
-        install_table = await resolve_solution_table_by_name(
-            ctx.db, ctx, name_or_id, target_org_id
-        )
-        if install_table is not None:
-            table = install_table
-        elif solution_id is not None:
-            table = None
-        else:
-            table = await repo.get_by_name(name_or_id)
-
-    if not table:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Table '{name_or_id}' not found",
-        )
-
-    return table
-
-
-async def _assert_solution_write_targets_owned_table(ctx: Context, table: Table) -> None:
-    solution_id = await solution_context_id(ctx.db, ctx)
-    if solution_id is None or table.solution_id == solution_id:
+async def _validate_table_target_org(
+    db: AsyncSession,
+    organization_id: UUID | None,
+) -> None:
+    """Reject a non-existent target organization before a foreign-key flush."""
+    if organization_id is None:
         return
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Table '{table.name}' not found",
+    exists = await db.scalar(
+        select(Organization.id).where(Organization.id == organization_id)
     )
+    if exists is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "Invalid Table target",
+                "errors": [
+                    f"organization_id '{organization_id}' does not reference "
+                    "an existing organization"
+                ],
+            },
+        )
 
 
 # =============================================================================
@@ -650,11 +181,11 @@ async def _assert_solution_write_targets_owned_table(ctx: Context, table: Table)
     response_model=TablePublic,
     status_code=status.HTTP_201_CREATED,
     summary="Create a table",
-)
+**operation_route("tables.create"))
 async def create_table(
     data: TableCreate,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     scope: str | None = Query(
         default=None,
         description="Target scope: 'global' or org UUID. Defaults to current org.",
@@ -671,9 +202,14 @@ async def create_table(
     if "organization_id" in (data.model_fields_set or set()):
         target_org_id = data.organization_id
     elif scope is not None:
-        target_org_id = _resolve_target_org_safe(ctx, scope)
+        target_org_id = await _resolve_target_org_safe(ctx, scope)
     else:
         target_org_id = ctx.org_id
+    caller = await load_caller(ctx.db, ctx.user)
+    if not user_reach(caller).covers(target_org_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requested scope is outside the caller's organization reach")
+    require_operation(caller, "tables.create", org_target(target_org_id))
+    await _validate_table_target_org(ctx.db, target_org_id)
     try:
         await _validate_table_policy_claim_refs(ctx.db, target_org_id, data.policies)
     except ValueError as e:
@@ -685,38 +221,53 @@ async def create_table(
     repo = TableRepository(ctx.db, target_org_id, is_superuser=True)
     try:
         table = await repo.create_table(data, created_by=user.email)
-        return TablePublic.model_validate(table)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
         )
 
+    await emit_audit(
+        ctx.db,
+        "table.create",
+        resource_type="table",
+        resource_id=table.id,
+        details={
+            "name": table.name,
+            "organization_id": (
+                str(table.organization_id) if table.organization_id else None
+            ),
+        },
+    )
+    return TablePublic.model_validate(table)
+
 
 @router.get(
     "",
     response_model=TableListResponse,
     summary="List tables",
-)
+**operation_route("tables.list"))
 async def list_tables(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     scope: str | None = Query(
         default=None,
         description="Filter scope: 'global' for global only, org UUID for specific org.",
     ),
 ) -> TableListResponse:
-    """List all tables in the current scope (platform admin only)."""
-    try:
-        filter_type, filter_org = resolve_org_filter(ctx.user, scope)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
-        )
-
-    repo = TableRepository(ctx.db, filter_org, is_superuser=True)
-    tables = await repo.list_tables(filter_type)
+    """List table metadata only where the caller holds ``tables.read``."""
+    caller = await load_caller(ctx.db, ctx.user)
+    reach = operation_reach(caller, "tables.list")
+    stmt = select(Table)
+    if scope is not None:
+        target_org_id = await _resolve_target_org_safe(ctx, scope)
+        require_operation(caller, "tables.list", org_target(target_org_id))
+        stmt = stmt.where(Table.organization_id == target_org_id)
+    else:
+        predicate = reach.where(Table.organization_id)
+        if predicate is not None:
+            stmt = stmt.where(predicate)
+    tables = (await ctx.db.execute(stmt.order_by(Table.name))).scalars().all()
 
     return TableListResponse(
         tables=[TablePublic.model_validate(t) for t in tables],
@@ -778,7 +329,7 @@ def _split_value_error_msg(msg: str) -> tuple[str, bool, str]:
 )
 async def validate_policies(
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
     body: Any = Body(...),
 ) -> PolicyValidationResponse:
     """Validate a candidate ``TablePolicies`` payload.
@@ -797,11 +348,13 @@ async def validate_policies(
     ``actions``) goes through the standard ``loc``-tuple → path conversion
     via ``_loc_to_path``.
 
-    Auth: matches the rest of the tables router (``CurrentSuperuser``).
-    The validator does not touch any tenant data, but tables are
-    superuser-only resources so the endpoint should not be reachable to
-    non-admin callers either.
+    Auth: requires ``tables.readwrite`` at the current organization target.
     """
+    require_operation(
+        await load_caller(ctx.db, ctx.user),
+        "POST /api/tables/policies/validate",
+        org_target(ctx.org_id),
+    )
     if not isinstance(body, dict):
         return PolicyValidationResponse(
             ok=False,
@@ -900,20 +453,27 @@ async def validate_policies(
     "/{table_id}",
     response_model=TablePublic,
     summary="Get table metadata",
-)
+**operation_route("tables.get"))
 async def get_table(
     table_id: UUID,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
 ) -> TablePublic:
-    """Get table metadata by UUID (platform admin only)."""
-    result = await ctx.db.execute(select(Table).where(Table.id == table_id))
+    """Get table metadata at its actual organization target."""
+    caller = await load_caller(ctx.db, ctx.user)
+    reach = operation_reach(caller, "tables.get")
+    stmt = select(Table).where(Table.id == table_id)
+    predicate = reach.where(Table.organization_id)
+    if predicate is not None:
+        stmt = stmt.where(predicate)
+    result = await ctx.db.execute(stmt)
     table = result.scalar_one_or_none()
     if not table:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Table '{table_id}' not found",
         )
+    require_operation(caller, "tables.get", org_target(table.organization_id))
     return TablePublic.model_validate(table)
 
 
@@ -921,33 +481,59 @@ async def get_table(
     "/{table_id}",
     response_model=TablePublic,
     summary="Update table",
-)
+**operation_route("tables.update"))
 async def update_table(
     table_id: UUID,
     data: TableUpdate,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
 ) -> TablePublic:
     """Update table metadata by ID (platform admin only).
 
     Solution-managed tables are read-only here: deploy owns schema + policies.
     Row DATA (documents) stays editable — that's runtime state (criterion 7).
     """
+    caller = await load_caller(ctx.db, ctx.user)
+    reach = operation_reach(caller, "tables.update")
+    stmt = select(Table).where(Table.id == table_id)
+    predicate = reach.where(Table.organization_id)
+    if predicate is not None:
+        stmt = stmt.where(predicate)
+    existing_table = (await ctx.db.execute(stmt)).scalar_one_or_none()
+    if existing_table is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Table '{table_id}' not found",
+        )
+    require_operation(
+        caller, "tables.update", org_target(existing_table.organization_id)
+    )
     await assert_entity_id_not_solution_managed(ctx.db, Table, table_id)
-    if "policies" in data.model_fields_set:
-        existing_table = (
-            await ctx.db.execute(select(Table).where(Table.id == table_id))
-        ).scalar_one_or_none()
-        if existing_table is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Table '{table_id}' not found",
+    policy_or_scope_changed = bool(
+        {"policies", "organization_id"} & data.model_fields_set
+    )
+    if policy_or_scope_changed:
+        effective_org_id = (
+            data.organization_id
+            if "organization_id" in data.model_fields_set
+            else existing_table.organization_id
+        )
+        require_operation(caller, "tables.update", org_target(effective_org_id))
+        effective_policies = (
+            data.policies
+            if "policies" in data.model_fields_set
+            else (
+                TablePolicies.model_validate(existing_table.access)
+                if existing_table.access is not None
+                else None
             )
+        )
+        await _validate_table_target_org(ctx.db, effective_org_id)
         try:
             await _validate_table_policy_claim_refs(
                 ctx.db,
-                existing_table.organization_id,
-                data.policies,
+                effective_org_id,
+                effective_policies,
                 existing_table.solution_id,
             )
         except ValueError as e:
@@ -956,13 +542,21 @@ async def update_table(
                 detail=str(e),
             )
 
+    original_org_id = existing_table.organization_id
+
     repo = TableRepository(ctx.db, ctx.org_id, is_superuser=True)
     try:
         table = await repo.update_table(table_id, data)
-    except ValueError as e:
+    except (IntegrityError, ValueError) as e:
+        await ctx.db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Table '{data.name or existing_table.name}' already exists "
+                "in the target scope"
+                if isinstance(e, IntegrityError)
+                else str(e)
+            ),
         )
 
     if not table:
@@ -970,6 +564,25 @@ async def update_table(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Table '{table_id}' not found",
         )
+
+    audit_details: dict[str, Any] = {
+        "name": table.name,
+        "fields": sorted(data.model_fields_set),
+    }
+    if "organization_id" in data.model_fields_set:
+        audit_details["organization_id_before"] = (
+            str(original_org_id) if original_org_id else None
+        )
+        audit_details["organization_id_after"] = (
+            str(table.organization_id) if table.organization_id else None
+        )
+    await emit_audit(
+        ctx.db,
+        "table.update",
+        resource_type="table",
+        resource_id=table.id,
+        details=audit_details,
+    )
 
     if "policies" in data.model_fields_set:
         # Subscribers re-read policies on a separate database connection when
@@ -985,22 +598,55 @@ async def update_table(
     "/{table_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete table",
-)
+**operation_route("tables.delete"))
 async def delete_table(
     table_id: UUID,
     ctx: Context,
-    user: CurrentSuperuser,
+    user: CurrentActiveUser,
 ) -> None:
     """Delete a table and all its documents by ID (platform admin only)."""
-    await assert_entity_id_not_solution_managed(ctx.db, Table, table_id)
-    repo = TableRepository(ctx.db, ctx.org_id, is_superuser=True)
-    success = await repo.delete_table(table_id)
+    from shared.sdk_table_metadata import SDKTableMetadataError, delete_sdk_table
+    caller = await load_caller(ctx.db, ctx.user)
+    reach = operation_reach(caller, "tables.delete")
+    stmt = select(Table).where(Table.id == table_id)
+    predicate = reach.where(Table.organization_id)
+    if predicate is not None:
+        stmt = stmt.where(predicate)
+    existing_table = (await ctx.db.execute(stmt)).scalar_one_or_none()
+    table_name = existing_table.name if existing_table else None
+
+    if existing_table is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Table '{table_id}' not found",
+        )
+
+    try:
+        success = await delete_sdk_table(
+            ctx.db,
+            table_id=table_id,
+            org_id=existing_table.organization_id,
+            caller=caller,
+        )
+    except SDKTableMetadataError as e:
+        raise HTTPException(
+            status_code=e.status_code,
+            detail=e.detail,
+        ) from None
 
     if not success:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Table '{table_id}' not found",
         )
+
+    await emit_audit(
+        ctx.db,
+        "table.delete",
+        resource_type="table",
+        resource_id=table_id,
+        details={"name": table_name},
+    )
 
 
 # =============================================================================
@@ -1026,47 +672,19 @@ async def insert_document(
     """Insert a new document into the table."""
     table = await get_table_or_404(ctx, table_id, scope=scope)
     await _assert_solution_write_targets_owned_table(ctx, table)
-    repo = DocumentRepository(ctx.db, table)
-    created_by, updated_by = _resolve_attribution(
-        ctx.user, body.created_by, body.updated_by
-    )
-
-    if body.upsert and body.id:
-        # Upsert: update if exists, otherwise insert. Check `update` against
-        # the existing row, `create` against the candidate row.
-        existing = await repo.get(body.id)
-        if existing is not None:
-            old_row = _row_from_doc(existing)
-            await _check_action_or_403("update", table, old_row, ctx.user, db=ctx.db)
-            doc = await repo.update(body.id, body.data, updated_by=updated_by)
-            if doc is None:
-                raise HTTPException(status_code=404, detail="Document not found")
-            await ctx.db.commit()
-            await publish_document_change(
-                table_id=str(table.id),
-                action="update",
-                old_row=old_row,
-                new_row=_row_from_doc(doc),
-            )
-            return DocumentPublic.model_validate(doc)
-
-    candidate_row: dict[str, Any] = {
-        **body.data,
-        "id": body.id,
-        "created_by": created_by,
-        "updated_by": updated_by,
-    }
-    await _check_action_or_403("create", table, candidate_row, ctx.user, db=ctx.db)
-    doc = await repo.insert(
-        body.data, created_by=created_by, doc_id=body.id, updated_by=updated_by
-    )
-    await ctx.db.commit()
-    await publish_document_change(
-        table_id=str(table.id),
-        action="insert",
-        old_row=None,
-        new_row=_row_from_doc(doc),
-    )
+    try:
+        doc = await insert_table_document(
+            ctx.db,
+            table,
+            ctx.user,
+            doc_id=body.id,
+            data=body.data,
+            created_by=body.created_by,
+            updated_by=body.updated_by,
+            upsert=body.upsert,
+        )
+    except TableWriteError as exc:
+        raise _table_write_http_error(exc) from exc
     return DocumentPublic.model_validate(doc)
 
 
@@ -1090,8 +708,8 @@ async def upsert_document(
     PATCH ``/{doc_id}`` for partial updates with merge semantics.
 
     The candidate row is policy-checked for ``create``; if a row already
-    exists, it is also policy-checked for ``update`` against its pre-image.
-    Either denial returns 403; the row is not written.
+    exists, ``update`` is additionally required on BOTH its pre-image and
+    the replaced post-image. Any denial returns 403; the row is not written.
 
     NOTE: This route is declared BEFORE ``GET /{table_id}/documents/{doc_id}``
     so the literal ``/upsert`` segment matches first. Reversing the order
@@ -1099,34 +717,18 @@ async def upsert_document(
     """
     table = await get_table_or_404(ctx, table_id, scope=scope)
     await _assert_solution_write_targets_owned_table(ctx, table)
-    repo = DocumentRepository(ctx.db, table)
-    created_by, updated_by = _resolve_attribution(
-        ctx.user, body.created_by, body.updated_by
-    )
-
-    existing = await repo.get(body.id)
-    old_row: dict[str, Any] | None = None
-    if existing is not None:
-        old_row = _row_from_doc(existing)
-        await _check_action_or_403("update", table, old_row, ctx.user, db=ctx.db)
-    candidate_row: dict[str, Any] = {
-        **body.data,
-        "id": body.id,
-        "created_by": created_by,
-        "updated_by": updated_by,
-    }
-    await _check_action_or_403("create", table, candidate_row, ctx.user, db=ctx.db)
-
-    doc, inserted = await repo.upsert(
-        body.id, body.data, created_by=created_by, updated_by=updated_by
-    )
-    await ctx.db.commit()
-    await publish_document_change(
-        table_id=str(table.id),
-        action="insert" if inserted else "update",
-        old_row=None if inserted else old_row,
-        new_row=_row_from_doc(doc),
-    )
+    try:
+        doc = await upsert_table_document(
+            ctx.db,
+            table,
+            ctx.user,
+            doc_id=body.id,
+            data=body.data,
+            created_by=body.created_by,
+            updated_by=body.updated_by,
+        )
+    except TableWriteError as exc:
+        raise _table_write_http_error(exc) from exc
     return DocumentPublic.model_validate(doc)
 
 
@@ -1153,23 +755,7 @@ async def count_documents(
     count endpoint.
     """
     table = await get_table_or_404(ctx, table_id, scope=scope)
-
-    policies = await load_resolved_table_policies(table, ctx.db)
-    await preresolve_for_policies(
-        ctx.user,
-        policies,
-        ctx.db,
-        table.organization_id,
-        table.solution_id,
-    )
-    read_filter = compile_read_filter(policies, ctx.user)
-    if read_filter is None:
-        # No rule grants read → count zero. Same existence-leak rationale
-        # as `query_documents`.
-        return DocumentCountResponse(count=0)
-
-    repo = DocumentRepository(ctx.db, table)
-    return DocumentCountResponse(count=await repo.count(extra_where=read_filter))
+    return await count_table_documents(ctx.db, table, ctx.user)
 
 
 @router.get(
@@ -1188,12 +774,7 @@ async def get_document(
 ) -> DocumentPublic:
     """Get a document by ID."""
     table = await get_table_or_404(ctx, table_id, scope=scope)
-    repo = DocumentRepository(ctx.db, table)
-    doc = await repo.get(doc_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-    await _check_action_or_403("read", table, _row_from_doc(doc), ctx.user, db=ctx.db)
-    return DocumentPublic.model_validate(doc)
+    return await get_table_document(ctx.db, table, doc_id, ctx.user)
 
 
 @router.patch(
@@ -1211,27 +792,26 @@ async def update_document(
         description="Target organization scope: 'global' or org UUID. Defaults to caller's home org. Provider admins only for non-self orgs.",
     ),
 ) -> DocumentPublic:
-    """Update a document (partial update, merges with existing)."""
+    """Update a document (partial update, merges with existing).
+
+    The ``update`` policy must pass on BOTH the pre-image and the merged
+    post-image — mutating a row into a value the caller could not write
+    (e.g. retargeting ``organization_id``) is denied with 403 and the row
+    is left untouched.
+    """
     table = await get_table_or_404(ctx, table_id, scope=scope)
     await _assert_solution_write_targets_owned_table(ctx, table)
-    repo = DocumentRepository(ctx.db, table)
-    _, updated_by = _resolve_attribution(ctx.user, None, body.updated_by)
-    existing = await repo.get(doc_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-    old_row = _row_from_doc(existing)
-    await _check_action_or_403("update", table, old_row, ctx.user, db=ctx.db)
-    doc = await repo.update(doc_id, body.data, updated_by=updated_by)
-    if doc is None:
-        # Lost a race with a concurrent delete after we fetched + access-checked.
-        raise HTTPException(status_code=404, detail="Document not found")
-    await ctx.db.commit()
-    await publish_document_change(
-        table_id=str(table.id),
-        action="update",
-        old_row=old_row,
-        new_row=_row_from_doc(doc),
-    )
+    try:
+        doc = await update_table_document(
+            ctx.db,
+            table,
+            ctx.user,
+            doc_id=doc_id,
+            data=body.data,
+            updated_by=body.updated_by,
+        )
+    except TableWriteError as exc:
+        raise _table_write_http_error(exc) from exc
     return DocumentPublic.model_validate(doc)
 
 
@@ -1252,21 +832,10 @@ async def delete_document(
     """Delete a document."""
     table = await get_table_or_404(ctx, table_id, scope=scope)
     await _assert_solution_write_targets_owned_table(ctx, table)
-    repo = DocumentRepository(ctx.db, table)
-    existing = await repo.get(doc_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-    old_row = _row_from_doc(existing)
-    await _check_action_or_403("delete", table, old_row, ctx.user, db=ctx.db)
-    deleted = await repo.delete(doc_id)
-    await ctx.db.commit()
-    if deleted:
-        await publish_document_change(
-            table_id=str(table.id),
-            action="delete",
-            old_row=old_row,
-            new_row=None,
-        )
+    try:
+        await delete_table_document(ctx.db, table, ctx.user, doc_id=doc_id)
+    except TableWriteError as exc:
+        raise _table_write_http_error(exc) from exc
 
 
 @router.post(
@@ -1288,36 +857,7 @@ async def query_documents(
     Returns 404 if the table doesn't exist.
     """
     table = await get_table_or_404(ctx, table_id, scope=scope)
-
-    policies = await load_resolved_table_policies(table, ctx.db)
-    await preresolve_for_policies(
-        ctx.user,
-        policies,
-        ctx.db,
-        table.organization_id,
-        table.solution_id,
-    )
-    read_filter = compile_read_filter(policies, ctx.user)
-    if read_filter is None:
-        # No rule grants read → empty result. Don't 403 to avoid leaking
-        # the table's existence to unauthorized callers.
-        return DocumentListResponse(
-            table_id=table.id,
-            documents=[],
-            total=0,
-            limit=query_params.limit,
-            offset=query_params.offset,
-        )
-
-    repo = DocumentRepository(ctx.db, table)
-    documents, total = await repo.query(query_params, extra_where=read_filter)
-    return DocumentListResponse(
-        table_id=table.id,
-        documents=[DocumentPublic.model_validate(d) for d in documents],
-        total=total,
-        limit=query_params.limit,
-        offset=query_params.offset,
-    )
+    return await query_table_documents(ctx.db, table, query_params, ctx.user)
 
 
 @router.post(
@@ -1334,106 +874,40 @@ async def batch_documents(
         description="Target organization scope: 'global' or org UUID. Defaults to caller's home org. Provider admins only for non-self orgs.",
     ),
 ) -> DocumentBatchCreateResponse:
-    """Insert (or upsert) multiple documents in a single request.
-
-    When `upsert=true`, each item with a provided id will be updated if it
-    exists, otherwise inserted. Items without an id are always inserted.
-
-    All-or-nothing on policy denials: any denied row aborts the whole batch
-    with a 403 listing every denied index.
-    """
+    """Insert, merge-upsert, or replace-upsert multiple documents."""
     table = await get_table_or_404(ctx, table_id, scope=scope)
+    await _assert_explicit_scope_targets_table(ctx, table, scope)
     await _assert_solution_write_targets_owned_table(ctx, table)
-    repo = DocumentRepository(ctx.db, table)
-    policies = await load_resolved_table_policies(table, ctx.db)
-    await preresolve_for_policies(
-        ctx.user,
-        policies,
-        ctx.db,
-        table.organization_id,
-        table.solution_id,
-    )
-
-    # Pre-resolve attribution per item up front so any forged-attribution
-    # 403 surfaces before we do work and applies all-or-nothing across
-    # the batch (consistent with the policy-denial semantics below).
-    attribution: list[tuple[str, str]] = [
-        _resolve_attribution(ctx.user, item.created_by, item.updated_by)
-        for item in body.documents
-    ]
-
-    # Pre-flight: check every row up front. Collect ALL denials so the
-    # client sees the full denied set in one response.
-    denied: list[int] = []
-    pre_existing: dict[int, Document] = {}
-    for i, item in enumerate(body.documents):
-        item_created_by, item_updated_by = attribution[i]
-        if body.upsert and item.id:
-            existing = await repo.get(item.id)
-            if existing is not None:
-                pre_existing[i] = existing
-                if not evaluate_action(
-                    "update", policies, _row_from_doc(existing), ctx.user
-                ):
-                    denied.append(i)
-                continue
-        candidate_row: dict[str, Any] = {
-            **item.data,
-            "id": item.id,
-            "created_by": item_created_by,
-            "updated_by": item_updated_by,
-        }
-        if not evaluate_action("create", policies, candidate_row, ctx.user):
-            denied.append(i)
-
-    if denied:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"denied_row_indices": denied},
+    try:
+        outcome = await batch_write_table_documents(
+            ctx.db,
+            table,
+            ctx.user,
+            items=[
+                BatchDocumentInput(
+                    id=item.id,
+                    data=item.data,
+                    created_by=item.created_by,
+                    updated_by=item.updated_by,
+                )
+                for item in body.documents
+            ],
+            mode=body.effective_write_mode,
         )
+    except TableWriteError as exc:
+        raise _table_write_http_error(exc) from exc
 
-    inserted = 0
-    errors: list[dict[str, Any]] = []
-    written: list[Document] = []
-
-    for i, item in enumerate(body.documents):
-        item_created_by, item_updated_by = attribution[i]
-        try:
-            if i in pre_existing:
-                old_row = _row_from_doc(pre_existing[i])
-                doc = await repo.update(item.id, item.data, updated_by=item_updated_by)
-                if doc is not None:
-                    await publish_document_change(
-                        table_id=str(table.id),
-                        action="update",
-                        old_row=old_row,
-                        new_row=_row_from_doc(doc),
-                    )
-                    written.append(doc)
-                inserted += 1
-                continue
-            doc = await repo.insert(
-                item.data,
-                created_by=item_created_by,
-                doc_id=item.id,
-                updated_by=item_updated_by,
-            )
-            await publish_document_change(
-                table_id=str(table.id),
-                action="insert",
-                old_row=None,
-                new_row=_row_from_doc(doc),
-            )
-            written.append(doc)
-            inserted += 1
-        except Exception as exc:
-            errors.append({"id": item.id, "error": str(exc)})
-
-    await ctx.db.commit()
     return DocumentBatchCreateResponse(
-        inserted=inserted,
-        errors=errors,
-        documents=[DocumentPublic.model_validate(d) for d in written],
+        inserted=outcome.inserted,
+        errors=[
+            {"id": conflict.id, "error": "Document already exists"}
+            for conflict in outcome.insert_conflicts
+        ],
+        documents=(
+            [DocumentPublic.model_validate(doc) for doc in outcome.ordered_documents]
+            if body.return_documents
+            else []
+        ),
     )
 
 
@@ -1458,54 +932,12 @@ async def batch_delete_documents(
     """
     table = await get_table_or_404(ctx, table_id, scope=scope)
     await _assert_solution_write_targets_owned_table(ctx, table)
-    repo = DocumentRepository(ctx.db, table)
-    policies = await load_resolved_table_policies(table, ctx.db)
-    await preresolve_for_policies(
-        ctx.user,
-        policies,
-        ctx.db,
-        table.organization_id,
-        table.solution_id,
-    )
-
-    # Pre-flight: load each existing row and check `delete` against policy.
-    denied: list[int] = []
-    existing_by_index: dict[int, Document] = {}
-    for i, doc_id in enumerate(body.ids):
-        existing = await repo.get(doc_id)
-        if existing is None:
-            # Skipping non-existent rows is the documented behavior; not a
-            # denial, just a no-op.
-            continue
-        existing_by_index[i] = existing
-        if not evaluate_action(
-            "delete", policies, _row_from_doc(existing), ctx.user
-        ):
-            denied.append(i)
-
-    if denied:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"denied_row_indices": denied},
+    try:
+        outcome = await batch_delete_table_documents(
+            ctx.db, table, ctx.user, ids=list(body.ids)
         )
-
-    deleted = 0
-    deleted_ids: list[str] = []
-    for i, doc_id in enumerate(body.ids):
-        existing = existing_by_index.get(i)
-        if existing is None:
-            continue
-        old_row = _row_from_doc(existing)
-        ok = await repo.delete(doc_id)
-        if ok:
-            await publish_document_change(
-                table_id=str(table.id),
-                action="delete",
-                old_row=old_row,
-                new_row=None,
-            )
-            deleted += 1
-            deleted_ids.append(doc_id)
-
-    await ctx.db.commit()
-    return DocumentBatchDeleteResponse(deleted=deleted, deleted_ids=deleted_ids)
+    except TableWriteError as exc:
+        raise _table_write_http_error(exc) from exc
+    return DocumentBatchDeleteResponse(
+        deleted=outcome.deleted, deleted_ids=outcome.deleted_ids
+    )

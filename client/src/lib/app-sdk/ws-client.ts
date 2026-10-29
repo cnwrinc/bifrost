@@ -3,18 +3,25 @@ import { getBifrostTransport } from "./transport";
 
 type Expr = components["schemas"]["Expr"];
 
-export type TableChangeMessage = {
-  type: "document_change" | "subscription_revoked" | "error";
-  table_id?: string;
-  action?: "insert" | "update" | "delete";
-  row?: Record<string, unknown> | null;
-  row_id?: string | null;
-  channel?: string;
-  // Populated on `type: "error"` frames — server sends these when a
-  // subscribe is rejected (table not found / policy missing / access denied).
-  // See `_authorize_table_subscribe` in api/src/routers/websocket.py.
-  message?: string;
-};
+export type TableChangeMessage =
+  | {
+      type: "document_change";
+      table_id?: string;
+      action?: "insert" | "update" | "delete";
+      row?: Record<string, unknown> | null;
+      row_id?: string | null;
+      channel?: string;
+    }
+  | { type: "table_invalidated"; table_id: string }
+  | { type: "subscription_revoked"; channel: string }
+  | {
+      type: "error";
+      channel?: string;
+      // Server sends these when a subscribe is rejected (table not found /
+      // policy missing / access denied). See `_authorize_table_subscribe` in
+      // api/src/routers/websocket.py.
+      message: string;
+    };
 
 export type FileChangeMessage =
   | {
@@ -39,7 +46,8 @@ export function buildWsUrl(): string {
   const base = t.baseUrl ? new URL(t.baseUrl) : new URL(window.location.href);
   const proto = base.protocol === "https:" ? "wss:" : "ws:";
   const url = new URL("/ws/connect", `${proto}//${base.host}`);
-  if (t.token) url.searchParams.set("token", t.token);
+	const token = t.getToken?.() ?? t.token;
+	if (token) url.searchParams.set("token", token);
   return url.toString();
 }
 
@@ -177,7 +185,8 @@ export function subscribeToTable(
     onMessage: (message) => {
       onEvent(message as TableChangeMessage);
       return !(
-        message.type === "error" || message.type === "subscription_revoked"
+				message.type === "error" ||
+				message.type === "subscription_revoked"
       );
     },
   });
@@ -202,7 +211,8 @@ export function subscribeToFiles(
     onMessage: (message) => {
       onEvent(message as FileChangeMessage);
       return !(
-        message.type === "error" || message.type === "subscription_revoked"
+				message.type === "error" ||
+				message.type === "subscription_revoked"
       );
     },
   });

@@ -6,6 +6,7 @@
  */
 
 import { AppHeader } from "./AppHeader";
+import { ImpersonationBanner } from "./ImpersonationBanner";
 
 interface AppLayoutProps {
 	/** App name to display in header */
@@ -22,9 +23,12 @@ export function AppLayout({
 	children,
 }: AppLayoutProps) {
 	return (
-		<div className="h-screen flex flex-col bg-background overflow-hidden">
+		<div className="h-dvh flex flex-col bg-background overflow-hidden">
+			<ImpersonationBanner />
 			<AppHeader appName={appName} isPreview={isPreview} />
-			<main className="flex-1 overflow-auto">{children}</main>
+			<main className="min-h-0 min-w-0 flex-1 overflow-auto">
+				{children}
+			</main>
 		</div>
 	);
 }

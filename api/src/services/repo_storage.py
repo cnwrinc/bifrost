@@ -14,9 +14,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
-from aiobotocore.session import get_session
-
 from src.config import Settings, get_settings
+from src.core.s3_transport import S3Error, S3Transport
 
 logger = logging.getLogger(__name__)
 
@@ -28,17 +27,7 @@ class S3FileMetadata:
     """Metadata for a file stored in S3."""
     etag: str
     last_modified: datetime
-
-
-_shared_session = None
-
-
-def _get_shared_session():
-    """Reuse a single aiobotocore session to share the connection pool."""
-    global _shared_session
-    if _shared_session is None:
-        _shared_session = get_session()
-    return _shared_session
+    size: int
 
 
 class RepoStorage:
@@ -50,13 +39,11 @@ class RepoStorage:
 
     @asynccontextmanager
     async def _get_client(self):
-        session = _get_shared_session()
-        async with session.create_client(
-            "s3",
+        async with S3Transport(
             endpoint_url=self._settings.s3_endpoint_url,
-            aws_access_key_id=self._settings.s3_access_key,
-            aws_secret_access_key=self._settings.s3_secret_key,
-            region_name=self._settings.s3_region,
+            access_key_id=self._settings.s3_access_key,
+            secret_access_key=self._settings.s3_secret_key,
+            region=self._settings.s3_region,
         ) as client:
             yield client
 
@@ -117,7 +104,9 @@ class RepoStorage:
                 # S3 ETags are quoted — strip quotes for clean comparison
                 etag = obj["ETag"].strip('"')
                 last_modified = obj["LastModified"]
-                result[rel_path] = S3FileMetadata(etag=etag, last_modified=last_modified)
+                result[rel_path] = S3FileMetadata(
+                    etag=etag, last_modified=last_modified, size=obj["Size"]
+                )
 
             if not response.get("IsTruncated"):
                 break
@@ -227,6 +216,48 @@ class RepoStorage:
                 return True
         except Exception:
             return False
+
+    async def head(self, path: str) -> S3FileMetadata | None:
+        """Return one object's metadata, or None when it does not exist."""
+        async with self._get_client() as client:
+            try:
+                response = await client.head_object(Bucket=self._bucket, Key=self._repo_key(path))
+            except S3Error as exc:
+                if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+                    return None
+                raise
+            return S3FileMetadata(
+                etag=response["ETag"].strip('"'),
+                last_modified=response["LastModified"],
+                size=response["ContentLength"],
+            )
+
+    async def content_hash(self, path: str) -> str | None:
+        """Return a bounded-memory SHA-256 fingerprint, or None when absent."""
+        async with self._get_client() as client:
+            try:
+                response = await client.get_object(
+                    Bucket=self._bucket, Key=self._repo_key(path)
+                )
+            except client.exceptions.NoSuchKey:
+                return None
+            digest = hashlib.sha256()
+            body = response["Body"]
+            async with body:
+                while chunk := await body.read(8 * 1024 * 1024):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+    async def prefix_exists(self, prefix: str) -> bool:
+        """Check if any object exists under a _repo/ prefix."""
+        async with self._get_client() as client:
+            key_prefix = self._repo_key(prefix.rstrip("/") + "/")
+            response = await client.list_objects_v2(
+                Bucket=self._bucket,
+                Prefix=key_prefix,
+                MaxKeys=1,
+            )
+            return response.get("KeyCount", 0) > 0 or bool(response.get("Contents"))
 
     @staticmethod
     def compute_hash(content: bytes) -> str:

@@ -16,17 +16,20 @@ import asyncio
 import base64
 import logging
 import re
-from uuid import UUID
+import tempfile
+from pathlib import Path
+from typing import Literal
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from src.core.auth import Context, CurrentUser
 from src.core.log_safety import log_safe
-from src.core.org_filter import resolve_org_filter
+from src.core.org_filter import OrgFilterType
 from src.core.pubsub import publish_app_draft_update
 from src.models.contracts.applications import (
     ApplicationCreate,
@@ -34,6 +37,10 @@ from src.models.contracts.applications import (
     ApplicationDraftSave,
     ApplicationListResponse,
     ApplicationPublic,
+    ApplicationSdkUpdateAccepted,
+    ApplicationSdkUpdateBatchRequest,
+    ApplicationSdkUpdateBatchResponse,
+    ApplicationSdkUpdateSkipped,
     ApplicationPublishRequest,
     ApplicationReplaceRequest,
     ApplicationRollbackRequest,
@@ -44,13 +51,33 @@ from src.jobs.platform.application_publish import (
     APPLICATION_PUBLISH_DEFINITION,
     ApplicationPublishPayload,
 )
+from src.jobs.platform.application_deploy import (
+    APPLICATION_DEPLOY_DEFINITION,
+    ApplicationDeployPayload,
+)
+from src.jobs.platform.application_sdk_update import (
+    APPLICATION_SDK_UPDATE_DEFINITION,
+    ApplicationSdkUpdatePayload,
+)
 from src.models.contracts.platform_jobs import PlatformJobAccepted
 from src.models.orm.applications import Application
+from src.models.orm.platform_jobs import PlatformJob
 from src.services.platform_jobs import (
+    ACTIVE_PLATFORM_JOB_STATUSES,
     enqueue_platform_job,
     ensure_platform_job_notification,
     publish_platform_job_update,
 )
+from src.services.platform_job_memory_profiles import build_resource_memory_profile_key
+from src.services.application_deploy_storage import ApplicationDeployStorage
+from src.services.application_sdk_status import (
+    CurrentApplicationSdkMetadata,
+    application_sdk_status,
+    load_current_sdk_metadata,
+    sdk_source_available,
+)
+from src.services.application_source_artifact import ApplicationSourceArtifactStorage
+from src.services.audit import emit_audit
 from src.services.solutions.guard import assert_entity_id_not_solution_managed
 from src.core.exceptions import AccessDeniedError
 from shared.logo_processing import (
@@ -58,6 +85,7 @@ from shared.logo_processing import (
     is_logo_thumbnail_version,
     process_logo,
 )
+from shared.scope_resolver import UNSET, RequestedScope, shared_read_organization
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +131,13 @@ def extract_external_deps(content: str) -> set[str]:
 
 
 from src.repositories.applications import ApplicationRepository  # noqa: E402
+from src.services.operation_catalog import operation_route  # noqa: E402
+from src.services.authorization.enforce import (  # noqa: E402
+    Caller,
+    load_caller,
+    require_named_permission,
+    user_reach,
+)
 
 
 # =============================================================================
@@ -131,6 +166,7 @@ async def application_to_public(
     application: Application,
     repo: "ApplicationRepository",
     *,
+    current_sdk: CurrentApplicationSdkMetadata,
     include_inline_logo: bool = True,
 ) -> ApplicationPublic:
     """Convert Application ORM to ApplicationPublic with role_ids."""
@@ -143,6 +179,7 @@ async def application_to_public(
         icon=application.icon,
         organization_id=application.organization_id,
         published_at=application.published_at,
+        deployed_at=application.deployed_at,
         created_at=application.created_at,
         updated_at=application.updated_at,
         created_by=application.created_by,
@@ -168,18 +205,200 @@ async def application_to_public(
         ),
         is_solution_managed=application.solution_id is not None,
         solution_id=application.solution_id,
+        sdk_package_version=application.sdk_package_version,
+        sdk_fingerprint=application.sdk_fingerprint,
+        sdk_contract_version=application.sdk_contract_version,
+        sdk_built_at=application.sdk_built_at,
+        sdk_status=application_sdk_status(application, current_sdk),
+        sdk_source_available=sdk_source_available(application),
     )
+
+
+def _sdk_update_action_skip_reason(
+    application: Application,
+    *,
+    current_sdk: CurrentApplicationSdkMetadata,
+) -> str | None:
+    if application.app_model != "standalone_v2":
+        return "not_applicable"
+    if not sdk_source_available(application):
+        return "source_unavailable"
+    sdk_status = application_sdk_status(application, current_sdk)
+    if sdk_status in ("current", "not_applicable"):
+        return sdk_status
+    return None
+
+
+async def _active_solution_job_exists(ctx: Context, solution_id: UUID) -> bool:
+    return (
+        await ctx.db.execute(
+            select(PlatformJob.id)
+            .where(
+                PlatformJob.resource_lock_key == f"solution:{solution_id}",
+                PlatformJob.status.in_(ACTIVE_PLATFORM_JOB_STATUSES),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None
+
+
+async def _lock_solution_operation(ctx: Context, solution_id: UUID) -> None:
+    await ctx.db.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtext('bifrost:solution-operation:' || :solution_id))"
+        ),
+        {"solution_id": str(solution_id)},
+    )
+
+
+async def _enqueue_sdk_update_for_application(
+    *,
+    ctx: Context,
+    user: CurrentUser,
+    application: Application,
+    response: Response | None = None,
+) -> tuple[PlatformJobAccepted, PlatformJob]:
+    if application.solution_id is not None:
+        await _lock_solution_operation(ctx, application.solution_id)
+        if await _active_solution_job_exists(ctx, application.solution_id):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A Solution deployment is already in progress for this App.",
+            )
+
+    job, reused = await enqueue_platform_job(
+        ctx.db,
+        APPLICATION_SDK_UPDATE_DEFINITION,
+        ApplicationSdkUpdatePayload(
+            application_id=application.id,
+            expected_active_deployment_id=application.active_deployment_id,
+            expected_sdk_package_version=application.sdk_package_version,
+            expected_sdk_fingerprint=application.sdk_fingerprint,
+            expected_sdk_contract_version=application.sdk_contract_version,
+            expected_sdk_built_at=application.sdk_built_at,
+        ),
+        dedupe_key=str(application.id),
+        resource_lock_key=f"application:{application.id}",
+        organization_id=application.organization_id,
+        requested_by_user_id=user.user_id,
+        requested_by_email=user.email,
+        requested_by_name=user.name or user.email or "Unknown",
+        resource_type="application",
+        resource_id=str(application.id),
+        title=f"Updating SDK for {application.name}",
+        action_url=f"/apps/{application.slug}",
+        memory_profile_key=build_resource_memory_profile_key(
+            APPLICATION_SDK_UPDATE_DEFINITION.job_type, application.id
+        ),
+    )
+    if reused and job.requested_by_user_id != str(user.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An App SDK update is already in progress.",
+        )
+    if job.notification_id is None:
+        try:
+            await ensure_platform_job_notification(ctx.db, job)
+        except Exception:
+            logger.warning(
+                "App SDK update queued without a progress notification",
+                extra={"platform_job_id": str(job.id)},
+                exc_info=True,
+            )
+    accepted = PlatformJobAccepted(
+        job_id=job.id,
+        notification_id=job.notification_id,
+        status=job.status,
+        reused=reused,
+    )
+    if response is not None:
+        response.headers["Location"] = f"/api/platform-jobs/{job.id}"
+    return accepted, job
+
+
+def _accepted_item(
+    application_id: UUID, accepted: PlatformJobAccepted
+) -> ApplicationSdkUpdateAccepted:
+    return ApplicationSdkUpdateAccepted(
+        application_id=application_id,
+        job_id=accepted.job_id,
+        status=accepted.status.value,
+        reused=accepted.reused,
+        notification_id=accepted.notification_id,
+    )
+
+
+ApplicationPermission = Literal["apps.readbasic", "apps.read", "apps.readwrite"]
+
+
+async def _application_repository(
+    ctx: Context,
+    caller: Caller,
+    *,
+    org_id: RequestedScope = UNSET,
+    permission: ApplicationPermission = "apps.readbasic",
+    selected_organization_id: RequestedScope = UNSET,
+) -> ApplicationRepository:
+    access_mode: Literal["read", "inspect", "write"] = "read"
+    if permission == "apps.read":
+        access_mode = "inspect"
+    elif permission == "apps.readwrite":
+        access_mode = "write"
+    return ApplicationRepository(
+        ctx.db,
+        shared_read_organization(caller, None) if org_id is UNSET else org_id,
+        caller=caller,
+        access_mode=access_mode,
+        selected_organization_id=selected_organization_id,
+    )
+
+
+async def _get_application_for_caller(
+    ctx: Context,
+    caller: Caller,
+    reference: str | UUID,
+    permission: ApplicationPermission,
+) -> Application:
+    """Map a common resource decision to the existing App HTTP errors."""
+    lookup = {"id": reference} if isinstance(reference, UUID) else {"slug": reference}
+    repo = await _application_repository(ctx, caller, permission=permission)
+    try:
+        # Deployed Apps are usable by slug even though ordinary name lookup
+        # excludes Solution-managed execution resources.
+        application = await repo.can_access(include_solution_managed=True, **lookup)
+    except AccessDeniedError:
+        if permission != "apps.readbasic":
+            reader = await _application_repository(ctx, caller)
+            visible = await reader.get(include_solution_managed=True, **lookup)
+            if visible is not None:
+                # Visible Apps retain a named-permission 403; unavailable
+                # Apps use the same 404 as missing Apps.
+                require_named_permission(caller, permission, visible.organization_id)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Application '{reference}' not found",
+        ) from None
+    target_org = (
+        shared_read_organization(caller, application.organization_id)
+        if permission == "apps.readbasic" else application.organization_id
+    )
+    # Keep the enforced decision in the Access Checks audit trail.
+    require_named_permission(caller, permission, target_org)
+    return application
 
 
 async def get_application_or_404(
     ctx: Context,
     slug: str,
+    *,
+    permission: ApplicationPermission = "apps.readbasic",
 ) -> Application:
     """Get application by slug with access control.
 
     Uses ApplicationRepository for cascade scoping and role-based access.
-    Returns 404 for both not found and access denied to avoid leaking
-    existence information.
+    Unavailable Apps return 404. A visible App without the requested
+    management permission retains its named-permission 403.
 
     Returns:
         Application if found and accessible
@@ -212,42 +431,21 @@ async def get_application_or_404(
             detail=f"Application '{slug}' not found",
         )
 
-    repo = ApplicationRepository(
-        session=ctx.db,
-        org_id=ctx.org_id,
-        user_id=ctx.user.user_id,
-        is_superuser=ctx.user.is_platform_admin,
-        is_external=ctx.user.is_external,
-    )
-    try:
-        if ctx.user.is_platform_admin:
-            # A solution app slug can exist in several orgs (criterion 9). The
-            # admin resolver disambiguates by the active org (then global), so a
-            # legitimate cross-org install doesn't 500 with MultipleResultsFound.
-            app = await repo.get_by_slug_global(slug)
-            if not app:
-                raise AccessDeniedError(f"Application '{slug}' not found")
-            return app
-        # include_solution_managed: a deployed (solution-managed) app MUST be
-        # openable by its slug for regular users (criterion 16) — the deployed
-        # entities are visible/usable even though the Solution itself is not.
-        return await repo.can_access(slug=slug, include_solution_managed=True)
-    except AccessDeniedError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Application '{slug}' not found",
-        )
+    caller = await load_caller(ctx.db, ctx.user)
+    return await _get_application_for_caller(ctx, caller, slug, permission)
 
 
 async def get_application_by_id_or_404(
     ctx: Context,
     app_id: UUID,
+    *,
+    permission: ApplicationPermission = "apps.readbasic",
 ) -> Application:
     """Get application by UUID with access control.
 
     Uses ApplicationRepository for cascade scoping and role-based access.
-    Returns 404 for both not found and access denied to avoid leaking
-    existence information.
+    Unavailable Apps return 404. A visible App without the requested
+    management permission retains its named-permission 403.
 
     Returns:
         Application if found and accessible
@@ -267,20 +465,25 @@ async def get_application_by_id_or_404(
             detail=f"Application '{app_id}' not found",
         )
 
-    repo = ApplicationRepository(
-        session=ctx.db,
-        org_id=ctx.org_id,
-        user_id=ctx.user.user_id,
-        is_superuser=ctx.user.is_platform_admin,
-        is_external=ctx.user.is_external,
+    caller = await load_caller(ctx.db, ctx.user)
+    return await _get_application_for_caller(ctx, caller, app_id, permission)
+
+
+async def get_application_for_write_or_404(
+    ctx: Context,
+    app_id: UUID,
+) -> Application:
+    """Get application by UUID, enforcing write scope.
+
+    Resolves the App against the original caller's reach and requires named
+    write authority at the App's actual organization.
+
+    Unavailable Apps remain 404; visible Apps without write permission
+    retain the existing 403 response.
+    """
+    return await get_application_by_id_or_404(
+        ctx, app_id, permission="apps.readwrite"
     )
-    try:
-        return await repo.can_access(id=app_id)
-    except AccessDeniedError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Application '{app_id}' not found",
-        )
 
 
 # =============================================================================
@@ -293,7 +496,7 @@ async def get_application_by_id_or_404(
     response_model=ApplicationPublic,
     status_code=status.HTTP_201_CREATED,
     summary="Create an application",
-)
+**operation_route("apps.create"))
 async def create_application(
     data: ApplicationCreate,
     ctx: Context,
@@ -305,17 +508,31 @@ async def create_application(
         target_org_id = data.organization_id
     else:
         target_org_id = ctx.org_id
-    repo = ApplicationRepository(
-        ctx.db,
-        target_org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
+    caller = await load_caller(ctx.db, user)
+    if not user_reach(caller).covers(target_org_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    require_named_permission(caller, "apps.readwrite", target_org_id)
+    repo = await _application_repository(ctx, caller, org_id=target_org_id, permission="apps.readwrite")
 
     try:
         application = await repo.create_application(data, created_by=user.email)
-        response = await application_to_public(application, repo)
+        current_sdk = await load_current_sdk_metadata()
+        response = await application_to_public(
+            application,
+            repo,
+            current_sdk=current_sdk,
+        )
+        await emit_audit(
+            ctx.db,
+            "app.create",
+            resource_type="application",
+            resource_id=application.id,
+            details={
+                "name": application.name,
+                "slug": application.slug,
+                "organization_id": str(application.organization_id) if application.organization_id else None,
+            },
+        )
         # The default request-scoped database dependency commits during
         # teardown, after the response may already have been sent.  A caller
         # that immediately uses the returned ID can therefore race that commit
@@ -339,7 +556,7 @@ async def create_application(
     "",
     response_model=ApplicationListResponse,
     summary="List applications",
-)
+**operation_route("apps.list"))
 async def list_applications(
     ctx: Context,
     user: CurrentUser,
@@ -349,32 +566,43 @@ async def list_applications(
     ),
 ) -> ApplicationListResponse:
     """List all applications in the current scope."""
-    try:
-        filter_type, filter_org = resolve_org_filter(ctx.user, scope)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
-        )
-
-    repo = ApplicationRepository(
-        ctx.db,
-        filter_org,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
-
-    # Superusers use list_all_in_scope (respects filter_type, no role checks)
-    # Regular users use list_applications (cascade scope + role checks)
-    if user.is_platform_admin:
-        applications = await repo.list_all_in_scope(filter_type)
+    caller = await load_caller(ctx.db, user)
+    selected_organization_id: RequestedScope = UNSET
+    if scope == "global":
+        filter_type, filter_org = OrgFilterType.GLOBAL_ONLY, None
+        selected_organization_id = None
+    elif scope:
+        try:
+            filter_org = UUID(scope)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid scope value: {scope}",
+            ) from exc
+        if not user_reach(caller).covers(filter_org):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+        filter_type = OrgFilterType.ORG_PLUS_GLOBAL
+        selected_organization_id = filter_org
     else:
-        applications = await repo.list_applications()
+        filter_type, filter_org = OrgFilterType.ALL, None
 
+    repo = await _application_repository(
+        ctx,
+        caller,
+        org_id=filter_org,
+        selected_organization_id=selected_organization_id,
+    )
+    applications = await repo.list_applications(filter_type)
+
+    current_sdk = await load_current_sdk_metadata()
     # Convert each application with role_ids
     public_apps = [
-        await application_to_public(app, repo, include_inline_logo=False)
+        await application_to_public(
+            app,
+            repo,
+            current_sdk=current_sdk,
+            include_inline_logo=False,
+        )
         for app in applications
     ]
 
@@ -384,33 +612,91 @@ async def list_applications(
     )
 
 
+@router.post(
+    "/sdk/update",
+    response_model=ApplicationSdkUpdateBatchResponse,
+    summary="Enqueue SDK updates for Apps",
+)
+async def batch_update_application_sdks(
+    data: ApplicationSdkUpdateBatchRequest,
+    ctx: Context,
+    user: CurrentUser,
+) -> ApplicationSdkUpdateBatchResponse:
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller, permission="apps.readwrite")
+    if data.application_ids is None:
+        applications = await repo.list_all_in_scope("all")
+        for application in applications:
+            require_named_permission(
+                caller, "apps.readwrite", application.organization_id
+            )
+    else:
+        applications = []
+        for app_id in data.application_ids:
+            applications.append(await get_application_for_write_or_404(ctx, app_id))
+
+    current_sdk = await load_current_sdk_metadata()
+    accepted: list[ApplicationSdkUpdateAccepted] = []
+    skipped: list[ApplicationSdkUpdateSkipped] = []
+    jobs: list[PlatformJob] = []
+    for application in applications:
+        reason = _sdk_update_action_skip_reason(application, current_sdk=current_sdk)
+        if reason is not None:
+            skipped.append(
+                ApplicationSdkUpdateSkipped(
+                    application_id=application.id,
+                    reason=reason,
+                )
+            )
+            continue
+        if application.solution_id is not None and await _active_solution_job_exists(
+            ctx, application.solution_id
+        ):
+            skipped.append(
+                ApplicationSdkUpdateSkipped(
+                    application_id=application.id,
+                    reason="solution_deploy_in_progress",
+                )
+            )
+            continue
+        job_accepted, job = await _enqueue_sdk_update_for_application(
+            ctx=ctx,
+            user=user,
+            application=application,
+        )
+        accepted.append(_accepted_item(application.id, job_accepted))
+        jobs.append(job)
+
+    await ctx.db.commit()
+    for job in jobs:
+        await ctx.db.refresh(job)
+        await publish_platform_job_update(job)
+    return ApplicationSdkUpdateBatchResponse(accepted=accepted, skipped=skipped)
+
+
 @router.get(
     "/{slug}",
     response_model=ApplicationPublic,
     summary="Get application metadata",
-)
+**operation_route("apps.get"))
 async def get_application(
     slug: str,
     ctx: Context,
     user: CurrentUser,
 ) -> ApplicationPublic:
     """Get application metadata by slug (globally unique)."""
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller)
     application = await get_application_or_404(ctx, slug)
-    return await application_to_public(application, repo)
+    current_sdk = await load_current_sdk_metadata()
+    return await application_to_public(application, repo, current_sdk=current_sdk)
 
 
 @router.patch(
     "/{app_id}",
     response_model=ApplicationPublic,
     summary="Update application metadata",
-)
+**operation_route("apps.update"))
 async def update_application(
     app_id: UUID,
     data: ApplicationUpdate,
@@ -419,20 +705,33 @@ async def update_application(
 ) -> ApplicationPublic:
     """Update application metadata and access control by ID."""
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
+    existing = await get_application_for_write_or_404(ctx, app_id)
+    caller = await load_caller(ctx.db, user)
+    allow_scope_change = False
+    if data.scope is not None:
+        if data.scope == "global":
+            target_org_id = None
+        else:
+            try:
+                target_org_id = UUID(data.scope)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Application scope must be an organization UUID or 'global'.",
+                ) from exc
+        if not user_reach(caller).covers(target_org_id):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+        require_named_permission(caller, "apps.readwrite", existing.organization_id)
+        require_named_permission(caller, "apps.readwrite", target_org_id)
+        allow_scope_change = True
+    repo = await _application_repository(ctx, caller, permission="apps.readwrite")
 
     try:
         application = await repo.update_application(
             app_id,
             data,
             updated_by=ctx.user.email,
-            is_platform_admin=user.is_platform_admin,
+            allow_scope_change=allow_scope_change,
         )
     except ValueError as e:
         raise HTTPException(
@@ -450,7 +749,6 @@ async def update_application(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Application '{app_id}' not found",
         )
-
     # Emit event for real-time updates
     await publish_app_draft_update(
         app_id=str(application.id),
@@ -460,14 +758,23 @@ async def update_application(
         entity_id=str(application.id),
     )
 
-    return await application_to_public(application, repo)
+    await emit_audit(
+        ctx.db,
+        "app.update",
+        resource_type="application",
+        resource_id=application.id,
+        details={"name": application.name, "slug": application.slug},
+    )
+
+    current_sdk = await load_current_sdk_metadata()
+    return await application_to_public(application, repo, current_sdk=current_sdk)
 
 
 @router.delete(
     "/{app_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Delete application",
-)
+**operation_route("apps.delete"))
 async def delete_application(
     app_id: UUID,
     ctx: Context,
@@ -475,13 +782,10 @@ async def delete_application(
 ) -> None:
     """Delete an application by ID."""
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
+    application = await get_application_for_write_or_404(ctx, app_id)
+    active_deployment_id = application.active_deployment_id
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller, permission="apps.readwrite")
     success = await repo.delete_application(app_id)
 
     if not success:
@@ -489,6 +793,33 @@ async def delete_application(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Application '{app_id}' not found",
         )
+    await emit_audit(
+        ctx.db,
+        "app.delete",
+        resource_type="application",
+        resource_id=app_id,
+        details={"name": application.name, "slug": application.slug},
+    )
+    await ctx.db.commit()
+    try:
+        await ApplicationSourceArtifactStorage().delete_application_artifacts(app_id)
+    except Exception:
+        logger.warning(
+            "Failed to remove retained App source artifacts for %s",
+            log_safe(app_id),
+            exc_info=True,
+        )
+    if active_deployment_id is not None:
+        from src.services.solutions.app_build import SolutionAppBuilder
+
+        try:
+            await SolutionAppBuilder().delete_deployment(app_id, active_deployment_id)
+        except Exception:
+            logger.warning(
+                "Failed to remove deleted App deployment %s",
+                active_deployment_id,
+                exc_info=True,
+            )
 
 
 # =============================================================================
@@ -511,14 +842,14 @@ async def get_draft(
 
     Returns the draft files serialized as JSON.
     """
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
-    app = await get_application_by_id_or_404(ctx, app_id)
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller)
+    app = await get_application_by_id_or_404(ctx, app_id, permission="apps.read")
+    if app.repo_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This App's source is local. Use `bifrost app deploy`.",
+        )
     export_data = await repo.export_application(app)
     return ApplicationDefinition(
         definition=export_data,
@@ -544,14 +875,14 @@ async def save_draft(
     Replaces all existing draft files with the provided definition.
     """
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
-    app = await get_application_by_id_or_404(ctx, app_id)
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller, permission="apps.readwrite")
+    app = await get_application_for_write_or_404(ctx, app_id)
+    if app.repo_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This App has no server-side draft or editor.",
+        )
 
     # Extract files from definition and update
     files_data = data.definition.get("files", [])
@@ -571,11 +902,204 @@ async def save_draft(
 
 
 @router.post(
+    "/{app_id}/deploy",
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Deploy an App",
+)
+async def deploy_application(
+    app_id: UUID,
+    source: UploadFile = File(...),
+    *,
+    ctx: Context,
+    user: CurrentUser,
+    response: Response,
+) -> PlatformJobAccepted:
+    """Build local App source and atomically activate the resulting artifact.
+
+    The raw upload is staged only for the platform job and is deleted whether
+    the job succeeds or fails. Successful deployments retain a sanitized source
+    archive beside the immutable compiled deployment artifact.
+    """
+    application = await get_application_for_write_or_404(ctx, app_id)
+    if application.solution_id is not None or application.app_model != "standalone_v2":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only independently managed V2 Apps can be deployed with this command.",
+        )
+
+    job_id = uuid4()
+    deployment_id = uuid4()
+    storage = ApplicationDeployStorage(job_id)
+    worker_owns_source = False
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="bifrost-app-upload-", suffix=".zip", delete=False
+    )
+    tmp_path = Path(tmp.name)
+    try:
+        with tmp:
+            while chunk := await source.read(8 * 1024 * 1024):
+                tmp.write(chunk)
+        input_sha256, _size = await storage.write_path(tmp_path)
+        job, reused = await enqueue_platform_job(
+            ctx.db,
+            APPLICATION_DEPLOY_DEFINITION,
+            ApplicationDeployPayload(
+                application_id=application.id,
+                deployment_id=deployment_id,
+                input_sha256=input_sha256,
+            ),
+            job_id=job_id,
+            dedupe_key=str(application.id),
+            resource_lock_key=f"application:{application.id}",
+            organization_id=application.organization_id,
+            requested_by_user_id=user.user_id,
+            requested_by_email=user.email,
+            requested_by_name=user.name or user.email or "Unknown",
+            resource_type="application",
+            resource_id=str(application.id),
+            title=f"Deploying {application.name}",
+            action_url=f"/apps/{application.slug}",
+            memory_profile_key=build_resource_memory_profile_key(
+                APPLICATION_DEPLOY_DEFINITION.job_type, application.id
+            ),
+        )
+        if reused:
+            await storage.delete()
+            if job.requested_by_user_id != str(user.user_id):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="An App deployment is already in progress.",
+                )
+        if job.notification_id is None:
+            try:
+                await ensure_platform_job_notification(ctx.db, job)
+            except Exception:
+                logger.warning(
+                    "App deploy queued without a progress notification",
+                    extra={"platform_job_id": str(job.id)},
+                    exc_info=True,
+                )
+        await ctx.db.commit()
+        worker_owns_source = True
+        await ctx.db.refresh(job)
+        await publish_platform_job_update(job)
+        response.headers["Location"] = f"/api/platform-jobs/{job.id}"
+        return PlatformJobAccepted(
+            job_id=job.id,
+            notification_id=job.notification_id,
+            status=job.status,
+            reused=reused,
+        )
+    except Exception:
+        # Once committed the worker owns deletion. Before that, avoid leaving
+        # an unreferenced source object behind.
+        if not worker_owns_source:
+            try:
+                await storage.delete()
+            except Exception:
+                logger.warning("Failed to clean rejected App source upload", exc_info=True)
+        raise
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.get(
+    "/{app_id}/source",
+    response_class=StreamingResponse,
+    summary="Download retained App source",
+    responses={
+        200: {"content": {"application/zip": {}}},
+        409: {"description": "Retained source is unavailable"},
+        503: {"description": "Retained source storage is unavailable"},
+    },
+)
+async def download_application_source(
+    app_id: UUID,
+    ctx: Context,
+    user: CurrentUser,
+) -> StreamingResponse:
+    application = await get_application_by_id_or_404(ctx, app_id, permission="apps.read")
+    if (
+        application.solution_id is not None
+        or application.app_model != "standalone_v2"
+        or application.active_deployment_id is None
+        or not sdk_source_available(application)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Retained source is not available for this App.",
+        )
+    source = ApplicationSourceArtifactStorage()
+    try:
+        source_exists = await source.deployment_source_exists(
+            application.id, application.active_deployment_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "Retained App source availability check failed",
+            extra={"application_id": str(application.id)},
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Retained source could not be accessed.",
+        ) from exc
+    if not source_exists:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Retained source is not available for this App.",
+        )
+    return StreamingResponse(
+        source.iter_deployment_source(application.id, application.active_deployment_id),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{application.slug}-source.zip"'
+            )
+        },
+    )
+
+
+@router.post(
+    "/{app_id}/sdk/update",
+    response_model=PlatformJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Enqueue an App SDK update",
+)
+async def update_application_sdk(
+    app_id: UUID,
+    *,
+    ctx: Context,
+    user: CurrentUser,
+    response: Response,
+) -> PlatformJobAccepted:
+    application = await get_application_for_write_or_404(ctx, app_id)
+    current_sdk = await load_current_sdk_metadata()
+    reason = _sdk_update_action_skip_reason(application, current_sdk=current_sdk)
+    if reason is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"App SDK update is not actionable: {reason}.",
+        )
+    accepted, job = await _enqueue_sdk_update_for_application(
+        ctx=ctx,
+        user=user,
+        application=application,
+        response=response,
+    )
+    await ctx.db.commit()
+    await ctx.db.refresh(job)
+    await publish_platform_job_update(job)
+    return accepted
+
+
+@router.post(
     "/{app_id}/publish",
     response_model=PlatformJobAccepted,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Publish draft to live",
-)
+**operation_route("apps.publish"))
 async def publish_application(
     app_id: UUID,
     ctx: Context,
@@ -595,7 +1119,14 @@ async def publish_application(
     """
     # Publishing a solution-managed app is a deploy-owned action.
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    application = await get_application_by_id_or_404(ctx, app_id)
+    application = await get_application_by_id_or_404(
+        ctx, app_id, permission="apps.publish"
+    )
+    if application.app_model == "standalone_v2":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="V2 Apps are deployed, not published. Use `bifrost app deploy`.",
+        )
     job, reused = await enqueue_platform_job(
         ctx.db,
         APPLICATION_PUBLISH_DEFINITION,
@@ -628,6 +1159,15 @@ async def publish_application(
                 exc_info=True,
             )
 
+    if not reused:
+        await emit_audit(
+            ctx.db,
+            "app.publish",
+            resource_type="application",
+            resource_id=application.id,
+            details={"name": application.name, "job_id": str(job.id)},
+        )
+
     # Make the durable row visible to the scheduler only after its optional
     # notification ID is attached. This removes the claim-before-notification
     # race while still allowing publishes to proceed when Redis is unavailable.
@@ -653,7 +1193,7 @@ async def publish_application(
     "/{app_id}/replace",
     response_model=ApplicationPublic,
     summary="Repoint application source directory",
-)
+**operation_route("apps.replace"))
 async def replace_application_endpoint(
     app_id: UUID,
     data: ApplicationReplaceRequest,
@@ -667,13 +1207,14 @@ async def replace_application_endpoint(
     """
     # Repointing a solution-managed app's source is a deploy-owned action.
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
+    app = await get_application_for_write_or_404(ctx, app_id)
+    if app.app_model == "standalone_v2":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="V2 App source is local and cannot be assigned an _repo path.",
+        )
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller, permission="apps.readwrite")
 
     try:
         application = await repo.replace_application(
@@ -691,7 +1232,16 @@ async def replace_application_endpoint(
             detail=f"Application '{app_id}' not found",
         )
 
-    return await application_to_public(application, repo)
+    await emit_audit(
+        ctx.db,
+        "app.replace",
+        resource_type="application",
+        resource_id=application.id,
+        details={"name": application.name, "repo_path": application.repo_path},
+    )
+
+    current_sdk = await load_current_sdk_metadata()
+    return await application_to_public(application, repo, current_sdk=current_sdk)
 
 
 @router.post(
@@ -714,21 +1264,19 @@ async def swap_application_slugs(
     # Slug is a deploy-owned property for solution-managed apps — refuse both.
     await assert_entity_id_not_solution_managed(ctx.db, Application, data.app_a)
     await assert_entity_id_not_solution_managed(ctx.db, Application, data.app_b)
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
+    for app_id in (data.app_a, data.app_b):
+        await get_application_for_write_or_404(ctx, app_id)
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller, permission="apps.readwrite")
     try:
         app_a, app_b = await repo.swap_slugs(data.app_a, data.app_b)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
+    current_sdk = await load_current_sdk_metadata()
     apps = [
-        await application_to_public(app_a, repo),
-        await application_to_public(app_b, repo),
+        await application_to_public(app_a, repo, current_sdk=current_sdk),
+        await application_to_public(app_b, repo, current_sdk=current_sdk),
     ]
     return ApplicationListResponse(applications=apps, total=len(apps))
 
@@ -742,7 +1290,7 @@ async def swap_application_slugs(
     "/{app_id}/validate",
     response_model=AppValidationResponse,
     summary="Validate application files",
-)
+**operation_route("apps.validate"))
 async def validate_application(
     app_id: UUID,
     ctx: Context,
@@ -757,7 +1305,12 @@ async def validate_application(
     from src.models.orm.file_index import FileIndex
     from src.models.orm.workflows import Workflow
 
-    app = await get_application_by_id_or_404(ctx, app_id)
+    app = await get_application_by_id_or_404(ctx, app_id, permission="apps.read")
+    if app.repo_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This App's source is local. Run validation in the local project.",
+        )
     prefix = app.repo_prefix
 
     # Get all app files
@@ -944,14 +1497,9 @@ async def export_application(
     Returns the complete application structure including all files.
     Pass version_id to export a specific version, or omit to export draft.
     """
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
-    application = await get_application_by_id_or_404(ctx, app_id)
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller)
+    application = await get_application_by_id_or_404(ctx, app_id, permission="apps.read")
     export_data = await repo.export_application(application, version_id)
 
     return ApplicationPublic.model_validate(export_data)
@@ -981,21 +1529,17 @@ async def rollback_application(
     """
     # Version rollback of a solution-managed app is a deploy-owned action.
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    repo = ApplicationRepository(
-        ctx.db,
-        ctx.org_id,
-        user_id=user.user_id,
-        is_superuser=user.is_platform_admin,
-        is_external=user.is_external,
-    )
-    application = await get_application_by_id_or_404(ctx, app_id)
+    caller = await load_caller(ctx.db, user)
+    repo = await _application_repository(ctx, caller, permission="apps.readwrite")
+    application = await get_application_for_write_or_404(ctx, app_id)
 
     try:
         await repo.rollback_to_version(application, data.version_id)
         await ctx.db.flush()
         await ctx.db.refresh(application)
         logger.info(f"Rolled back application {log_safe(app_id)} to version {log_safe(data.version_id)}")
-        return await application_to_public(application, repo)
+        current_sdk = await load_current_sdk_metadata()
+        return await application_to_public(application, repo, current_sdk=current_sdk)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1022,7 +1566,7 @@ async def upload_application_logo(
     Requires the same permissions as updating the application.
     """
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    application = await get_application_by_id_or_404(ctx, app_id)
+    application = await get_application_for_write_or_404(ctx, app_id)
 
     content = await file.read()
     try:
@@ -1061,16 +1605,8 @@ async def get_application_logo(
     app_id: UUID,
     ctx: Context,
 ) -> Response:
-    # The logo is non-sensitive chrome shown in the app header. Resolve the row
-    # by id WITHOUT the consumer-access gate that get_application_by_id_or_404
-    # applies: any authenticated user who can MOUNT the app (it's served to
-    # them) must be able to see its logo — including external/portal users, for
-    # whom the role-scoped metadata lookup 404s. Only the logo bytes + type are
-    # returned, nothing else about the app.
-    application = (
-        await ctx.db.execute(select(Application).where(Application.id == app_id))
-    ).scalar_one_or_none()
-    if application is None or not application.logo_data:
+    application = await get_application_by_id_or_404(ctx, app_id)
+    if not application.logo_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Logo not set",
@@ -1107,7 +1643,7 @@ async def delete_application_logo(
     ctx: Context,
 ) -> Response:
     await assert_entity_id_not_solution_managed(ctx.db, Application, app_id)
-    application = await get_application_by_id_or_404(ctx, app_id)
+    application = await get_application_for_write_or_404(ctx, app_id)
     application.logo_data = None
     application.logo_content_type = None
     application.logo_thumbnail_data = None

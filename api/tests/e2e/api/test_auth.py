@@ -52,7 +52,6 @@ class TestHealthCheck:
         assert data["status"] == "healthy"
         assert data["components"]["database"]["status"] == "healthy"
         assert data["components"]["redis"]["status"] == "healthy"
-        assert data["components"]["rabbitmq"]["status"] == "healthy"
         assert data["components"]["s3"]["status"] == "healthy"
 
     def test_detailed_health_check(self, e2e_client):
@@ -61,10 +60,9 @@ class TestHealthCheck:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "healthy"
-        assert set(data["components"]) == {"database", "redis", "rabbitmq", "s3"}
+        assert set(data["components"]) == {"database", "redis", "s3"}
         assert data["components"]["database"]["type"] == "postgresql"
         assert data["components"]["redis"]["type"] == "redis"
-        assert data["components"]["rabbitmq"]["type"] == "rabbitmq"
         assert data["components"]["s3"]["type"] == "s3"
 
 
@@ -98,9 +96,9 @@ class TestRegistrationFlow:
 class TestMFAFlow:
     """Test MFA setup and verification flows."""
 
-    def test_login_requires_mfa(self, e2e_client, platform_admin):
+    def test_login_requires_mfa(self, private_client, platform_admin):
         """Login should require MFA for password auth."""
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/login",
             data={
                 "username": platform_admin.email,
@@ -122,10 +120,10 @@ class TestMFAFlow:
         assert response.status_code == 200
         assert response.json()["mfa_enabled"] is True
 
-    def test_mfa_login_with_totp(self, e2e_client, platform_admin):
+    def test_mfa_login_with_totp(self, private_client, platform_admin):
         """Complete MFA login flow with TOTP code."""
         # Login to get MFA token
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/login",
             data={
                 "username": platform_admin.email,
@@ -140,7 +138,7 @@ class TestMFAFlow:
 
         # Complete MFA
         totp_code = generate_totp_code(platform_admin.totp_secret)
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/mfa/login",
             json={"mfa_token": mfa_token, "code": totp_code},
         )
@@ -163,12 +161,12 @@ class TestTokenSecurity:
         assert payload.get("iss") == "bifrost-api", "Token should have issuer claim"
         assert payload.get("aud") == "bifrost-client", "Token should have audience claim"
 
-    def test_refresh_token_rejected_as_access_token(self, e2e_client, platform_admin):
+    def test_refresh_token_rejected_as_access_token(self, private_client, platform_admin):
         """
         Security: Refresh tokens should be rejected when used as access tokens.
         """
         # Get a fresh refresh token
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/login",
             data={
                 "username": platform_admin.email,
@@ -182,7 +180,7 @@ class TestTokenSecurity:
         # Complete MFA if required
         if data.get("mfa_required"):
             totp_code = generate_totp_code(platform_admin.totp_secret)
-            mfa_response = e2e_client.post(
+            mfa_response = private_client.post(
                 "/auth/mfa/login",
                 json={"mfa_token": data["mfa_token"], "code": totp_code},
             )
@@ -193,18 +191,18 @@ class TestTokenSecurity:
         assert refresh_token, "Should receive refresh token"
 
         # Try to use refresh token as access token
-        response = e2e_client.get(
+        response = private_client.get(
             "/auth/me",
             headers={"Authorization": f"Bearer {refresh_token}"},
         )
         assert response.status_code == 401, "Refresh token should be rejected as access token"
 
-    def test_refresh_token_rotation(self, e2e_client, platform_admin):
+    def test_refresh_token_rotation(self, private_client, platform_admin):
         """
         Security: Refresh token should be rotated on use (old token invalidated).
         """
         # Login to get fresh tokens
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/login",
             data={
                 "username": platform_admin.email,
@@ -218,7 +216,7 @@ class TestTokenSecurity:
         # Complete MFA if required
         if data.get("mfa_required"):
             totp_code = generate_totp_code(platform_admin.totp_secret)
-            mfa_response = e2e_client.post(
+            mfa_response = private_client.post(
                 "/auth/mfa/login",
                 json={"mfa_token": data["mfa_token"], "code": totp_code},
             )
@@ -229,7 +227,7 @@ class TestTokenSecurity:
         assert old_refresh_token, "Should receive refresh token"
 
         # Use refresh token to get new tokens
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/refresh",
             json={"refresh_token": old_refresh_token},
         )
@@ -239,7 +237,7 @@ class TestTokenSecurity:
         assert new_refresh_token != old_refresh_token, "Should receive new refresh token"
 
         # Try to use old refresh token again (should fail - single use)
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/refresh",
             json={"refresh_token": old_refresh_token},
         )
@@ -296,10 +294,10 @@ class TestOrgValidation:
 class TestLogoutAndRevocation:
     """Test logout and session revocation."""
 
-    def test_logout_revokes_refresh_token(self, e2e_client, platform_admin):
+    def test_logout_revokes_refresh_token(self, private_client, platform_admin):
         """Logout should revoke the refresh token."""
         # Login to get fresh tokens
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/login",
             data={
                 "username": platform_admin.email,
@@ -313,7 +311,7 @@ class TestLogoutAndRevocation:
         # Complete MFA if required
         if data.get("mfa_required"):
             totp_code = generate_totp_code(platform_admin.totp_secret)
-            mfa_response = e2e_client.post(
+            mfa_response = private_client.post(
                 "/auth/mfa/login",
                 json={"mfa_token": data["mfa_token"], "code": totp_code},
             )
@@ -325,7 +323,7 @@ class TestLogoutAndRevocation:
         assert access_token and refresh_token
 
         # Logout - pass refresh_token in body for API clients
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/logout",
             headers={"Authorization": f"Bearer {access_token}"},
             json={"refresh_token": refresh_token},
@@ -333,16 +331,16 @@ class TestLogoutAndRevocation:
         assert response.status_code == 200
 
         # Try to use refresh token (should fail)
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/refresh",
             json={"refresh_token": refresh_token},
         )
         assert response.status_code == 401, "Refresh token should be revoked after logout"
 
-    def test_revoke_all_sessions(self, e2e_client, platform_admin):
+    def test_revoke_all_sessions(self, private_client, platform_admin):
         """Revoke-all should invalidate all refresh tokens."""
         # Login to get fresh tokens
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/login",
             data={
                 "username": platform_admin.email,
@@ -356,7 +354,7 @@ class TestLogoutAndRevocation:
         # Complete MFA if required
         if data.get("mfa_required"):
             totp_code = generate_totp_code(platform_admin.totp_secret)
-            mfa_response = e2e_client.post(
+            mfa_response = private_client.post(
                 "/auth/mfa/login",
                 json={"mfa_token": data["mfa_token"], "code": totp_code},
             )
@@ -368,7 +366,7 @@ class TestLogoutAndRevocation:
         assert access_token and refresh_token
 
         # Revoke all sessions
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/revoke-all",
             headers={"Authorization": f"Bearer {access_token}"},
         )
@@ -377,7 +375,7 @@ class TestLogoutAndRevocation:
         assert "sessions_revoked" in revoke_data
 
         # Try to use refresh token (should fail)
-        response = e2e_client.post(
+        response = private_client.post(
             "/auth/refresh",
             json={"refresh_token": refresh_token},
         )

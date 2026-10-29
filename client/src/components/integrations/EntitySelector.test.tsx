@@ -12,7 +12,7 @@ import { EntitySelector } from "./EntitySelector";
 
 describe("EntitySelector — loading", () => {
 	it("renders a skeleton while loading", () => {
-		const { container } = renderWithProviders(
+		renderWithProviders(
 			<EntitySelector
 				entities={[]}
 				value=""
@@ -20,8 +20,9 @@ describe("EntitySelector — loading", () => {
 				isLoading
 			/>,
 		);
-		// Skeleton has no role — assert DOM presence via class signal.
-		expect(container.querySelector(".h-8")).toBeTruthy();
+		expect(
+			screen.getByRole("status", { name: "Loading entities" }),
+		).toBeInTheDocument();
 	});
 });
 
@@ -83,5 +84,23 @@ describe("EntitySelector — populated", () => {
 			/>,
 		);
 		expect(screen.getByText("Beta")).toBeInTheDocument();
+	});
+
+	it("clears the entity when the selected one is chosen again", async () => {
+		const onChange = vi.fn();
+		const { user } = renderWithProviders(
+			<EntitySelector
+				entities={[
+					{ value: "ent-1", label: "Acme" },
+					{ value: "ent-2", label: "Beta" },
+				]}
+				value="ent-2"
+				onChange={onChange}
+			/>,
+		);
+		await user.click(screen.getByRole("combobox"));
+		await user.click(screen.getByRole("option", { name: "Beta" }));
+
+		expect(onChange).toHaveBeenCalledWith("", "");
 	});
 });

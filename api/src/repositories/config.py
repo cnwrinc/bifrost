@@ -2,6 +2,7 @@
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -10,6 +11,7 @@ from sqlalchemy import and_, or_, select
 
 from src.core.log_safety import log_safe
 from src.core.org_filter import OrgFilterType
+from src.core.security import SECRET_PLACEHOLDER
 from src.models import (
     Config as ConfigModel,
     ConfigResponse,
@@ -20,6 +22,7 @@ from src.models import (
 from src.models.enums import ConfigType as ConfigTypeEnum
 from src.models.orm.integrations import Integration
 from src.repositories.org_scoped import OrgScopedRepository
+from src.services.authorization.reach import OrgReach
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,15 @@ class RequiredConfigUnset(RuntimeError):
             f"Set it with `bifrost configs set {key} --value <value>` "
             f"or in the solution's Setup tab."
         )
+
+
+@dataclass(frozen=True)
+class ConfigWrite:
+    """A config write's masked response plus the value the cache must store."""
+
+    response: ConfigResponse
+    # As persisted: ciphertext for secrets, never returned to a caller.
+    stored_value: Any
 
 
 class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-var]
@@ -92,7 +104,7 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
                 else config.value
             )
             display_value = (
-                "[SECRET]"
+                SECRET_PLACEHOLDER
                 if config.config_type == ConfigTypeEnum.SECRET
                 else raw_value
             )
@@ -114,15 +126,109 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
                     else None,
                     integration_name=integration_name,
                     description=config.description,
+                    required=config.required,
+                    position=config.position,
                     updated_at=config.updated_at,
                     updated_by=config.updated_by,
                 )
             )
         return schemas
 
+    async def list_configs_in_reach(
+        self,
+        reach: OrgReach,
+        *,
+        include_global_fallback: bool,
+    ) -> list[ConfigResponse]:
+        """List rows authorized before query execution and response shaping.
+
+        Global configuration is a shared fallback for an authorized
+        organization read.  It is included here only because the caller has
+        at least one authorized organization; explicit Global targeting is
+        decided by the router before it calls this method.
+        """
+        query = select(self.model, Integration.name.label("integration_name")).outerjoin(
+            Integration,
+            and_(self.model.integration_id == Integration.id, Integration.is_deleted.is_(False)),
+        )
+        predicate = reach.where(self.model.organization_id)
+        if predicate is not None:
+            if include_global_fallback and not reach.covers(None):
+                predicate = or_(predicate, self.model.organization_id.is_(None))
+            query = query.where(predicate)
+        query = query.order_by(self.model.key)
+        rows = (await self.session.execute(query)).all()
+        return [self._to_response(row[0], integration_name=row[1]) for row in rows]
+
     async def get_config(self, key: str) -> ConfigModel | None:
         """Get config by key with cascade scoping: org-specific > global."""
         return await self.get(key=key)
+
+    @staticmethod
+    def _to_response(
+        config: ConfigModel, *, integration_name: str | None
+    ) -> ConfigResponse:
+        """Shape one row into a ``ConfigResponse``.
+
+        Unwraps the ``{"value": X}`` JSONB storage envelope and masks
+        ``secret``-type values, so no read surface built on this can leak a
+        stored secret.
+        """
+        raw_value = (
+            config.value.get("value")
+            if isinstance(config.value, dict)
+            else config.value
+        )
+        display_value = (
+            SECRET_PLACEHOLDER
+            if config.config_type == ConfigTypeEnum.SECRET
+            else raw_value
+        )
+        return ConfigResponse(
+            id=config.id,
+            key=config.key,
+            value=display_value,
+            type=ConfigType(config.config_type.value)
+            if config.config_type
+            else ConfigType.STRING,
+            scope="org" if config.organization_id else "GLOBAL",
+            org_id=str(config.organization_id) if config.organization_id else None,
+            integration_id=str(config.integration_id)
+            if config.integration_id
+            else None,
+            integration_name=integration_name,
+            description=config.description,
+            required=config.required,
+            position=config.position,
+            updated_at=config.updated_at,
+            updated_by=config.updated_by,
+        )
+
+    async def get_config_by_id(self, config_id: UUID) -> ConfigResponse | None:
+        """Get one config by UUID, or ``None`` when it does not exist.
+
+        No org cascade: IDs are globally unique, so an ID lookup resolves
+        directly. This deliberately matches :meth:`update_config_by_id` and
+        :meth:`delete_config`, which also filter on ``id`` alone. The router
+        authorizes the persisted organization before returning or mutating the
+        row. Secret values are masked by :meth:`_to_response`.
+        """
+        query = (
+            select(self.model, Integration.name.label("integration_name"))
+            .outerjoin(
+                Integration,
+                and_(
+                    self.model.integration_id == Integration.id,
+                    Integration.is_deleted.is_(False),
+                ),
+            )
+            .where(self.model.id == config_id)
+        )
+
+        row = (await self.session.execute(query)).first()
+        if row is None:
+            return None
+        return self._to_response(row[0], integration_name=row[1])
 
     async def require(self, key: str) -> ConfigModel:
         """Get a config by key, raising RequiredConfigUnset when it is absent.
@@ -145,12 +251,9 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
         (organization_id IS NULL) tier so they can't read (nor the endpoint
         decrypt) a global secret. Defaults to ``self.is_external``.
 
-        This is the USER-facing restriction ONLY. The ENGINE/sentinel path
-        (workflow execution, embed-app sessions — ``is_superuser`` sentinel,
-        ``is_external`` False) keeps the full org+global merge UNCHANGED: a
-        workflow legitimately reads global config, and an external user's whole
-        portal runs on those workflows. The CLI/SDK endpoints distinguish by
-        passing ``external=current_user.is_external`` (False for the sentinel).
+        SDK services derive this restriction from the current Caller.
+        Workflow powers retain the shared cascade; named config and Secrets
+        permissions still decide whether values may be read or decrypted.
 
         External reads BYPASS the cache entirely — they're a rare,
         portal-admin-only path, and a separate cache namespace would add
@@ -256,7 +359,7 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
 
     async def set_config(
         self, request: SetConfigRequest, updated_by: str
-    ) -> ConfigResponse:
+    ) -> ConfigWrite:
         """Create or update a config in current org scope."""
         now = datetime.now(timezone.utc)
 
@@ -306,17 +409,9 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
 
         logger.info(f"Set config {log_safe(request.key)} in org {self.org_id}")
 
-        value = config.value.get("value") if isinstance(config.value, dict) else config.value
-        return ConfigResponse(
-            id=config.id,
-            key=config.key,
-            value=value,
-            type=request.type if request.type else ConfigType.STRING,
-            scope="org" if config.organization_id else "GLOBAL",
-            org_id=str(config.organization_id) if config.organization_id else None,
-            description=config.description,
-            updated_at=config.updated_at,
-            updated_by=config.updated_by,
+        return ConfigWrite(
+            response=self._to_response(config, integration_name=None),
+            stored_value=stored_value,
         )
 
     async def update_config_by_id(
@@ -324,7 +419,7 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
         config_id: UUID,
         request: UpdateConfigRequest,
         updated_by: str,
-    ) -> tuple[ConfigResponse, UUID | None, str] | None:
+    ) -> tuple[ConfigWrite, UUID | None, str] | None:
         """Update a config by ID and return the prior cache identity."""
         query = select(self.model).where(self.model.id == config_id)
         result = await self.session.execute(query)
@@ -374,24 +469,12 @@ class ConfigRepository(OrgScopedRepository[ConfigModel]):  # type: ignore[type-v
             f"(id={log_safe(config_id)}) org={log_safe(config.organization_id)}"
         )
 
-        response_type = (
-            ConfigType(config.config_type.value)
-            if config.config_type
-            else ConfigType.STRING
+        stored_value = config.value.get("value") if isinstance(config.value, dict) else config.value
+        write = ConfigWrite(
+            response=self._to_response(config, integration_name=None),
+            stored_value=stored_value,
         )
-        value = config.value.get("value") if isinstance(config.value, dict) else config.value
-        response = ConfigResponse(
-            id=config.id,
-            key=config.key,
-            value=value,
-            type=response_type,
-            scope="org" if config.organization_id else "GLOBAL",
-            org_id=str(config.organization_id) if config.organization_id else None,
-            description=config.description,
-            updated_at=config.updated_at,
-            updated_by=config.updated_by,
-        )
-        return response, old_org_id, old_key
+        return write, old_org_id, old_key
 
     async def delete_config(self, config_id: UUID) -> ConfigModel | None:
         """Delete config by ID. Returns the deleted config or None if missing."""

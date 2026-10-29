@@ -1,22 +1,130 @@
-"""Unit tests for the Solution zip-install PREVIEW path (parse-only) + zip-slip
-safety. The preview function unzips a Solution workspace, parses the manifests
-via the CLI collectors, and returns what it would create — no DB, no S3, no
-build. The COMMIT path is covered by the e2e test (it needs a live deployer)."""
+"""Tests for Solution zip-install validation and direct service contracts."""
 from __future__ import annotations
 
 import io
 import zipfile
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
-from pathlib import Path
-
+from bifrost.definition_validation import DefinitionValidationError
 from src.services.solutions.zip_install import (
     BadExportPassword,
     PreviewResult,
+    UnmetDependency,
+    install_zip,
     preview_zip,
     validate_install_zip,
 )
+
+
+def test_safe_extract_rejects_compression_bomb(tmp_path: Path) -> None:
+    from src.services.solutions.zip_install import _safe_extract
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("compressed.txt", b"0" * (2 * 1024 * 1024))
+
+    with pytest.raises(ValueError, match="compression ratio"):
+        _safe_extract(archive.getvalue(), str(tmp_path))
+
+
+def test_safe_extract_accepts_identical_duplicate_member_once_in_bounded_chunks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Identical legacy entries are one logical workspace file, not two writes."""
+    from src.services.solutions import zip_install
+
+    monkeypatch.setattr(zip_install, "_DUPLICATE_COMPARE_CHUNK_BYTES", 3)
+    archive = io.BytesIO()
+    content = b"same member read across several bounded chunks"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("bifrost.solution.yaml", "slug: duplicate\nname: Duplicate\n")
+        z.writestr("apps/dash/app-logo.png", content)
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            z.writestr("apps/dash/app-logo.png", content)
+
+    extractions: list[str] = []
+    original_extract = zipfile.ZipFile.extract
+
+    def record_extract(self, member, path=None, pwd=None):
+        extractions.append(member.filename if isinstance(member, zipfile.ZipInfo) else member)
+        return original_extract(self, member, path, pwd)
+
+    monkeypatch.setattr(zipfile.ZipFile, "extract", record_extract)
+    zip_install._safe_extract(archive.getvalue(), str(tmp_path))
+
+    assert (tmp_path / "apps/dash/app-logo.png").read_bytes() == content
+    assert extractions.count("apps/dash/app-logo.png") == 1
+
+
+def test_safe_extract_rejects_conflicting_duplicate_members(tmp_path: Path) -> None:
+    from src.services.solutions.zip_install import _safe_extract
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("bifrost.solution.yaml", "slug: duplicate\nname: Duplicate\n")
+        z.writestr("apps/dash/app-logo.png", b"first")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            z.writestr("apps/dash/app-logo.png", b"third")
+
+    with pytest.raises(ValueError, match="conflicting duplicate member"):
+        _safe_extract(archive.getvalue(), str(tmp_path))
+
+    assert not (tmp_path / "apps").exists()
+
+
+def test_duplicate_members_count_toward_archive_entry_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.services.solutions import zip_install
+
+    monkeypatch.setattr(zip_install, "MAX_SOLUTION_ARCHIVE_ENTRIES", 1)
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("duplicate.txt", b"same")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            z.writestr("duplicate.txt", b"same")
+
+    with zipfile.ZipFile(archive) as z:
+        with pytest.raises(ValueError, match="too many entries"):
+            zip_install._validate_zip_members(z)
+
+
+def test_duplicate_members_count_toward_expanded_budget_before_comparison(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.services.solutions import zip_install
+
+    monkeypatch.setattr(zip_install, "MAX_SOLUTION_UNCOMPRESSED_BYTES", 7)
+    monkeypatch.setattr(
+        zip_install,
+        "_zip_members_match",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not compare")),
+    )
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("duplicate.txt", b"four")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            z.writestr("duplicate.txt", b"four")
+
+    with zipfile.ZipFile(archive) as z:
+        with pytest.raises(ValueError, match="expands beyond"):
+            zip_install._validate_zip_members(z)
+
+
+def test_safe_extract_rejects_unsafe_duplicate_member_path(tmp_path: Path) -> None:
+    from src.services.solutions.zip_install import _safe_extract
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr("../escape.txt", b"same")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            z.writestr("../escape.txt", b"same")
+
+    with pytest.raises(ValueError, match="unsafe path"):
+        _safe_extract(archive.getvalue(), str(tmp_path))
+
+    assert not (tmp_path.parent / "escape.txt").exists()
 
 
 def _make_workspace_zip(extra: dict[str, str] | None = None) -> bytes:
@@ -68,6 +176,79 @@ def _make_workspace_zip(extra: dict[str, str] | None = None) -> bytes:
         for name, content in files.items():
             z.writestr(name, content)
     return buf.getvalue()
+
+
+@pytest.mark.e2e
+async def test_install_zip_rejects_missing_module_before_persisting(db_session) -> None:
+    """The installer invokes the dependency gate before committing an install."""
+    from sqlalchemy import select
+
+    from src.models.orm.solutions import Solution
+
+    bundle = _make_workspace_zip(
+        extra={
+            "workflows/main.py": (
+                "from modules.absent import x\n\n"
+                "def run(sdk):\n    return x\n"
+            )
+        }
+    )
+    with pytest.raises(UnmetDependency, match="modules.absent"):
+        await install_zip(
+            db_session,
+            bundle,
+            organization_id=None,
+            config_values={},
+            deployer_email="dev@gobifrost.com",
+        )
+
+    await db_session.rollback()
+    rows = (await db_session.execute(
+        select(Solution).where(Solution.slug == "zip-demo")
+    )).scalars().all()
+    assert rows == []
+
+
+def test_preview_rejects_invalid_decorator_in_unregistered_helper() -> None:
+    archive = _make_workspace_zip(extra={
+        "helpers/rejected.py": (
+            "from bifrost import workflow\n"
+            "@workflow(timeout_seconds=30)\n"
+            "def rejected(): pass\n"
+        ),
+    })
+
+    with pytest.raises(DefinitionValidationError, match="helpers/rejected.py.*timeout_seconds"):
+        preview_zip(archive)
+
+
+@pytest.mark.e2e
+async def test_install_zip_rejects_invalid_decorator_before_persisting(db_session) -> None:
+    from sqlalchemy import select
+
+    from src.models.orm.solutions import Solution
+
+    archive = _make_workspace_zip(extra={
+        "helpers/rejected.py": (
+            "from bifrost import workflow\n"
+            "@workflow(timeout_seconds=30)\n"
+            "def rejected(): pass\n"
+        ),
+    })
+
+    with pytest.raises(DefinitionValidationError, match="helpers/rejected.py.*timeout_seconds"):
+        await install_zip(
+            db_session,
+            archive,
+            organization_id=None,
+            config_values={},
+            deployer_email="dev@gobifrost.com",
+        )
+
+    rows = (await db_session.execute(
+        select(Solution).where(Solution.slug == "zip-demo")
+    )).scalars().all()
+    assert rows == []
 
 
 def test_preview_lists_entities_and_config_schemas() -> None:
@@ -213,3 +394,356 @@ def test_validate_install_zip_correct_password_for_secrets(tmp_path: Path) -> No
     )
     # Must not raise.
     validate_install_zip(zp, password="correct-horse")
+
+
+@pytest.mark.e2e
+async def test_secret_content_collision_requires_replace_and_preserves_integration_config(
+    db_session,
+) -> None:
+    """Only solution-scope config rows collide, and replacement is explicit."""
+    from sqlalchemy import select
+
+    from src.core.security import decrypt_secret
+    from src.models.enums import ConfigType as ConfigTypeEnum
+    from src.models.orm.config import Config
+    from src.models.orm.integrations import Integration
+    from src.models.orm.organizations import Organization
+    from src.models.orm.solution_config_schema import SolutionConfigSchema
+    from src.models.orm.solutions import Solution
+    from src.services.solutions.secrets_blob import SolutionContent
+    from src.services.solutions.zip_install import (
+        ContentCollision,
+        _apply_content,
+        _assert_no_unforced_collisions,
+    )
+
+    org = Organization(
+        id=uuid4(), name=f"Import secrets {uuid4().hex[:8]}", created_by="test"
+    )
+    solution = Solution(
+        id=uuid4(),
+        slug=f"import-secrets-{uuid4().hex[:8]}",
+        name="Import secrets",
+        organization_id=org.id,
+    )
+    integration = Integration(name=f"Import secrets {uuid4().hex[:8]}")
+    db_session.add_all([org, solution, integration])
+    await db_session.flush()
+    db_session.add_all(
+        [
+            SolutionConfigSchema(
+                id=uuid4(),
+                solution_id=solution.id,
+                key="API_KEY",
+                type=ConfigTypeEnum.SECRET.value,
+            ),
+            Config(
+                key="API_KEY",
+                value={"value": "integration-owned"},
+                config_type=ConfigTypeEnum.STRING,
+                organization_id=org.id,
+                integration_id=integration.id,
+                updated_by="test",
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    initial = SolutionContent(config_values={"API_KEY": "initial-secret"})
+    await _assert_no_unforced_collisions(
+        db_session,
+        solution=solution,
+        content=initial,
+        replace_secrets=False,
+        replace_data=False,
+    )
+    await _apply_content(
+        db_session,
+        solution=solution,
+        content=initial,
+        workspace=Path(),
+        password=None,
+        replace_secrets=False,
+        replace_data=False,
+        deployer_email="test",
+    )
+
+    replacement = SolutionContent(config_values={"API_KEY": "replacement-secret"})
+    with pytest.raises(ContentCollision) as exc_info:
+        await _assert_no_unforced_collisions(
+            db_session,
+            solution=solution,
+            content=replacement,
+            replace_secrets=False,
+            replace_data=False,
+        )
+    assert exc_info.value.keys == ["API_KEY"]
+
+    await _assert_no_unforced_collisions(
+        db_session,
+        solution=solution,
+        content=replacement,
+        replace_secrets=True,
+        replace_data=False,
+    )
+    await _apply_content(
+        db_session,
+        solution=solution,
+        content=replacement,
+        workspace=Path(),
+        password=None,
+        replace_secrets=True,
+        replace_data=False,
+        deployer_email="test",
+    )
+    stored = (
+        await db_session.execute(
+            select(Config).where(
+                Config.key == "API_KEY",
+                Config.organization_id == org.id,
+                Config.integration_id.is_(None),
+            )
+        )
+    ).scalar_one()
+    assert decrypt_secret(stored.value["value"]) == "replacement-secret"
+
+
+@pytest.mark.e2e
+async def test_table_content_collision_requires_replace_data_and_replaces_all_rows(
+    db_session,
+) -> None:
+    """Existing runtime rows block import until replace_data replaces them all."""
+    from sqlalchemy import select
+
+    from src.models.orm.organizations import Organization
+    from src.models.orm.solutions import Solution
+    from src.models.orm.tables import Document, Table
+    from src.services.solutions.secrets_blob import SolutionContent
+    from src.services.solutions.zip_install import (
+        ContentCollision,
+        _apply_content,
+        _assert_no_unforced_collisions,
+    )
+
+    org = Organization(
+        id=uuid4(), name=f"Import table {uuid4().hex[:8]}", created_by="test"
+    )
+    solution = Solution(
+        id=uuid4(),
+        slug=f"import-table-{uuid4().hex[:8]}",
+        name="Import table",
+        organization_id=org.id,
+    )
+    table_name = f"import_rows_{uuid4().hex[:8]}"
+    db_session.add_all([org, solution])
+    await db_session.flush()
+
+    table = Table(
+        id=uuid4(),
+        name=table_name,
+        organization_id=org.id,
+        solution_id=solution.id,
+    )
+    db_session.add(table)
+    await db_session.flush()
+    db_session.add(
+        Document(
+            id="target-only",
+            table_id=table.id,
+            data={"account": "south", "total": 99},
+        )
+    )
+    await db_session.flush()
+
+    exported = SolutionContent(
+        table_data={table_name: [{"account": "north", "total": 42}]}
+    )
+    with pytest.raises(ContentCollision) as exc_info:
+        await _assert_no_unforced_collisions(
+            db_session,
+            solution=solution,
+            content=exported,
+            replace_secrets=False,
+            replace_data=False,
+        )
+    assert exc_info.value.keys == []
+    assert exc_info.value.tables == [table_name]
+    retained_rows = (
+        (
+            await db_session.execute(
+                select(Document.data).where(Document.table_id == table.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert retained_rows == [{"account": "south", "total": 99}]
+
+    await _assert_no_unforced_collisions(
+        db_session,
+        solution=solution,
+        content=exported,
+        replace_secrets=False,
+        replace_data=True,
+    )
+    await _apply_content(
+        db_session,
+        solution=solution,
+        content=exported,
+        workspace=Path(),
+        password=None,
+        replace_secrets=False,
+        replace_data=True,
+        deployer_email="test",
+    )
+    replaced_rows = (
+        (
+            await db_session.execute(
+                select(Document.id, Document.data).where(Document.table_id == table.id)
+            )
+        )
+        .all()
+    )
+    assert len(replaced_rows) == 1
+    assert replaced_rows[0].data == {"account": "north", "total": 42}
+    assert replaced_rows[0].id != "target-only"
+
+
+@pytest.mark.e2e
+async def test_empty_table_backup_clears_existing_rows_when_replacing(db_session) -> None:
+    """An empty table key in a new backup clears stale target rows."""
+    from sqlalchemy import select
+
+    from src.models.orm.solutions import Solution
+    from src.models.orm.tables import Document, Table
+    from src.services.solutions.secrets_blob import SolutionContent
+    from src.services.solutions.zip_install import _apply_content
+
+    solution = Solution(
+        id=uuid4(), slug=f"empty-data-{uuid4().hex[:8]}", name="Empty data", organization_id=None
+    )
+    table = Table(
+        id=uuid4(), name=f"rows_{uuid4().hex[:8]}", organization_id=None, solution_id=solution.id
+    )
+    db_session.add_all([solution, table])
+    await db_session.flush()
+    db_session.add(Document(id="stale", table_id=table.id, data={"name": "old"}))
+    await db_session.flush()
+
+    await _apply_content(
+        db_session,
+        solution=solution,
+        content=SolutionContent(
+            table_data={table.name: []}, table_document_ids={table.name: []}
+        ),
+        workspace=Path(),
+        password=None,
+        replace_secrets=False,
+        replace_data=True,
+        deployer_email="test",
+    )
+
+    remaining = (await db_session.execute(select(Document.id).where(Document.table_id == table.id))).scalars().all()
+    assert remaining == []
+
+
+@pytest.mark.e2e
+async def test_table_content_rejects_bad_ids_before_replacing_rows(db_session) -> None:
+    """Malformed IDs cannot clear a live table before the import fails."""
+    from sqlalchemy import select
+
+    from src.models.orm.solutions import Solution
+    from src.models.orm.tables import Document, Table
+    from src.services.solutions.secrets_blob import SolutionContent
+    from src.services.solutions.zip_install import _apply_content
+
+    solution = Solution(
+        id=uuid4(), slug=f"bad-ids-{uuid4().hex[:8]}", name="Bad ids", organization_id=None
+    )
+    table = Table(
+        id=uuid4(), name=f"rows_{uuid4().hex[:8]}", organization_id=None, solution_id=solution.id
+    )
+    db_session.add_all([solution, table])
+    await db_session.flush()
+    db_session.add(Document(id="keep-me", table_id=table.id, data={"name": "existing"}))
+    await db_session.flush()
+
+    malformed = SolutionContent(
+        table_data={table.name: [{"name": "replacement"}]},
+        table_document_ids={table.name: []},
+    )
+    with pytest.raises(ValueError, match="table_document_ids.*alignment"):
+        await _apply_content(
+            db_session,
+            solution=solution,
+            content=malformed,
+            workspace=Path(),
+            password=None,
+            replace_secrets=False,
+            replace_data=True,
+            deployer_email="test",
+        )
+
+    retained = (await db_session.execute(select(Document.id).where(Document.table_id == table.id))).scalars().all()
+    assert retained == ["keep-me"]
+
+
+@pytest.mark.e2e
+async def test_encrypted_backup_restores_document_graph_with_source_ids(db_session, tmp_path) -> None:
+    """A disk-backed encrypted restore preserves IDs, links and attachment bytes."""
+    import hashlib
+
+    from sqlalchemy import select
+
+    from src.models.orm.solutions import Solution
+    from src.models.orm.tables import Document, Table
+    from src.services.solution_files import SolutionFileEntry, read_solution_file
+    from src.services.solutions.deploy import SolutionBundle
+    from src.services.solutions.export import build_workspace_zip
+    from src.services.solutions.zip_install import install_zip_path
+
+    table_name = f"graph_{uuid4().hex[:8]}"
+    manifest_table_id = str(uuid4())
+    row_ids = ["folder-source-id", "document-source-id", "attachment-source-id"]
+    file_path = "documents/guide.pdf"
+    file_content = b"%PDF-synthetic restore attachment\n" * 100
+    rows = [
+        {"name": "Runbooks"},
+        {"name": "Getting started", "parent_id": row_ids[0]},
+        {"name": "Guide.pdf", "attachment_parent_id": row_ids[1], "file_path": file_path},
+    ]
+    backup = SolutionBundle(
+        solution=Solution(slug=f"graph-{uuid4().hex[:8]}", name="Graph backup", organization_id=None),
+        tables=[{"id": manifest_table_id, "name": table_name, "schema": {"columns": []}, "policies": None}],
+        table_data={table_name: rows},
+        table_document_ids={table_name: row_ids},
+        file_locations=["shared"],
+        solution_files=[SolutionFileEntry(
+            location="shared", path=file_path,
+            sha256=hashlib.sha256(file_content).hexdigest(), size=len(file_content),
+            content_bytes=file_content,
+        )],
+    )
+    archive = tmp_path / "backup.zip"
+    archive.write_bytes(build_workspace_zip(backup, password="backup-password"))
+
+    installed = await install_zip_path(
+        db_session,
+        archive,
+        organization_id=None,
+        config_values={},
+        deployer_email="backup-test",
+        password="backup-password",
+    )
+    target_table = (
+        await db_session.execute(select(Table).where(Table.solution_id == installed.id, Table.name == table_name))
+    ).scalar_one()
+    restored = (
+        await db_session.execute(select(Document).where(Document.table_id == target_table.id).order_by(Document.id))
+    ).scalars().all()
+    by_id = {row.id: row.data for row in restored}
+    assert set(by_id) == set(row_ids)
+    assert by_id["document-source-id"]["parent_id"] == "folder-source-id"
+    assert by_id["attachment-source-id"]["attachment_parent_id"] == "document-source-id"
+    assert by_id["attachment-source-id"]["file_path"] == file_path
+    assert await read_solution_file(db_session, installed.id, "shared", file_path) == file_content

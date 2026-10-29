@@ -1,7 +1,7 @@
 # Bifrost Web SDK
 
-The v2 web SDK is the installable `bifrost` package used by
-`standalone_v2` Solution apps:
+The V2 web SDK is the installable `bifrost` package used by independent and
+Solution-owned Apps:
 
 ```tsx
 import { BifrostProvider, BifrostHeader, useWorkflowMutation } from "bifrost";
@@ -32,34 +32,53 @@ instance that served it.
 
 ## Local Apps
 
-Scaffolded v2 apps declare the SDK dependency as an instance URL:
-
-```json
-{
-  "dependencies": {
-    "bifrost": "https://your-bifrost.example.com/api/sdk/download"
-  }
-}
-```
-
-That is why local development needs no npm registry publish. `npm install`
-downloads the SDK tarball from the Bifrost instance the app targets.
-
-To update a local app's SDK after upgrading Bifrost, reinstall the dependency
-from the target instance:
+V2 App scaffolds deliberately omit an instance-specific SDK dependency from
+`package.json`. Both connected development commands install the selected
+instance's SDK transiently without rewriting project metadata:
 
 ```bash
-npm install bifrost@https://your-bifrost.example.com/api/sdk/download
+bifrost app start
+bifrost solution start
 ```
 
-Commit the resulting `package-lock.json` change if the app source keeps a lock
-file. If the app should point at a different Bifrost environment, change the URL
-in `package.json` and run the same install command.
+An independent App stores only `BIFROST_API_URL` and `BIFROST_APP_ID` in its
+gitignored `.env`. A Solution stores its install binding in `.env` and its
+portable ownership metadata in the descriptor and manifests.
+
+For an independent App, start again after removing a stale
+`node_modules/bifrost` package. For a Solution App, use the explicit update
+command:
+
+```bash
+bifrost solution sdk update [path] --app <slug>
+```
+
+Do not commit an instance URL or authentication token to `package.json`.
+
+`bifrost solution start` resolves the selected app's portable manifest ID to its
+installed ID before starting Vite. Local Python functions and browser API calls
+use the CLI user's credentials plus a separate, ten-minute signed development
+context for the bound install. The CLI and local proxy renew that context as
+needed; it stays in memory and is never included in the browser bundle or saved
+credentials. This also works before the selected app's first deployment.
+
+Starting a Solution preview requires current Platform Admin membership, checked
+against stored role grants. The context establishes the caller's install and
+does not grant workflow powers or bypass table policies, ownership, organization
+scope, or another install's inbound rules. An inactive install, changed install
+organization, revoked admin grant, or mismatched app context stops access. Use
+matching current CLI and server builds for this development path.
+
+In local Python, a table query or count that receives a not-found response raises
+an explained error instead of appearing empty. The response does not distinguish
+a missing table from a protected one. Individual document reads retain their
+normal not-found behavior, and a successful query with no matching rows is empty.
 
 ## Deployed Apps
 
-Server-side Solution builds do not call the public SDK download URL and do not
-need network access to npm for the SDK itself. `SolutionAppBuilder` generates
+Server-side independent-App and Solution builds do not call the public SDK
+download URL and do not need network access to npm for the SDK itself.
+`SolutionAppBuilder` is the shared V2 compiler: it generates
 the same tarball from the running API image, writes it into the temporary build
 directory as `bifrost-sdk.tgz`, and injects:
 
@@ -71,9 +90,13 @@ directory as `bifrost-sdk.tgz`, and injects:
 }
 ```
 
-Then it runs `npm install` and `vite build`. Redeploying or reinstalling a
-Solution after a Bifrost upgrade rebuilds the app against the SDK bundled with
-that upgraded instance.
+Then it runs `npm install` and `vite build`. `bifrost app deploy` uploads source,
+stores a sanitized source archive beside the immutable compiled deployment,
+and atomically activates it. `bifrost solution deploy` builds the same App shape
+as part of full Solution reconciliation and retains the deployed Solution
+archive. These retained artifacts make an SDK-only rebuild possible without a
+full redeploy; `.env*`, dependencies, generated output, caches, and VCS data are
+excluded. See [Application SDK updates](application-sdk-update.md).
 
 Prebuilt disconnected Solution packages are different: if a bundle ships a
 ready `dist/`, the platform skips the server-side Vite build. In that case the
@@ -81,12 +104,32 @@ SDK version is whatever the bundle was built with.
 
 ## App Mount Lifecycle
 
-Apps v2 keep the module graph exactly as Vite emits it. The host loads the
+V2 Apps keep the module graph exactly as Vite emits it. The host loads the
 content-hashed entry through its canonical URL, without per-mount query
 parameters, then invokes the entry's exported `mount(mountEl, bootstrap)` for
 each visit. `mount` must return a teardown function (normally
 `root.unmount()`). Bootstrap includes the basename, API base URL, viewer token,
-organization scope, app id, theme, and logout callback.
+organization scope, app id, theme, and logout callback. The optional
+`solutionId` identifies the owning Solution, or is null for an unowned App.
+Forward it to `BifrostProvider` alongside `appId`; Apps can then read it from
+`useBifrostContext()` without inferring ownership from URLs or install-specific
+constants. This applies to both the live App and its editor preview. It does
+not grant access to Solution administration; those routes retain their
+platform-administrator checks.
+
+Ordinary signed-in viewers call workflows as themselves. The SDK's
+`X-Bifrost-App` header, or the older workflow request's `app_id` field, selects
+the App's install; it does not make the App a security principal. A viewer who
+can currently open an App can select its own active, sealed Solution without
+enabling inbound access. Their organization reach, workflow sharing and
+execution permissions, and table/file policies still apply. Runtime credentials
+continue to use their verified install provenance for inbound checks.
+
+Solution Detail tabs accept `?tab=overview`, `contents`, `access`,
+`configuration`, or `exports`. Links to an owning Solution's backup history
+can use `/solutions/${solutionId}?tab=exports`. Missing or unknown tab values
+open Overview, and changing tabs preserves other query parameters and browser
+history.
 
 Current scaffolds declare the contract in `index.html`:
 
@@ -112,26 +155,88 @@ Do not add cache-busting queries to the entry or disable Vite code splitting.
 
 ## Versioning Contract
 
-There is no independently published web SDK version stream today. The SDK
+There is no independently published web SDK version stream today. The package
 version follows the Bifrost instance version returned by `shared.version`.
+Deployed Apps also record a fingerprint of the built SDK bytes and a separately
+managed wire-contract version.
 
 Practical consequences:
 
-- App authors should depend on an instance URL, not `bifrost@latest`.
+- App authors should let the CLI/server inject the selected instance's SDK, not depend on `bifrost@latest`.
 - SDK changes ship with the Bifrost deployment that contains them.
-- Local apps update by reinstalling from `/api/sdk/download`.
-- Deployed source-built apps update when the Solution is rebuilt on the target
-  instance.
+- Local Apps update through `app start` or `solution sdk update`.
+- Deployed source-built Apps update only when an administrator explicitly runs
+  an SDK update or redeploys the App or Solution; a Bifrost upgrade does not
+  silently change a deployed App.
 - Breaking SDK surface changes should be treated as Bifrost release changes and
   documented in release notes, because apps consume the SDK from their host
   instance.
 
 ## Header Ownership
 
-The platform does not wrap `standalone_v2` apps in a shell. Apps own their
+The platform does not wrap V2 Apps in a shell. Apps own their
 layout. `<BifrostHeader>` is an optional SDK component that an app can compose
 when it wants familiar platform chrome.
 
 The header must remain self-contained: no Tailwind, shadcn, or `@/` imports.
 It carries its own minimal inline styling so it works in local dev, deployed
 apps, and apps that do not include the main Bifrost client CSS.
+
+## Branding and organizations
+
+Both hooks run inside `BifrostProvider` and use its API URL, authentication,
+and organization scope. They return `data`, `loading`, `error`, and `refetch()`.
+
+```tsx
+import { useBranding, useOrganizations } from "bifrost";
+
+function OrganizationHeader() {
+  const branding = useBranding();
+  const organizations = useOrganizations();
+
+  if (branding.loading || organizations.loading) return <p>Loading…</p>;
+  if (branding.error || organizations.error) return <p>Unable to load settings.</p>;
+
+  return (
+    <header>
+      {branding.rectangleLogoUrl && (
+        <img src={branding.rectangleLogoUrl} alt={branding.applicationName ?? "Logo"} />
+      )}
+      <select aria-label="Organization">
+        {organizations.data?.map((org) => (
+          <option key={org.id} value={org.id}>{org.name}</option>
+        ))}
+      </select>
+      <button style={{ background: "var(--primary)", color: "var(--primary-foreground)" }}>
+        Continue
+      </button>
+    </header>
+  );
+}
+```
+
+`useBranding()` reads public global platform branding and applies the same
+light/dark CSS variables as the main client, including `--primary`,
+`--primary-foreground`, `--ring`, `--bf-primary-hover`, and
+`--bf-activity-gradient`. The provider's `.dark` theme class selects the dark
+palette. An unset primary color uses the platform's standard palette. Apps
+still own their CSS and layout.
+
+It exposes `squareLogoUrl`, `rectangleLogoUrl`, `applicationName`,
+`primaryColor` (the stored color), `palette` (both themes), and `colors` (the
+current theme's palette). Logo URLs, including those in `data`, resolve against
+the configured API URL so local apps load images from Bifrost. Missing logos
+and an unset application name remain null. To consume branding without
+changing document styles, use `useBranding({ applyTheme: false })` and apply
+`colors.primary`, `colors.primaryForeground`, and `colors.primaryHover`
+directly. A failed request is exposed through `error`.
+
+`useOrganizations({ enabled, includeInactive })` reads only the organizations
+returned by the existing `/api/organizations` endpoint. It defaults to loading
+active organizations. Set `enabled: false` to defer loading, or
+`includeInactive: true` to request disabled organizations too. Server-side
+permissions remain authoritative; a refused request appears in `error`.
+
+These hooks are compatible SDK additions. Existing deployed Apps need an
+explicit SDK update or redeploy to import them; the wire-contract version is
+unchanged.

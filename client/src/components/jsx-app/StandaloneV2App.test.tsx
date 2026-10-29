@@ -9,8 +9,13 @@ import {
 } from "./StandaloneV2App";
 
 const orgScopeState = vi.hoisted(() => ({
-	scope: { type: "global" as "global" | "organization", orgId: null as string | null },
+	scope: {
+		type: "global" as "global" | "organization",
+		orgId: null as string | null,
+	},
 }));
+
+const authState = vi.hoisted(() => ({ isPlatformAdmin: false }));
 
 const { mockAuthFetch } = vi.hoisted(() => ({ mockAuthFetch: vi.fn() }));
 
@@ -18,8 +23,16 @@ vi.mock("@/lib/api-client", () => ({
 	authFetch: (...args: unknown[]) => mockAuthFetch(...args),
 }));
 
+vi.mock("@/contexts/AuthContext", () => ({
+	useAuth: () => ({ isPlatformAdmin: authState.isPlatformAdmin }),
+}));
+
 vi.mock("@/hooks/useOrgScope", () => ({
 	useOrgScope: () => ({ scope: orgScopeState.scope }),
+}));
+
+vi.mock("@/components/layout/ImpersonationBanner", () => ({
+	ImpersonationBanner: () => null,
 }));
 
 function props(entry: string) {
@@ -39,8 +52,8 @@ let appendedScripts: HTMLScriptElement[] = [];
 let appendedStylesheets: HTMLLinkElement[] = [];
 
 function moduleScript(entry: string): HTMLScriptElement {
-	const script = appendedScripts.find(
-		(candidate) => candidate.dataset.bifrostAppEntry?.endsWith(`assets/${entry}.js`),
+	const script = appendedScripts.find((candidate) =>
+		candidate.dataset.bifrostAppEntry?.endsWith(`assets/${entry}.js`),
 	);
 	if (!script) throw new Error(`No module script found for ${entry}`);
 	return script;
@@ -87,13 +100,14 @@ beforeEach(() => {
 	localStorage.clear();
 	sessionStorage.clear();
 	orgScopeState.scope = { type: "global", orgId: null };
+	authState.isPlatformAdmin = false;
 	delete window.__BIFROST_APP__;
 	delete window.__BIFROST_APP_MODULES__;
 	mockAuthFetch.mockReset();
 	vi.spyOn(console, "error").mockImplementation(() => {});
 	const appendChild = document.head.appendChild.bind(document.head);
 	vi.spyOn(document.head, "appendChild").mockImplementation(
-		<T extends Node,>(node: T): T => {
+		<T extends Node>(node: T): T => {
 			// happy-dom tries to fetch module scripts and immediately dispatches an
 			// error. Retain them in-memory so each test controls load completion.
 			if (node instanceof HTMLScriptElement) {
@@ -118,7 +132,9 @@ afterEach(() => {
 describe("StandaloneV2App", () => {
 	it("loads the immutable entry and stylesheet through canonical URLs", async () => {
 		localStorage.setItem("bifrost_access_token", "tok-1");
-		render(<StandaloneV2App {...props("canonical")} css="assets/main.css" />);
+		render(
+			<StandaloneV2App {...props("canonical")} css="assets/main.css" />,
+		);
 
 		let script!: HTMLScriptElement;
 		await waitFor(() => {
@@ -137,15 +153,31 @@ describe("StandaloneV2App", () => {
 		expect(stylesheet.href).not.toContain("?");
 	});
 
+	it("shows opening status while the standalone bundle is bootstrapping", async () => {
+		localStorage.setItem("bifrost_access_token", "tok-1");
+		render(<StandaloneV2App {...props("booting")} />);
+
+		expect(
+			screen.getByRole("status", { name: "Loading application…" }),
+		).toBeInTheDocument();
+
+		await finishModuleLoad(
+			"booting",
+			vi.fn(() => vi.fn()),
+		);
+		await waitFor(() =>
+			expect(screen.queryByRole("status")).not.toBeInTheDocument(),
+		);
+	});
+
 	it("passes isolated bootstrap to mount and calls its teardown", async () => {
 		localStorage.setItem("bifrost_access_token", "tok-1");
 		const teardown = vi.fn();
-		const mount = vi.fn((_el: HTMLElement, _boot: BifrostAppBootstrap) => teardown);
+		const mount = vi.fn(
+			(_el: HTMLElement, _boot: BifrostAppBootstrap) => teardown,
+		);
 		const view = render(
-			<StandaloneV2App
-				{...props("bootstrap")}
-				appOrgId="org-42"
-			/>,
+			<StandaloneV2App {...props("bootstrap")} appOrgId="org-42" solutionId="solution-42" />,
 		);
 		const root = view.getByTestId("solution-v2-app-root");
 
@@ -156,8 +188,9 @@ describe("StandaloneV2App", () => {
 		expect(bootstrap).toMatchObject({
 			token: "tok-1",
 			basename: "/apps/dash",
-			orgScope: "org-42",
+			orgScope: null,
 			appId: "app-1",
+			solutionId: "solution-42",
 		});
 		expect(window.__BIFROST_APP__).toBeUndefined();
 
@@ -165,10 +198,33 @@ describe("StandaloneV2App", () => {
 		expect(teardown).toHaveBeenCalledTimes(1);
 	});
 
+	it("keeps the app mounted across token rotation and tears it down on logout", async () => {
+		localStorage.setItem("bifrost_access_token", "tok-1");
+		const teardown = vi.fn();
+		const mount = vi.fn<StandaloneV2Module["mount"]>(() => teardown);
+		const view = render(<StandaloneV2App {...props("token-rotation")} />);
+
+		await finishModuleLoad("token-rotation", mount);
+		await waitFor(() => expect(mount).toHaveBeenCalledTimes(1));
+		localStorage.setItem("bifrost_access_token", "tok-2");
+		view.rerender(<StandaloneV2App {...props("token-rotation")} />);
+
+		expect(mount).toHaveBeenCalledTimes(1);
+		expect(teardown).not.toHaveBeenCalled();
+
+		localStorage.removeItem("bifrost_access_token");
+		view.rerender(<StandaloneV2App {...props("token-rotation")} />);
+
+		await waitFor(() => expect(teardown).toHaveBeenCalledTimes(1));
+	});
+
 	it("mounts with the serving session and installed scope, not stale realm state", async () => {
 		localStorage.setItem("bifrost_access_token", "stale-musick-token");
 		sessionStorage.setItem("bifrost_embed_token", "local-serving-token");
-		orgScopeState.scope = { type: "organization", orgId: "stale-musick-org" };
+		orgScopeState.scope = {
+			type: "organization",
+			orgId: "stale-musick-org",
+		};
 		const mount = vi.fn<StandaloneV2Module["mount"]>(() => vi.fn());
 
 		render(
@@ -183,18 +239,47 @@ describe("StandaloneV2App", () => {
 		expect(mount.mock.calls[0][1]).toMatchObject({
 			baseUrl: window.location.origin,
 			token: "local-serving-token",
-			orgScope: "local-install-org",
+			orgScope: "stale-musick-org",
 			appId: "app-1",
 			basename: "/apps/dash",
 		});
+	});
+
+	it("runs a platform admin against the App's own organization", async () => {
+		localStorage.setItem("bifrost_access_token", "tok-1");
+		authState.isPlatformAdmin = true;
+		const mount = vi.fn<StandaloneV2Module["mount"]>(() => vi.fn());
+
+		render(<StandaloneV2App {...props("admin-app-org")} appOrgId="client-org" />);
+		await finishModuleLoad("admin-app-org", mount);
+		await waitFor(() => expect(mount).toHaveBeenCalledTimes(1));
+
+		expect(mount.mock.calls[0][1]).toMatchObject({ orgScope: "client-org" });
+	});
+
+	it("runs a platform admin against the selection when the App has no organization", async () => {
+		localStorage.setItem("bifrost_access_token", "tok-1");
+		authState.isPlatformAdmin = true;
+		orgScopeState.scope = { type: "organization", orgId: "selected-org" };
+		const mount = vi.fn<StandaloneV2Module["mount"]>(() => vi.fn());
+
+		render(<StandaloneV2App {...props("admin-global-app")} />);
+		await finishModuleLoad("admin-global-app", mount);
+		await waitFor(() => expect(mount).toHaveBeenCalledTimes(1));
+
+		expect(mount.mock.calls[0][1]).toMatchObject({ orgScope: "selected-org" });
 	});
 
 	it("remounts when the parent supplies a newer manifest", async () => {
 		localStorage.setItem("bifrost_access_token", "tok-1");
 		const firstTeardown = vi.fn();
 		const secondTeardown = vi.fn();
-		const firstMount = vi.fn<StandaloneV2Module["mount"]>(() => firstTeardown);
-		const secondMount = vi.fn<StandaloneV2Module["mount"]>(() => secondTeardown);
+		const firstMount = vi.fn<StandaloneV2Module["mount"]>(
+			() => firstTeardown,
+		);
+		const secondMount = vi.fn<StandaloneV2Module["mount"]>(
+			() => secondTeardown,
+		);
 		const { rerender } = render(<StandaloneV2App {...props("first")} />);
 
 		await finishModuleLoad("first", firstMount);
@@ -210,7 +295,9 @@ describe("StandaloneV2App", () => {
 	it("waits for both the module and stylesheet before mounting", async () => {
 		localStorage.setItem("bifrost_access_token", "tok-1");
 		const mount = vi.fn<StandaloneV2Module["mount"]>(() => vi.fn());
-		render(<StandaloneV2App {...props("styled")} css="assets/styled.css" />);
+		render(
+			<StandaloneV2App {...props("styled")} css="assets/styled.css" />,
+		);
 
 		await finishModuleLoad("styled", mount);
 		expect(mount).not.toHaveBeenCalled();
@@ -238,7 +325,9 @@ describe("StandaloneV2App", () => {
 		expect(
 			await screen.findByRole("heading", { name: "Application updated" }),
 		).toBeInTheDocument();
-		expect(screen.getByText("Loading the latest version…")).toBeInTheDocument();
+		expect(
+			screen.getByText("Loading the latest version…"),
+		).toBeInTheDocument();
 
 		await act(async () => resolveManifest(manifest("fresh")));
 		await finishModuleLoad("fresh", mount);
@@ -254,7 +343,12 @@ describe("StandaloneV2App", () => {
 		mockAuthFetch.mockResolvedValueOnce(manifest("fresh-css", "fresh-css"));
 		const oldMount = vi.fn<StandaloneV2Module["mount"]>(() => vi.fn());
 		const freshMount = vi.fn<StandaloneV2Module["mount"]>(() => vi.fn());
-		render(<StandaloneV2App {...props("stale-css")} css="assets/stale-css.css" />);
+		render(
+			<StandaloneV2App
+				{...props("stale-css")}
+				css="assets/stale-css.css"
+			/>,
+		);
 
 		await finishModuleLoad("stale-css", oldMount);
 		act(() => stylesheet("stale-css").dispatchEvent(new Event("error")));
@@ -277,8 +371,39 @@ describe("StandaloneV2App", () => {
 		});
 		act(() => script.dispatchEvent(new Event("error")));
 
-		expect(await screen.findByText(/Failed to load the application entry/i)).toBeInTheDocument();
+		expect(
+			await screen.findByRole("heading", { name: "Bundle Load Error" }),
+		).toBeInTheDocument();
+		expect(screen.getByLabelText("Bundle error details")).toHaveTextContent(
+			/Failed to load the application entry/i,
+		);
+		expect(
+			screen.getByRole("button", { name: "Reload app" }),
+		).toBeInTheDocument();
 		expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("shows a safe permission message when refreshing stale assets is forbidden", async () => {
+		localStorage.setItem("bifrost_access_token", "tok-1");
+		mockAuthFetch.mockResolvedValueOnce({
+			ok: false,
+			status: 403,
+			text: async () => '{"detail":"internal deployment metadata"}',
+		});
+		render(<StandaloneV2App {...props("forbidden-refresh")} />);
+
+		let script!: HTMLScriptElement;
+		await waitFor(() => {
+			script = moduleScript("forbidden-refresh");
+		});
+		act(() => script.dispatchEvent(new Event("error")));
+
+		const details = await screen.findByLabelText("Bundle error details");
+		expect(details).toHaveTextContent(
+			"You do not have permission to open this app.",
+		);
+		expect(details).not.toHaveTextContent("403");
+		expect(details).not.toHaveTextContent("internal deployment metadata");
 	});
 
 	it("uses the preview basename when requested", async () => {
@@ -292,9 +417,13 @@ describe("StandaloneV2App", () => {
 
 	it("does not load or mount while unauthenticated", async () => {
 		render(<StandaloneV2App {...props("unauthenticated")} />);
-		expect(await screen.findByText(/Not authenticated/i)).toBeInTheDocument();
 		expect(
-			appendedScripts.some((script) => script.src.endsWith("unauthenticated.js")),
+			await screen.findByText(/Not authenticated/i),
+		).toBeInTheDocument();
+		expect(
+			appendedScripts.some((script) =>
+				script.src.endsWith("unauthenticated.js"),
+			),
 		).toBe(false);
 	});
 
@@ -308,7 +437,9 @@ describe("StandaloneV2App", () => {
 		});
 		view.unmount();
 
-		(window.__BIFROST_APP_MODULES__ ??= new Map()).set(script.src, { mount });
+		(window.__BIFROST_APP_MODULES__ ??= new Map()).set(script.src, {
+			mount,
+		});
 		act(() => script.dispatchEvent(new Event("load")));
 		await act(async () => Promise.resolve());
 		expect(mount).not.toHaveBeenCalled();
@@ -319,18 +450,31 @@ describe("StandaloneV2App", () => {
 		const teardown = vi.fn();
 		const mount = vi.fn<StandaloneV2Module["mount"]>(() => teardown);
 		const first = render(
-			<StandaloneV2App {...props("concurrent")} appId="app-A" appSlug="aaa" />,
+			<StandaloneV2App
+				{...props("concurrent")}
+				appId="app-A"
+				appSlug="aaa"
+			/>,
 		);
 		const second = render(
-			<StandaloneV2App {...props("concurrent")} appId="app-B" appSlug="bbb" />,
+			<StandaloneV2App
+				{...props("concurrent")}
+				appId="app-B"
+				appSlug="bbb"
+			/>,
 		);
 
 		await finishModuleLoad("concurrent", mount);
 		await waitFor(() => expect(mount).toHaveBeenCalledTimes(2));
 		expect(mount.mock.calls[0][0]).not.toBe(mount.mock.calls[1][0]);
-		expect(mount.mock.calls.map((call) => call[1].appId)).toEqual(["app-A", "app-B"]);
+		expect(mount.mock.calls.map((call) => call[1].appId)).toEqual([
+			"app-A",
+			"app-B",
+		]);
 		expect(
-			appendedScripts.filter((script) => script.src.endsWith("concurrent.js")),
+			appendedScripts.filter((script) =>
+				script.src.endsWith("concurrent.js"),
+			),
 		).toHaveLength(1);
 
 		first.unmount();
@@ -342,13 +486,18 @@ describe("StandaloneV2App", () => {
 		localStorage.setItem("bifrost_access_token", "tok-1");
 		const teardown = vi.fn();
 		const view = render(
-			<StandaloneV2App {...props("legacy-first")} runtimeContract={null} />,
+			<StandaloneV2App
+				{...props("legacy-first")}
+				runtimeContract={null}
+			/>,
 		);
 
 		let script!: HTMLScriptElement;
 		await waitFor(() => {
 			script = appendedScripts.find((candidate) =>
-				candidate.dataset.bifrostLegacyAppEntry?.endsWith("assets/legacy-first.js"),
+				candidate.dataset.bifrostLegacyAppEntry?.endsWith(
+					"assets/legacy-first.js",
+				),
 			)!;
 			expect(script).toBeTruthy();
 		});
@@ -367,7 +516,10 @@ describe("StandaloneV2App", () => {
 		const teardown = vi.fn();
 		const view = render(
 			<StrictMode>
-				<StandaloneV2App {...props("legacy-strict")} runtimeContract={null} />
+				<StandaloneV2App
+					{...props("legacy-strict")}
+					runtimeContract={null}
+				/>
 			</StrictMode>,
 		);
 
@@ -381,7 +533,9 @@ describe("StandaloneV2App", () => {
 		const script = appendedScripts.find((candidate) =>
 			candidate.src.endsWith("assets/legacy-strict.js"),
 		)!;
-		expect(document.body.contains(window.__BIFROST_APP__?.mountEl ?? null)).toBe(true);
+		expect(
+			document.body.contains(window.__BIFROST_APP__?.mountEl ?? null),
+		).toBe(true);
 		window.__BIFROST_APP__?.registerUnmount(teardown);
 		act(() => script.dispatchEvent(new Event("load")));
 		await act(async () => Promise.resolve());
@@ -393,10 +547,16 @@ describe("StandaloneV2App", () => {
 	it("rejects a concurrent mount of the same legacy side-effect entry", async () => {
 		localStorage.setItem("bifrost_access_token", "tok-1");
 		const first = render(
-			<StandaloneV2App {...props("legacy-concurrent")} runtimeContract={null} />,
+			<StandaloneV2App
+				{...props("legacy-concurrent")}
+				runtimeContract={null}
+			/>,
 		);
 		const second = render(
-			<StandaloneV2App {...props("legacy-concurrent")} runtimeContract={null} />,
+			<StandaloneV2App
+				{...props("legacy-concurrent")}
+				runtimeContract={null}
+			/>,
 		);
 
 		const message = await second.findByText(

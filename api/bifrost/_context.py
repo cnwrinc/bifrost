@@ -125,33 +125,41 @@ def get_default_scope() -> str | None:
     return ctx.org_id  # Returns None for GLOBAL scope, org UUID otherwise
 
 
-def resolve_scope(scope: str | None) -> str | None:
-    """Resolve scope for SDK calls with the C2 bypass gate.
+def get_effective_solution(explicit: str | None) -> str | None:
+    """SPIKE: per-call ``solution=`` override.
 
-    The same rule the API enforces: a caller asking for a scope other
-    than their own org must be either a platform admin (engine carries
-    this on ``ExecutionContext.is_platform_admin``) OR a member of a
-    provider org. Either gate alone is sufficient.
-
-    CLI mode (no ExecutionContext) returns the requested scope unchanged
-    — the API will apply its own resolver against the user's JWT.
+    Explicit (UUID or slug/name) wins for this call only. Unset (None) →
+    inherit today's behavior (the active execution's own install, if any).
+    Never mutates the session.
     """
-    default = get_default_scope()
-    if scope is None:
-        return default
-    if scope == default:
-        return scope
+    if explicit is not None:
+        return explicit
     ctx = _execution_context.get()
     if ctx is None:
-        return scope  # CLI mode — user authenticates with their own JWT
-    is_platform_admin = bool(getattr(ctx, "is_platform_admin", False))
-    is_provider_org = bool(ctx.organization and ctx.organization.is_provider)
-    if is_platform_admin or is_provider_org:
-        return scope
-    raise PermissionError(
-        f"Scope override to '{scope}' denied. "
-        "Platform admins or provider-org members only."
-    )
+        return None
+    return getattr(ctx, "solution_id", None)
+
+
+def get_caller_solution() -> str | None:
+    """SPIKE: the caller's OWN install for server-side inbound attestation.
+
+    Always the inherited ExecutionContext install (never the explicit
+    per-call target) — lets the server tell own-calls apart from
+    cross-install calls. None outside a solution execution.
+    """
+    ctx = _execution_context.get()
+    if ctx is None:
+        return None
+    return getattr(ctx, "solution_id", None)
+
+
+def resolve_scope(scope: str | None) -> str | None:
+    """Send the requested or selected scope to the API for authorization.
+
+    The child holds no role snapshot. Every operation validates current
+    original-user reach and its own permission at the server boundary.
+    """
+    return get_default_scope() if scope is None else scope
 
 
 def register_secret(value: "str | None") -> None:

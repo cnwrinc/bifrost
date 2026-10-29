@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Route, Routes, useLocation } from "react-router-dom";
 import { renderWithProviders, screen, waitFor, within } from "@/test-utils";
 
-const mockUseUsersFiltered = vi.fn();
+const mockUseMediaQuery = vi.fn(() => false);
+vi.mock("@/hooks/useMediaQuery", () => ({
+	useMediaQuery: () => mockUseMediaQuery(),
+}));
+afterEach(() => mockUseMediaQuery.mockReturnValue(false));
+const mockUseUsersPage = vi.fn();
 const mockUseDeleteUser = vi.fn();
 const mockUseUpdateUser = vi.fn();
+const mockResetMfa = vi.fn();
+const mockSignOut = vi.fn();
 const mockUseOrganizations = vi.fn();
 const mockUseAuth = vi.fn();
 const mockUseOrgScope = vi.fn();
@@ -15,11 +23,14 @@ const mockUseEventSources = vi.fn();
 const mockToastSuccess = vi.fn();
 const mockToastError = vi.fn();
 const mockRefetch = vi.fn();
+const mockEditUserDialog = vi.fn();
 
 vi.mock("@/hooks/useUsers", () => ({
-	useUsersFiltered: (...args: unknown[]) => mockUseUsersFiltered(...args),
+	useUsersPage: (...args: unknown[]) => mockUseUsersPage(...args),
 	useDeleteUser: () => mockUseDeleteUser(),
 	useUpdateUser: () => mockUseUpdateUser(),
+	useResetUserMfa: () => ({ mutateAsync: mockResetMfa }),
+	useSignOutUserEverywhere: () => ({ mutateAsync: mockSignOut }),
 }));
 
 vi.mock("@/hooks/useOrganizations", () => ({
@@ -29,6 +40,52 @@ vi.mock("@/hooks/useOrganizations", () => ({
 vi.mock("@/contexts/AuthContext", () => ({
 	useAuth: () => mockUseAuth(),
 }));
+
+const authz = vi.hoisted(() => ({
+	summary: undefined as AuthorizationSummary | undefined,
+}));
+vi.mock("@/services/authorization", () => ({
+	useAuthorization: () => ({
+		authorization: authz.summary,
+		isPlatformAdmin: authz.summary?.is_platform_admin ?? false,
+		canAt: (permission: string, target: AuthorizationTarget) =>
+			canAt(authz.summary, permission, target),
+		canAnywhere: (permission: string) =>
+			canAnywhere(authz.summary, permission),
+		meets: (requirement: PermissionRequirement) =>
+			meetsRequirement(authz.summary, requirement),
+	}),
+}));
+
+const PROVIDER_ORG = "org-provider";
+
+function adminSummary(): AuthorizationSummary {
+	return {
+		is_platform_admin: true,
+		home_organization_id: PROVIDER_ORG,
+		provider_organization_id: PROVIDER_ORG,
+		base_role: { id: "admin-role", name: "Platform Admin" },
+		grants: [],
+	};
+}
+
+function operatorSummary(): AuthorizationSummary {
+	return {
+		...adminSummary(),
+		is_platform_admin: false,
+		base_role: { id: "user-role", name: "User" },
+		grants: [
+			"users.read",
+			"users.readwrite",
+			"organizations.read",
+			"roleassignments.read",
+			"roleassignments.readwrite",
+		].map((permission) => ({
+			permission,
+			boundary: { kind: "managed_organizations", organization_id: null },
+		})),
+	};
+}
 
 vi.mock("@/contexts/OrgScopeContext", () => ({
 	useOrgScope: () => mockUseOrgScope(),
@@ -64,7 +121,12 @@ vi.mock("@/components/users/CreateUserDialog", () => ({
 }));
 
 vi.mock("@/components/users/EditUserDialog", () => ({
-	EditUserDialog: () => null,
+	EditUserDialog: (props: { open: boolean; user?: { id: string } }) => {
+		mockEditUserDialog(props);
+		return props.open ? (
+			<div role="dialog">Edit user test dialog</div>
+		) : null;
+	},
 }));
 
 vi.mock("@/components/users/BulkUserDialogs", () => ({
@@ -74,7 +136,36 @@ vi.mock("@/components/users/BulkUserDialogs", () => ({
 	BulkSetActiveDialog: () => null,
 }));
 
+import {
+	canAnywhere,
+	canAt,
+	meetsRequirement,
+	type AuthorizationSummary,
+	type AuthorizationTarget,
+	type PermissionRequirement,
+} from "@/lib/authorization";
 import { Users } from "./Users";
+
+beforeEach(() => {
+	authz.summary = adminSummary();
+});
+
+function LocationProbe() {
+	return <output aria-label="location">{useLocation().pathname}</output>;
+}
+
+function renderUsersRoute(initialEntry = "/users") {
+	return renderWithProviders(
+		<>
+			<Routes>
+				<Route path="/users" element={<Users />} />
+				<Route path="/users/:userId" element={<p>Person page</p>} />
+			</Routes>
+			<LocationProbe />
+		</>,
+		{ initialEntries: [initialEntry] },
+	);
+}
 
 const registrationUrl = "https://example.test/accept-invite?token=invite-token";
 
@@ -119,9 +210,11 @@ describe("Users — registration links", () => {
 		originalWriteText = navigator.clipboard?.writeText.bind(
 			navigator.clipboard,
 		);
-		mockUseUsersFiltered.mockReturnValue({
-			data: [pendingInviteUser()],
+		mockUseUsersPage.mockReturnValue({
+			data: { items: [pendingInviteUser()], total: 1 },
 			isLoading: false,
+			isFetching: false,
+			isError: false,
 			refetch: vi.fn(),
 		});
 		mockUseDeleteUser.mockReturnValue({ mutateAsync: vi.fn() });
@@ -161,6 +254,41 @@ describe("Users — registration links", () => {
 		});
 		mockToastSuccess.mockReset();
 		mockToastError.mockReset();
+		mockEditUserDialog.mockClear();
+	});
+
+	it("opens the person page when a row is selected", async () => {
+		const { user } = renderUsersRoute();
+
+		await user.click(screen.getByText("Alice"));
+
+		expect(
+			screen.getByRole("status", { name: "location" }),
+		).toHaveTextContent("/users/user-1");
+		expect(screen.getByText("Person page")).toBeInTheDocument();
+		expect(mockEditUserDialog).not.toHaveBeenCalledWith(
+			expect.objectContaining({ open: true }),
+		);
+	});
+
+	it("edits a profile from the row menu without leaving the list", async () => {
+		const { user } = renderUsersRoute();
+
+		await user.click(screen.getByRole("button", { name: "Alice actions" }));
+		await user.click(
+			screen.getByRole("menuitem", { name: "Edit Profile" }),
+		);
+
+		expect(await screen.findByRole("dialog")).toBeInTheDocument();
+		expect(mockEditUserDialog).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				open: true,
+				user: expect.objectContaining({ id: "user-1" }),
+			}),
+		);
+		expect(
+			screen.getByRole("status", { name: "location" }),
+		).toHaveTextContent(/^\/users$/);
 	});
 
 	afterEach(() => {
@@ -176,11 +304,13 @@ describe("Users — registration links", () => {
 	it("shows a generated registration link in a modal", async () => {
 		const { user } = renderWithProviders(<Users />);
 
-		await user.click(screen.getByRole("button", { name: /user actions/i }));
+		await user.click(screen.getByRole("button", { name: "Alice actions" }));
 		await user.click(screen.getByText(/generate registration link/i));
 
 		expect(
-			await screen.findByRole("heading", { name: /user created/i }),
+			await screen.findByRole("heading", {
+				name: /registration link ready/i,
+			}),
 		).toBeInTheDocument();
 		expect(screen.queryByText("Destination")).not.toBeInTheDocument();
 		expect(screen.queryByText(registrationUrl)).not.toBeInTheDocument();
@@ -213,21 +343,55 @@ describe("Users — registration links", () => {
 		).writeText = undefined;
 		const { user } = renderWithProviders(<Users />);
 
-		await user.click(screen.getByRole("button", { name: /user actions/i }));
+		await user.click(screen.getByRole("button", { name: "Alice actions" }));
 		await user.click(screen.getByText(/copy registration link/i));
 
 		await waitFor(() => {
 			expect(
-				screen.getByRole("heading", { name: /user created/i }),
+				screen.getByRole("heading", {
+					name: /registration link ready/i,
+				}),
 			).toBeInTheDocument();
 		});
 		expect(mockToastSuccess).not.toHaveBeenCalled();
 	});
 
+	it("retains a generated link when delivery fails and retries the same link", async () => {
+		mockSendInviteMutate
+			.mockRejectedValueOnce({ detail: "Synthetic delivery failure" })
+			.mockResolvedValueOnce({});
+		const { user } = renderWithProviders(<Users />);
+		await user.click(screen.getByRole("button", { name: "Alice actions" }));
+		await user.click(screen.getByText(/generate registration link/i));
+		await user.click(
+			await screen.findByRole("button", {
+				name: /send registration email/i,
+			}),
+		);
+		await waitFor(() =>
+			expect(screen.getByRole("alert")).toHaveTextContent(
+				"Synthetic delivery failure",
+			),
+		);
+		expect(
+			screen.getByRole("button", { name: /copy registration link/i }),
+		).toBeEnabled();
+		await user.click(
+			screen.getByRole("button", { name: /send registration email/i }),
+		);
+		await waitFor(() =>
+			expect(mockSendInviteMutate).toHaveBeenCalledTimes(2),
+		);
+		expect(mockSendInviteMutate).toHaveBeenNthCalledWith(2, {
+			userId: "user-1",
+			registrationUrl,
+		});
+	});
+
 	it("sends the registration email from a generated link", async () => {
 		const { user } = renderWithProviders(<Users />);
 
-		await user.click(screen.getByRole("button", { name: /user actions/i }));
+		await user.click(screen.getByRole("button", { name: "Alice actions" }));
 		await user.click(screen.getByText(/generate registration link/i));
 		await user.click(
 			await screen.findByRole("button", {
@@ -250,10 +414,12 @@ describe("Users — registration links", () => {
 describe("Users", () => {
 	beforeEach(() => {
 		mockRefetch.mockReset();
-		mockUseUsersFiltered.mockReset();
-		mockUseUsersFiltered.mockReturnValue({
-			data: [makeUser()],
+		mockUseUsersPage.mockReset();
+		mockUseUsersPage.mockReturnValue({
+			data: { items: [makeUser()], total: 1 },
 			isLoading: false,
+			isFetching: false,
+			isError: false,
 			refetch: mockRefetch,
 		});
 		mockUseOrganizations.mockReset();
@@ -298,12 +464,314 @@ describe("Users", () => {
 	it("includes inactive users when Show Inactive is enabled", async () => {
 		const { user } = renderWithProviders(<Users />);
 
-		expect(mockUseUsersFiltered).toHaveBeenLastCalledWith(undefined, false);
-
-		await user.click(
-			screen.getByRole("switch", { name: "Show Inactive" }),
+		expect(mockUseUsersPage).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				includeInactive: false,
+				offset: 0,
+				limit: 25,
+			}),
 		);
 
-		expect(mockUseUsersFiltered).toHaveBeenLastCalledWith(undefined, true);
+		await user.click(screen.getByRole("switch", { name: "Show Inactive" }));
+
+		expect(mockUseUsersPage).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				includeInactive: true,
+				offset: 0,
+				limit: 25,
+			}),
+		);
+	});
+
+	it("keeps pagination in the bounded table footer", () => {
+		mockUseUsersPage.mockReturnValue({
+			data: { items: [makeUser()], total: 30 },
+			isLoading: false,
+			isFetching: false,
+			isError: false,
+			refetch: mockRefetch,
+		});
+
+		renderWithProviders(<Users />);
+
+		const pagination = screen.getByRole("navigation", {
+			name: /pagination/i,
+		});
+		expect(pagination.closest("tfoot")).not.toBeNull();
+		expect(
+			screen.getAllByRole("table")[0].parentElement?.parentElement,
+		).toHaveClass("max-h-full");
+	});
+	it("keeps mobile selection, account identity and server sorting available", async () => {
+		mockUseMediaQuery.mockReturnValue(true);
+		const { user } = renderWithProviders(<Users />);
+		expect(screen.queryByRole("table")).not.toBeInTheDocument();
+		const records = screen.getByRole("list", { name: "Users" });
+		expect(within(records).getByText("Platform Admin")).toBeVisible();
+		expect(within(records).getByText("dev@gobifrost.com")).toBeVisible();
+		await user.click(
+			screen.getByRole("checkbox", { name: "Select Dev Admin" }),
+		);
+		expect(
+			screen.getByRole("region", { name: "Bulk user actions" }),
+		).toHaveTextContent("1 selected");
+		await user.selectOptions(
+			screen.getByRole("combobox", { name: "Sort users" }),
+			"last_login:desc",
+		);
+		expect(mockUseUsersPage).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				sortBy: "last_login",
+				sortDirection: "desc",
+				offset: 0,
+			}),
+		);
+	});
+	it("keeps self-selection disabled on mobile", () => {
+		mockUseMediaQuery.mockReturnValue(true);
+		mockUseAuth.mockReturnValue({
+			isPlatformAdmin: true,
+			user: { id: "user-1" },
+		});
+		renderWithProviders(<Users />);
+		expect(
+			screen.getByRole("checkbox", { name: "Cannot select yourself" }),
+		).toBeDisabled();
+	});
+	it("retains cached records and selection when refresh fails", async () => {
+		mockUseMediaQuery.mockReturnValue(true);
+		const { user, rerender } = renderWithProviders(<Users />);
+		await user.click(
+			screen.getByRole("checkbox", { name: "Select Dev Admin" }),
+		);
+		mockUseUsersPage.mockReturnValue({
+			data: { items: [makeUser()], total: 1 },
+			isLoading: false,
+			isFetching: false,
+			isError: true,
+			refetch: mockRefetch,
+		});
+		rerender(<Users />);
+		expect(screen.getByRole("alert")).toHaveTextContent(
+			"Users could not be refreshed",
+		);
+		expect(
+			screen.getByRole("checkbox", { name: "Select Dev Admin" }),
+		).toBeChecked();
+		await user.click(screen.getByRole("button", { name: "Retry Users" }));
+		expect(mockRefetch).toHaveBeenCalledOnce();
+	});
+});
+
+describe("Users — permission-driven actions", () => {
+	beforeEach(() => {
+		mockUseDeleteUser.mockReturnValue({ mutateAsync: vi.fn() });
+		mockUseUpdateUser.mockReturnValue({ mutateAsync: vi.fn() });
+		mockUseOrganizations.mockReturnValue({
+			data: [
+				{ id: "org-1", name: "Acme", is_provider: false },
+				{ id: PROVIDER_ORG, name: "Provider", is_provider: true },
+			],
+		});
+		mockUseAuth.mockReturnValue({ user: { id: "current-user" } });
+		mockUseOrgScope.mockReturnValue({
+			scope: { type: "global", orgName: null },
+		});
+		mockUseEventSources.mockReturnValue({ data: { items: [] } });
+		mockUseUsersPage.mockReturnValue({
+			data: {
+				items: [
+					makeUser({
+						id: "ordinary",
+						name: "Ordinary Person",
+						email: "ordinary@acme.test",
+						is_superuser: false,
+						organization_id: "org-1",
+					}),
+					makeUser({
+						id: "protected",
+						name: "Guarded Admin",
+						email: "guarded@acme.test",
+						is_superuser: false,
+						is_protected: true,
+						organization_id: "org-1",
+					}),
+				],
+				total: 2,
+			},
+			isLoading: false,
+			isFetching: false,
+			isError: false,
+			refetch: vi.fn(),
+		});
+	});
+
+	it("gives an operator support actions only, and no deletion", async () => {
+		authz.summary = operatorSummary();
+		const { user } = renderUsersRoute();
+
+		expect(
+			screen.getByRole("button", { name: "Create User" }),
+		).toBeInTheDocument();
+		await user.click(
+			screen.getByRole("button", { name: "Ordinary Person actions" }),
+		);
+		expect(
+			screen.getByRole("menuitem", { name: "Disable" }),
+		).not.toHaveAttribute("data-disabled");
+		expect(
+			screen.queryByRole("menuitem", { name: "Delete" }),
+		).not.toBeInTheDocument();
+	});
+
+	it("resets a user's MFA after the confirm dialog and reports what was removed", async () => {
+		mockResetMfa.mockResolvedValue({
+			totp_removed: true,
+			recovery_codes_removed: 8,
+			passkeys_removed: 1,
+			trusted_devices_revoked: 2,
+			sessions_revoked: 3,
+		});
+		authz.summary = operatorSummary();
+		const { user } = renderUsersRoute();
+
+		await user.click(
+			screen.getByRole("button", { name: "Ordinary Person actions" }),
+		);
+		await user.click(screen.getByRole("menuitem", { name: "Reset MFA" }));
+		expect(screen.getByRole("alertdialog")).toHaveTextContent(
+			"Removes Ordinary Person’s authenticator app, recovery codes, passkeys and remembered devices, and signs them out everywhere.",
+		);
+		expect(mockResetMfa).not.toHaveBeenCalled();
+		await user.click(screen.getByRole("button", { name: "Reset MFA" }));
+
+		await waitFor(() =>
+			expect(mockResetMfa).toHaveBeenCalledWith({
+				params: { path: { user_id: "ordinary" } },
+			}),
+		);
+		expect(mockToastSuccess).toHaveBeenCalledWith(
+			"MFA reset for Ordinary Person",
+			{
+				description:
+					"Removed the authenticator app, 8 recovery codes, 1 passkey, 2 remembered devices. Ended 3 sessions. They'll set up MFA at their next sign-in.",
+			},
+		);
+		await waitFor(() =>
+			expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+		);
+	});
+
+	it("shows the passkey-only refusal inside the dialog and leaves it open", async () => {
+		mockResetMfa.mockRejectedValue({
+			detail: "This user signs in only with a passkey. Resetting would leave them no way to sign in.",
+		});
+		const { user } = renderUsersRoute();
+
+		await user.click(
+			screen.getByRole("button", { name: "Ordinary Person actions" }),
+		);
+		await user.click(screen.getByRole("menuitem", { name: "Reset MFA" }));
+		await user.click(screen.getByRole("button", { name: "Reset MFA" }));
+
+		expect(await screen.findByRole("alert")).toHaveTextContent(
+			"This user signs in only with a passkey. Resetting would leave them no way to sign in.",
+		);
+		expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+		expect(mockToastSuccess).not.toHaveBeenCalled();
+	});
+
+	it("signs a user out of every device through the admin revoke endpoint", async () => {
+		mockSignOut.mockResolvedValue({
+			message: "All sessions have been revoked",
+			sessions_revoked: 1,
+		});
+		const { user } = renderUsersRoute();
+
+		await user.click(
+			screen.getByRole("button", { name: "Ordinary Person actions" }),
+		);
+		await user.click(
+			screen.getByRole("menuitem", { name: "Sign Out of All Devices" }),
+		);
+		expect(screen.getByRole("alertdialog")).toHaveTextContent(
+			"Signs Ordinary Person out on every device. They can sign in again right away.",
+		);
+		await user.click(
+			screen.getByRole("button", { name: "Sign Out Everywhere" }),
+		);
+
+		await waitFor(() =>
+			expect(mockSignOut).toHaveBeenCalledWith({
+				body: { user_id: "ordinary" },
+			}),
+		);
+		expect(mockToastSuccess).toHaveBeenCalledWith(
+			"Ordinary Person signed out",
+			{ description: "Ended 1 session." },
+		);
+	});
+
+	it("shows an operator a protected user's actions disabled, with why", async () => {
+		authz.summary = operatorSummary();
+		const { user } = renderUsersRoute();
+
+		expect(screen.getAllByText("Protected").length).toBeGreaterThan(0);
+		await user.click(
+			screen.getByRole("button", { name: "Guarded Admin actions" }),
+		);
+		expect(
+			screen.getByText(/only a platform admin can change it/i),
+		).toBeInTheDocument();
+		for (const name of [
+			"Reset MFA",
+			"Sign Out of All Devices",
+			"Disable",
+		]) {
+			expect(screen.getByRole("menuitem", { name })).toHaveAttribute(
+				"data-disabled",
+			);
+		}
+	});
+
+	it("lets a Platform Admin change protected users", async () => {
+		const { user } = renderUsersRoute();
+
+		await user.click(
+			screen.getByRole("button", { name: "Guarded Admin actions" }),
+		);
+		expect(
+			screen.queryByText(/only a platform admin can change it/i),
+		).not.toBeInTheDocument();
+		expect(
+			screen.getByRole("menuitem", { name: "Delete" }),
+		).not.toHaveAttribute("data-disabled");
+	});
+
+	it("hides creation, selection and row actions from a read-only viewer", () => {
+		authz.summary = {
+			...operatorSummary(),
+			grants: operatorSummary().grants.filter((grant) =>
+				grant.permission.endsWith(".read"),
+			),
+		};
+		renderUsersRoute();
+
+		expect(
+			screen.getByText(
+				"View and support users in the organizations you can reach",
+			),
+		).toBeInTheDocument();
+		expect(
+			screen.queryByRole("button", { name: "Create User" }),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByRole("checkbox", {
+				name: "Select all visible users",
+			}),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByRole("button", { name: "Ordinary Person actions" }),
+		).not.toBeInTheDocument();
 	});
 });

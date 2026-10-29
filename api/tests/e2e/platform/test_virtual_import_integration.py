@@ -7,9 +7,60 @@ Tests the complete flow of:
 """
 
 import sys
+from typing import Awaitable, cast
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
+
+
+@pytest.mark.e2e
+@pytest.mark.asyncio
+async def test_resolver_invalidation_with_large_unrelated_keyspace():
+    """Nested source updates invalidate all scopes without a Redis walk."""
+    from src.core.module_cache import (
+        get_module_resolution_cache, get_module_resolution_generation,
+        set_module_resolution_cache, set_module,
+    )
+    from src.core.redis_client import get_redis_client
+
+    redis = await get_redis_client()._get_redis()
+    affected = [
+        f"{scope}:{name}"
+        for scope in ["-:0", "-:1", "solution-a:0", "solution-b:1"]
+        for name in ["modules", "modules.helpers", "modules.helpers.tool"]
+    ]
+    preserved = ["solution-a:0:modules.other", "-:1:modules.helpers.toolkit"]
+    unrelated = [f"resolver-scale-test:{i}" for i in range(10_000)]
+    source_path = "_solutions/solution-a/modules/helpers/tool.py"
+    try:
+        for key in affected + preserved:
+            generation = await get_module_resolution_generation(key)
+            await set_module_resolution_cache(
+                key, {"kind": "namespace", "path": "test"}, generation=generation,
+            )
+        async with redis.pipeline(transaction=False) as pipeline:
+            for key in unrelated:
+                pipeline.set(key, "{}", ex=60)
+            await pipeline.execute()
+
+        with patch.object(redis, "scan_iter", wraps=redis.scan_iter) as scan:
+            await set_module(source_path, "VALUE = 2", "new-hash")
+
+        scan.assert_not_called()
+        for key in affected:
+            assert await get_module_resolution_cache(key) is None
+        for key in preserved:
+            assert await get_module_resolution_cache(key) == {"kind": "namespace", "path": "test"}
+        assert await redis.get(unrelated[0]) == "{}"
+    finally:
+        from src.core.module_cache_contract import MODULE_RESOLUTION_KEY_PREFIX, module_resolution_generation_key
+        await redis.delete(
+            *unrelated, f"bifrost:module:{source_path}",
+            *[f"{MODULE_RESOLUTION_KEY_PREFIX}{key}" for key in affected + preserved],
+            *[module_resolution_generation_key(key) for key in affected + preserved],
+        )
+        await cast(Awaitable[int], redis.srem("bifrost:module:index", source_path))
 
 
 @pytest.fixture(autouse=True)
@@ -81,12 +132,67 @@ class TestVirtualImportIntegration:
             await clear_module_cache()
 
     @pytest.mark.asyncio
+    async def test_sdk_module_resolver_endpoint_resolves_module_namespace_and_miss(
+        self,
+        e2e_client,
+        platform_admin,
+    ):
+        """The resolver endpoint classifies one logical import without whole-index lookup."""
+        from src.core.module_cache import clear_module_cache, set_module
+        from src.services.repo_storage import RepoStorage
+
+        storage = RepoStorage()
+        await clear_module_cache()
+        await storage.write("resolver_live/pkg/helper.py", b"VALUE = 42")
+        await set_module(
+            path="resolver_live/pkg/helper.py",
+            content="VALUE = 42",
+            content_hash="resolver-live-hash",
+        )
+
+        try:
+            module_resp = e2e_client.get(
+                "/api/sdk/modules-resolve",
+                params={"name": "resolver_live.pkg.helper"},
+                headers=platform_admin.headers,
+            )
+            assert module_resp.status_code == 200
+            module_body = module_resp.json()
+            assert module_body["kind"] == "module"
+            assert module_body["path"] == "resolver_live/pkg/helper.py"
+            assert module_body["content"] == "VALUE = 42"
+
+            namespace_resp = e2e_client.get(
+                "/api/sdk/modules-resolve",
+                params={"name": "resolver_live"},
+                headers=platform_admin.headers,
+            )
+            assert namespace_resp.status_code == 200
+            assert namespace_resp.json() == {
+                "kind": "namespace",
+                "path": "resolver_live",
+            }
+
+            miss_resp = e2e_client.get(
+                "/api/sdk/modules-resolve",
+                params={"name": "resolver_live.missing"},
+                headers=platform_admin.headers,
+            )
+            assert miss_resp.status_code == 200
+            assert miss_resp.json() == {
+                "kind": "not_found",
+                "path": "resolver_live/missing",
+            }
+        finally:
+            await clear_module_cache()
+            await storage.delete("resolver_live/pkg/helper.py")
+
+    @pytest.mark.asyncio
     async def test_virtual_import_package_with_submodule(self, db_session: AsyncSession):
         """Test importing a package with submodules from Redis cache."""
         from src.core.module_cache import clear_module_cache, set_module
         from src.services.execution.virtual_import import (
             install_virtual_import_hook,
-            invalidate_module_index,
             remove_virtual_import_hook,
         )
 
@@ -105,7 +211,6 @@ class TestVirtualImportIntegration:
 
         # Install virtual import hook
         install_virtual_import_hook()
-        invalidate_module_index()  # Force refresh of index
 
         try:
             # Import package and submodule
@@ -199,7 +304,6 @@ class TestEndToEndModuleLoading:
         from src.core.module_cache import clear_module_cache, set_module
         from src.services.execution.virtual_import import (
             install_virtual_import_hook,
-            invalidate_module_index,
             remove_virtual_import_hook,
         )
 
@@ -221,7 +325,6 @@ def run_workflow(params):
 
             # Step 2: Install virtual import hook
             install_virtual_import_hook()
-            invalidate_module_index()
 
             # Step 3: Import and use the module
             import e2e_test_workflow  # type: ignore[import-not-found]

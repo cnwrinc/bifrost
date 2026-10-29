@@ -212,7 +212,7 @@ async def test_build_with_migrate_runs_migration_before_bundle() -> None:
     call_order: list[str] = []
 
     async def fake_migrate(
-        app_id: str, repo_prefix: str
+        app_id: str, repo_prefix: str, db: object
     ) -> tuple[bool, list[object]]:
         call_order.append("migrate")
         return True, []
@@ -243,6 +243,7 @@ async def test_build_with_migrate_runs_migration_before_bundle() -> None:
             repo_prefix="apps/test/",
             mode="preview",
             dependencies={},
+            db=AsyncMock(),
         )
 
     assert call_order == ["migrate", "build"]
@@ -453,3 +454,13 @@ async def test_write_entry_imports_tailwind_css_when_present() -> None:
     assert f"./{TAILWIND_OUTPUT_CSS}" in entry, (
         "entry must import the generated tailwind CSS so esbuild bundles it"
     )
+
+
+def test_portal_context_primitives_use_host_platform_not_lucide(
+    bundler: BundlerService, tmp_path: pathlib.Path
+) -> None:
+    names = {"createContext", "createElement", "useContext"}
+    pkg = _build_pkg_with_bifrost_imports(bundler, tmp_path, names)
+    for name in names:
+        assert f"export const {name} = _p['{name}'];" in pkg
+    assert 'from "lucide-react"' not in pkg

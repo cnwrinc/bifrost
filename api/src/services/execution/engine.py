@@ -3,28 +3,177 @@ Unified Execution Engine
 Single source of truth for all code execution (workflows, scripts, data providers)
 """
 
+import asyncio
+import copy
 import inspect
 import json
 import logging
 import os
+import re
+import signal
 import sys
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stdout, redirect_stderr
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Any, get_type_hints, get_origin, get_args, Union
+from types import CodeType
+from typing import Any, Callable, Iterator, Mapping, get_type_hints, get_origin, get_args, Union
 
 from pydantic import BaseModel
+
+from bifrost._runtime_io import write_log
 
 from src.sdk.context import Caller, ExecutionContext, Organization
 from src.sdk.error_handling import WorkflowError
 from src.sdk.errors import UserError, WorkflowExecutionException
 from src.models.enums import ExecutionStatus
-from src.core.cache import get_cached_data_provider, cache_data_provider_result
+from src.core.error_messages import format_exception_message
 from src.core.secret_string import redact_secrets
 
 logger = logging.getLogger(__name__)
+
+
+_RUNTIME_TRANSPORT_LOGGERS = (
+    "httpcore",
+    "hpack",
+    "h2",
+    "h11",
+    "urllib3.connectionpool",
+)
+
+
+def _is_runtime_transport_logger(name: str) -> bool:
+    return any(
+        name == family or name.startswith(f"{family}.")
+        for family in _RUNTIME_TRANSPORT_LOGGERS
+    )
+
+
+_RUNTIME_CREDENTIAL_HEADERS = (
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+)
+_RUNTIME_CREDENTIAL_HEADER_PATTERN = "|".join(_RUNTIME_CREDENTIAL_HEADERS)
+_RUNTIME_HEADER_LINE_RE = re.compile(
+    rf"(?i)(\b(?:{_RUNTIME_CREDENTIAL_HEADER_PATTERN})\s*:\s*)(.*?)(?=(?:[\r\n]|\\[rn])|$)"
+)
+_RUNTIME_HEADER_STRUCTURED_RE = re.compile(
+    rf"(?i)((?:b)?(?:\\?['\"])(?:{_RUNTIME_CREDENTIAL_HEADER_PATTERN})(?:\\?['\"])\s*[:,]\s*(?:b)?)"
+)
+
+
+def _quoted_log_scalar_end(message: str, start: int) -> int | None:
+    """Return the end of a quoted repr/JSON scalar without splitting its value."""
+    escaped_delimiter = message.startswith("\\'", start) or message.startswith('\\"', start)
+    delimiter_length = 2 if escaped_delimiter else 1
+    quote = message[start + delimiter_length - 1]
+    index = start + delimiter_length
+    while index < len(message):
+        if escaped_delimiter:
+            if message.startswith(f"\\{quote}", index):
+                following = index + 2
+                while following < len(message) and message[following].isspace():
+                    following += 1
+                if following == len(message) or message[following] in ",)]}":
+                    return index + 2
+                index += 2
+                continue
+        elif message[index] == "\\":
+            index += 2
+            continue
+        elif message[index] == quote:
+            return index + 1
+        index += 1
+    return None
+
+
+def _sanitize_structured_header_values(message: str) -> str:
+    """Redact quoted dict and bytes-tuple header values without truncating them."""
+    sanitized: list[str] = []
+    cursor = 0
+    for match in _RUNTIME_HEADER_STRUCTURED_RE.finditer(message):
+        if match.start() < cursor:
+            continue
+        value_start = match.end()
+        if value_start >= len(message) or message[value_start] not in "'\\\"":
+            continue
+        value_end = _quoted_log_scalar_end(message, value_start)
+        if value_end is None:
+            delimiter_length = 2 if message[value_start] == "\\" else 1
+            delimiter = message[value_start:value_start + delimiter_length]
+            sanitized.append(message[cursor:value_start])
+            sanitized.append(f"{delimiter}[REDACTED]")
+            return "".join(sanitized)
+        delimiter_length = 2 if message[value_start] == "\\" else 1
+        delimiter = message[value_start:value_start + delimiter_length]
+        sanitized.append(message[cursor:value_start])
+        sanitized.append(f"{delimiter}[REDACTED]{delimiter}")
+        cursor = value_end
+    sanitized.append(message[cursor:])
+    return "".join(sanitized)
+
+
+def _sanitize_runtime_log_message(message: str, secret_values: set[str]) -> str:
+    """Redact credentials from HTTP header renderings before they leave the engine."""
+    sanitized = _sanitize_structured_header_values(message)
+    sanitized = _RUNTIME_HEADER_LINE_RE.sub(
+        lambda match: f"{match.group(1)}[REDACTED]", sanitized
+    )
+    return redact_secrets(sanitized, secret_values)
+
+
+class _RuntimeLogSanitizingFormatter(logging.Formatter):
+    """Format a cloned record so console output cannot alter capture behavior."""
+
+    def __init__(
+        self,
+        formatter: logging.Formatter | None,
+        secret_values: Callable[[], set[str]],
+    ) -> None:
+        super().__init__()
+        self._formatter = formatter or logging.Formatter()
+        self._secret_values = secret_values
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = self._formatter.format(copy.copy(record))
+        return _sanitize_runtime_log_message(formatted, self._secret_values())
+
+
+@contextmanager
+def _runtime_logging_scope(
+    root_logger: logging.Logger,
+    secret_values: Callable[[], set[str]],
+) -> Iterator[None]:
+    """Capture user DEBUG logs while keeping transport noise and credentials scoped."""
+    root_level = root_logger.level
+    handlers = list(root_logger.handlers)
+    handler_formatters = [(handler, handler.formatter) for handler in handlers]
+    logger_levels: dict[logging.Logger, int] = {}
+    for name, candidate in logging.root.manager.loggerDict.items():
+        if not isinstance(candidate, logging.Logger):
+            continue
+        if _is_runtime_transport_logger(name):
+            logger_levels[candidate] = candidate.level
+    for family in _RUNTIME_TRANSPORT_LOGGERS:
+        transport_logger = logging.getLogger(family)
+        logger_levels.setdefault(transport_logger, transport_logger.level)
+
+    for handler, formatter in handler_formatters:
+        handler.setFormatter(_RuntimeLogSanitizingFormatter(formatter, secret_values))
+    for transport_logger, level in logger_levels.items():
+        transport_logger.setLevel(max(level, logging.INFO))
+    root_logger.setLevel(logging.DEBUG)
+    try:
+        yield
+    finally:
+        root_logger.setLevel(root_level)
+        for transport_logger, level in logger_levels.items():
+            transport_logger.setLevel(level)
+        for handler, formatter in handler_formatters:
+            handler.setFormatter(formatter)
 
 
 def _human_size(num_bytes: int) -> str:
@@ -36,13 +185,51 @@ def _human_size(num_bytes: int) -> str:
     return f"{num_bytes:.1f}TB"
 
 
-# Import unified log streaming (Redis Stream + PubSub)
-try:
-    from bifrost._logging import log_and_broadcast
-    STREAM_LOGGING_AVAILABLE = True
-except ImportError:
-    STREAM_LOGGING_AVAILABLE = False
-    log_and_broadcast = None  # type: ignore
+# Attribute naming the code object whose locals are captured when it returns,
+# for callables that run user code in an inner function (inline scripts).
+_CAPTURE_CODE_ATTR = "_bifrost_capture_code"
+
+# sys.monitoring tool ids CPython leaves unassigned (0, 1, 2 and 5 are the
+# conventional debugger, coverage, profiler and optimizer ids).
+_CAPTURE_TOOL_IDS = (3, 4)
+
+
+@contextmanager
+def _capture_locals_on_return(
+    code: CodeType, capture: Callable[[Mapping[str, Any]], None]
+) -> Iterator[None]:
+    """Call ``capture`` with the frame's locals whenever ``code`` returns.
+
+    A PEP 669 ``PY_RETURN`` event scoped to ``code`` alone fires once per
+    return; no other code is instrumented and no per-line or per-call Python
+    callback runs. An await suspension raises ``PY_YIELD`` and an exception
+    raises ``PY_UNWIND``, so neither reaches ``capture``. ``sys.settrace`` is
+    left alone, so an attached debugger keeps its tracer.
+    """
+    monitoring = sys.monitoring
+    tool_id = next(
+        (t for t in _CAPTURE_TOOL_IDS if monitoring.get_tool(t) is None), None
+    )
+    if tool_id is None:
+        raise RuntimeError(
+            "Workflow variable capture could not get a sys.monitoring tool id: "
+            f"ids {_CAPTURE_TOOL_IDS} are all in use"
+        )
+
+    def on_return(returning_code: CodeType, instruction_offset: int, retval: object) -> None:
+        # The returning frame is the caller of this callback.
+        capture(sys._getframe(1).f_locals)
+
+    monitoring.use_tool_id(tool_id, "bifrost-variable-capture")
+    try:
+        monitoring.register_callback(tool_id, monitoring.events.PY_RETURN, on_return)
+        monitoring.set_local_events(tool_id, code, monitoring.events.PY_RETURN)
+        yield
+    finally:
+        monitoring.set_local_events(tool_id, code, monitoring.events.NO_EVENTS)
+        monitoring.register_callback(tool_id, monitoring.events.PY_RETURN, None)
+        monitoring.free_tool_id(tool_id)
+
 
 # Import bifrost context management for SDK support
 project_root = Path(__file__).parent.parent
@@ -57,15 +244,21 @@ except ImportError:
         "Bifrost SDK not available - user workflows cannot use bifrost SDK")
     BIFROST_CONTEXT_AVAILABLE = False
 
-# Import write buffer for SDK writes
-try:
-    from bifrost._write_buffer import WriteBuffer, set_write_buffer, clear_write_buffer
-    WRITE_BUFFER_AVAILABLE = True
-except ImportError:
-    WRITE_BUFFER_AVAILABLE = False
-    WriteBuffer = None  # type: ignore
-    set_write_buffer = None  # type: ignore
-    clear_write_buffer = None  # type: ignore
+@dataclass
+class ServiceRunConfig:
+    """Supervision config for one service attempt (engine service mode)."""
+
+    service_id: str
+    attempt_id: str
+    lease_token: str
+    revision: str | None = None
+    graceful_shutdown_seconds: int = 30
+    startup_grace_seconds: int = 60
+    # Initial renewable credential; the supervisor installs fresher ones
+    # from the parent's Redis handoff as they arrive.
+    token: str = ""
+    token_expires_at: str = ""
+
 
 @dataclass
 class ExecutionRequest:
@@ -87,6 +280,7 @@ class ExecutionRequest:
 
     # Execution settings
     timeout_seconds: int = 1800          # Default 30 minutes
+    workflow_deadline: datetime | None = None
     cache_ttl_seconds: int = 300         # For data providers
 
     # Parameters
@@ -117,6 +311,17 @@ class ExecutionRequest:
     # entity — own-first, then _repo/. None for plain _repo/ executions.
     solution_id: str | None = None
     artifact_workspace_id: str | None = None
+
+    # Service mode (Slice 3): set for supervised @service runs. The engine
+    # invokes the service coroutine with cooperative stop (no timeout kill,
+    # no variable tracing) and attempt-scoped log streaming.
+    service: ServiceRunConfig | None = None
+
+    # The pre-minted engine token this process installed as its SDK
+    # credentials (see worker.py::_set_process_engine_credentials).
+    # Registered as a dynamic secret so _scrub_outputs redacts it from
+    # results, logs, variables and error messages.
+    engine_token: str | None = None
 
 
 @dataclass
@@ -220,8 +425,15 @@ def _scrub_outputs(
     logs: list[dict[str, Any]] | None = None,
     error_message: str | None = None,
 ) -> tuple[Any, dict[str, Any] | None, list[dict[str, Any]] | None, str | None]:
-    """Scrub secret values from execution outputs before returning."""
+    """Scrub credentials from logs/errors and known secrets from all outputs."""
     secret_values = context._collect_secret_values()
+    if logs is not None:
+        logs = [
+            {**entry, "message": _sanitize_runtime_log_message(entry["message"], secret_values)}
+            for entry in logs
+        ]
+    if error_message is not None:
+        error_message = _sanitize_runtime_log_message(error_message, secret_values)
     if not secret_values:
         return result, variables, logs, error_message
     return (
@@ -250,6 +462,11 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
         ValueError: If neither func nor code provided
     """
     start_time = datetime.now(timezone.utc)
+
+    # Supervised service mode: cooperative stop, no timeout kill, no
+    # variable tracing, attempt-scoped log streaming.
+    if request.service is not None:
+        return await execute_service(request, start_time=start_time)
 
     # Resolve what we're executing
     func = None
@@ -291,6 +508,8 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
         is_platform_admin=request.is_platform_admin,
         is_function_key=False,  # Engine executions are not function key based
         execution_id=request.execution_id,
+        workflow_deadline=request.workflow_deadline,
+        workflow_timeout_seconds=request.timeout_seconds,
         workflow_name=request.name or "",  # Workflow/script name for context
         public_url=get_settings().public_url,
         startup=request.startup,  # Launch workflow results (from form execution)
@@ -301,6 +520,11 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
         solution_id=request.solution_id,  # install scope for SDK name lookups
         artifact_workspace_id=request.artifact_workspace_id,
     )
+
+    # The engine token this process installed as its SDK credentials is a
+    # secret like any other: register it so _scrub_outputs redacts it from
+    # the result, logs, variables and error message.
+    context._register_dynamic_secret(request.engine_token)
 
     # Set bifrost SDK context if available
     if BIFROST_CONTEXT_AVAILABLE:
@@ -322,20 +546,17 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
     captured_variables: dict[str, Any] = {}  # Initialize to empty dict
     cache_expires_at_str: str | None = None  # For data providers
 
-    # Note: SDK authentication is handled by authenticate_engine() in worker.py
-    # which creates credentials in ~/.bifrost/credentials.json before each execution.
+    # SDK authentication uses the pre-minted runtime credential installed by
+    # worker.py for this one-shot child.
     # The SDK's get_client() finds these credentials automatically.
 
     try:
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            # Check Redis cache for data providers
+            # The child has no Redis credentials. The authenticated worker SDK
+            # transport derives this execution's workflow, current authority
+            # partition, and TTL on the server.
             if is_data_provider and not request.no_cache:
-                org_id = request.organization.id if request.organization else None
-                cached_result = await get_cached_data_provider(
-                    org_id,
-                    request.name or "",
-                    request.parameters
-                )
+                cached_result = await _read_runtime_data_provider_cache(request.parameters)
                 if cached_result:
                     return _build_cached_result(
                         request.execution_id,
@@ -361,17 +582,10 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
                 broadcaster=request.broadcaster
             )
 
-            # Cache result to Redis if data provider
-            if is_data_provider and request.cache_ttl_seconds > 0:
-                org_id = request.organization.id if request.organization else None
-                expires_at = await cache_data_provider_result(
-                    org_id,
-                    request.name or "",
-                    request.parameters,
-                    result,
-                    request.cache_ttl_seconds
-                )
-                cache_expires_at_str = expires_at.isoformat()
+            if is_data_provider and not request.no_cache:
+                expires_at = await _write_runtime_data_provider_cache(request.parameters, result)
+                if expires_at is not None:
+                    cache_expires_at_str = expires_at
 
         # Process captured logs (from scripts or workflows with platform admin)
         logger.info(
@@ -475,7 +689,11 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
         # Determine error type from original exception
         original_exc = e.original_exception
         error_type = type(original_exc).__name__
-        error_message = str(original_exc)
+        execution_context = "executing script" if request.code else "executing workflow"
+        error_message = format_exception_message(
+            original_exc,
+            context=execution_context,
+        )
 
         # Add traceback to logs
         import traceback
@@ -550,7 +768,10 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
                     'source': 'workflow'
                 })
 
-        _wf_err_msg = str(e)
+        _wf_err_msg = format_exception_message(
+            e,
+            context="executing script" if request.code else "executing workflow",
+        )
         e.__traceback__ = None  # Free traceback references
 
         _, scrubbed_vars, scrubbed_logs, scrubbed_err = _scrub_outputs(
@@ -574,16 +795,22 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
         # Unexpected error
         end_time = datetime.now(timezone.utc)
         duration_ms = int((end_time - start_time).total_seconds() * 1000)
-
-        logger.error(
-            f"Execution error: {request.name or 'script'}",
-            extra={
-                "execution_id": request.execution_id,
-                "error": str(e),
-                "error_type": type(e).__name__
-            },
-            exc_info=True
+        execution_context = "executing script" if request.code else "executing workflow"
+        error_message = format_exception_message(
+            e,
+            context=execution_context,
         )
+
+        with _runtime_logging_scope(logging.getLogger(), context._collect_secret_values):
+            logger.error(
+                f"Execution error: {request.name or 'script'}",
+                extra={
+                    "execution_id": request.execution_id,
+                    "error": _sanitize_runtime_log_message(error_message, context._collect_secret_values()),
+                    "error_type": type(e).__name__
+                },
+                exc_info=True
+            )
 
         # Add traceback to logs
         import traceback
@@ -613,7 +840,7 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
                         'source': 'script' if request.code else 'workflow'
                     })
 
-        _gen_err_msg = str(e)
+        _gen_err_msg = error_message
         e.__traceback__ = None  # Free traceback references
 
         _, scrubbed_vars, scrubbed_logs, scrubbed_err = _scrub_outputs(
@@ -634,7 +861,7 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
         )
 
     finally:
-        # NOTE: flush_pending_changes, flush_logs_to_postgres, and cleanup_execution_cache
+        # NOTE: flush_logs_to_postgres and cleanup_execution_cache
         # are now called from workflow_execution.py's _process_execution_result() callback.
         # This avoids event loop issues when running in thread workers (each thread creates
         # its own event loop via asyncio.run(), which breaks shared async Redis connections).
@@ -646,10 +873,6 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
             logger.debug(
                 f"Cleared bifrost execution context for execution {request.execution_id}")
 
-        # Clear write buffer context
-        if WRITE_BUFFER_AVAILABLE and clear_write_buffer:
-            clear_write_buffer()
-
         # Close broadcaster to prevent resource leaks
         if request.broadcaster is not None:
             try:
@@ -657,6 +880,353 @@ async def execute(request: ExecutionRequest) -> ExecutionResult:
                 logger.debug(f"Closed broadcaster for execution {request.execution_id}")
             except Exception as e:
                 logger.warning(f"Error closing broadcaster: {e}")
+
+
+async def execute_service(
+    request: ExecutionRequest,
+    start_time: datetime | None = None,
+) -> ExecutionResult:
+    """Run one supervised @service attempt to a terminal outcome.
+
+    Service-mode semantics (vs one-shot workflows):
+    - the service coroutine runs indefinitely until it returns, raises, or
+      a stop is requested — no timeout kill, no variable
+      capture, no completion Postgres flush;
+    - stop arrives cooperatively: SIGTERM/SIGINT sets the supervision event
+      (installed on the loop, overriding the pool's loop-top flag handler)
+      and the parent mirrors ``stop_requested`` over a Redis key as backup;
+    - logs stream continuously to the attempt-scoped Redis stream
+      (``publish_service_log``) with the same MAXLEN bound as executions;
+    - ``service.ready()`` reports are drained to the parent's Redis ready key
+      and the renewable credential is refreshed from the parent's handoff.
+    """
+    from src.config import get_settings
+
+    cfg = request.service
+    assert cfg is not None
+    start_time = start_time or datetime.now(timezone.utc)
+    func = request.func
+    if func is None:
+        raise ValueError("Service execution requires request.func")
+    metadata = getattr(func, "_executable_metadata", None)
+    if metadata is not None and getattr(metadata, "type", None) != "service":
+        raise ValueError(
+            f"Service execution requires a @service function, got type="
+            f"{getattr(metadata, 'type', None)!r}"
+        )
+
+    from src.sdk.context import ROIContext
+
+    roi = ROIContext()
+    if request.roi:
+        roi.time_saved = request.roi.get("time_saved", 0)
+        roi.value = request.roi.get("value", 0.0)
+
+    context = ExecutionContext(
+        user_id=request.caller.user_id,
+        email=request.caller.email,
+        name=request.caller.name,
+        scope=request.organization.id if request.organization else "GLOBAL",
+        organization=request.organization,
+        is_platform_admin=request.is_platform_admin,
+        is_function_key=False,
+        execution_id=cfg.attempt_id,
+        workflow_name=request.name or "",
+        public_url=get_settings().public_url,
+        startup=request.startup,
+        form_inputs=request.form_inputs,
+        embed=request.embed,
+        roi=roi,
+        event=request.event,
+        solution_id=request.solution_id,
+        artifact_workspace_id=request.artifact_workspace_id,
+    )
+
+    if BIFROST_CONTEXT_AVAILABLE:
+        set_execution_context(context)
+
+    # Install the initial renewable credential handed down at dispatch.
+    if cfg.token:
+        from bifrost._service_runtime import install_service_credentials
+
+        install_service_credentials(cfg.token)
+
+    stop_event = asyncio.Event()
+    from bifrost._service_runtime import (
+        clear_service_runtime,
+        install_service_runtime,
+    )
+
+    install_service_runtime(stop_event)
+
+    # Cooperative stop: SIGTERM/SIGINT resolves wait_until_stopping() even
+    # when user code is parked in an await (the pool's loop-top SIGTERM flag
+    # alone cannot interrupt that). Guarded for non-Unix loops.
+    loop = asyncio.get_running_loop()
+    installed_signals: list[int] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+            installed_signals.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            # Non-Unix loop or unsupported signal: cooperative stop still
+            # works via the stop-event mirror; signals are best-effort.
+            pass
+
+    supervisor_task: asyncio.Task[None] | None = None
+    try:
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            supervisor_task = asyncio.create_task(
+                _service_supervisor(cfg, stop_event),
+                name=f"service-supervisor-{cfg.attempt_id[:8]}",
+            )
+            service_logger = logging.getLogger(
+                getattr(func, "__module__", __name__)
+            )
+            service_logger.info(
+                "service starting (revision %s)", cfg.revision or "unknown"
+            )
+            # The parent decides the completion reason from durable state
+            # (stop_requested_at set → 'requested'); the local flag only
+            # records that this run unwound via the stop path.
+            result, service_logs, _ = await _execute_service_with_trace(
+                func, context, request.parameters or {}, cfg, stop_event
+            )
+
+        duration_ms = int(
+            (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        )
+        return ExecutionResult(
+            execution_id=cfg.attempt_id,
+            status=ExecutionStatus.SUCCESS,
+            result=result,
+            duration_ms=duration_ms,
+            logs=service_logs,
+            variables=None,
+            integration_calls=context._integration_calls,
+            execution_context=None,
+            error_message=None,
+            error_type=None,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        duration_ms = int(
+            (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        )
+        service_logger = logging.getLogger(getattr(func, "__module__", __name__))
+        # The user-facing log line is scrubbed by the log handler, but the
+        # persisted error string is built here: redact fetched secrets or
+        # they land verbatim in ServiceAttempt.error via the attempts API.
+        secret_values = context._collect_secret_values()
+        raw_message = format_exception_message(e)
+        error_message = _sanitize_runtime_log_message(raw_message, secret_values)
+        service_logger.error("service failed: %s", error_message)
+        e.__traceback__ = None
+        return ExecutionResult(
+            execution_id=cfg.attempt_id,
+            status=ExecutionStatus.FAILED,
+            result=None,
+            duration_ms=duration_ms,
+            logs=[],
+            variables=None,
+            integration_calls=[],
+            execution_context=None,
+            error_message=error_message,
+            error_type=type(e).__name__,
+        )
+    finally:
+        if supervisor_task is not None:
+            supervisor_task.cancel()
+            try:
+                await supervisor_task
+            except asyncio.CancelledError:
+                # Expected: we just cancelled it and awaited shutdown.
+                pass
+        for sig in installed_signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                # Handler was never installed (see install guard above).
+                pass
+        clear_service_runtime()
+        if BIFROST_CONTEXT_AVAILABLE:
+            clear_execution_context()
+
+
+async def _service_supervisor(
+    cfg: ServiceRunConfig, stop_event: asyncio.Event
+) -> None:
+    """Exchange only this attempt's control state over its authenticated API."""
+    from bifrost._service_runtime import install_service_credentials, take_ready_report
+    from bifrost.client import get_client, raise_for_status_with_detail
+
+    ready_pending = False
+    while not stop_event.is_set():
+        try:
+            ready_pending = ready_pending or take_ready_report()
+            response = await get_client().engine_request(
+                "POST", "/api/sdk/runtime/service-control",
+                json={"ready": ready_pending, "token_expires_at": cfg.token_expires_at},
+            )
+            if response.status_code in {401, 403}:
+                stop_event.set()
+                break
+            raise_for_status_with_detail(response)
+            payload = response.json()
+            ready_pending = False
+            if payload["stop_requested"]:
+                stop_event.set()
+                break
+            if payload["access_token"] is not None:
+                install_service_credentials(payload["access_token"])
+                cfg.token_expires_at = payload["token_expires_at"]
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.debug("service supervisor tick failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _execute_service_with_trace(
+    func: Any,
+    context: ExecutionContext,
+    parameters: dict[str, Any],
+    cfg: ServiceRunConfig,
+    stop_event: asyncio.Event,
+) -> tuple[Any, list[dict[str, Any]], bool]:
+    """Invoke the @service coroutine with log capture and stop supervision.
+
+    Returns (result, service_logs, stopped). No variable tracing: services
+    never persist ``variables``/``execution_context`` snapshots.
+    """
+    from bifrost._runtime_io import write_log
+
+    service_logs: list[dict[str, Any]] = []
+    workflow_module_file = func.__code__.co_filename
+
+    class ServiceLogHandler(logging.Handler):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if getattr(record, "_bifrost_log_transport", False):
+                return False
+            workflow_basename = os.path.basename(workflow_module_file)
+            record_basename = os.path.basename(record.pathname)
+            is_workspace_log = (
+                "workspace" in record.pathname or "/repo/" in record.pathname
+            )
+            # System rows (starting/ready/stopping) are emitted by the
+            # engine itself: same logger name as the service module but an
+            # engine pathname. They are first-class service log entries.
+            is_service_system = record.name == getattr(
+                func, "__module__", None
+            )
+            # Reject infrastructure logs before Handler.handle acquires its lock.
+            # Transport refresh may log from a thread while a service log is sent.
+            return (
+                record_basename == workflow_basename
+                or is_workspace_log
+                or is_service_system
+            )
+
+        def emit(self, record: logging.LogRecord) -> None:
+            message = record.getMessage()
+            current_secrets = context._collect_secret_values()
+            message = _sanitize_runtime_log_message(message, current_secrets)
+            service_logs.append(
+                {"level": record.levelname, "message": message}
+            )
+            try:
+                write_log(record.levelname, message)
+            except Exception as e:
+                logger.debug("service log publish failed: %s", e, extra={"_bifrost_log_transport": True})
+
+    handler = ServiceLogHandler()
+    handler.setLevel(logging.DEBUG)
+    root_logger = logging.getLogger()
+    logging_scope = ExitStack()
+    logging_scope.enter_context(
+        _runtime_logging_scope(root_logger, context._collect_secret_values)
+    )
+    root_logger.addHandler(handler)
+    try:
+        # System rows are first-class service log entries: starting is emitted
+        # here so the handler above captures it like every later row.
+        logging.getLogger(getattr(func, "__module__", __name__)).info(
+            "service starting (revision %s)", cfg.revision or "unknown"
+        )
+        sig = inspect.signature(func)
+        params = list(sig.parameters.values())
+        accepted_param_names = {p.name for p in params}
+        has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params
+        )
+        if has_var_keyword:
+            accepted_params = _coerce_params_to_type_hints(func, parameters)
+        else:
+            accepted_params = _coerce_params_to_type_hints(
+                func,
+                {
+                    k: v
+                    for k, v in parameters.items()
+                    if k in accepted_param_names
+                },
+            )
+        context.parameters = dict(parameters)
+
+        first_param_is_context = False
+        if params:
+            first_param = params[0]
+            annotation = first_param.annotation
+            if annotation is not inspect.Parameter.empty:
+                if annotation is ExecutionContext:
+                    first_param_is_context = True
+                elif (
+                    isinstance(annotation, str)
+                    and "ExecutionContext" in annotation
+                ):
+                    first_param_is_context = True
+            if not first_param_is_context and first_param.name == "context":
+                first_param_is_context = True
+
+        async def _run_service_async():
+            if first_param_is_context:
+                return await func(context, **accepted_params)
+            return await func(**accepted_params)
+
+        user_task = asyncio.ensure_future(_run_service_async())
+        stop_waiter = asyncio.ensure_future(stop_event.wait())
+        try:
+            await asyncio.wait(
+                {user_task, stop_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            if not stop_waiter.done():
+                stop_waiter.cancel()
+
+        # A set stop event at completion time owns the outcome — even when
+        # the user coroutine returned in the same tick. The parent completes
+        # stop-requested attempts as 'requested' no matter how the child
+        # exited, so the racing value is dropped and the run reports stopped.
+        if stop_event.is_set():
+            service_logger = logging.getLogger(func.__module__)
+            service_logger.info("service stopping")
+            if not user_task.done():
+                user_task.cancel()
+                try:
+                    await user_task
+                except asyncio.CancelledError:
+                    # Expected: we just cancelled it and awaited shutdown.
+                    pass
+            return None, service_logs, True
+
+        return user_task.result(), service_logs, False
+    finally:
+        root_logger.removeHandler(handler)
+        logging_scope.close()
 
 
 def _script_to_callable(code: str, name: str):
@@ -668,7 +1238,7 @@ def _script_to_callable(code: str, name: str):
     streaming.
 
     The script code is wrapped in an async main() function to enable:
-    - Proper variable capture via sys.settrace()
+    - Variable capture when main() returns
     - Function-level logging that can be filtered
     - Support for both sync and async code
 
@@ -685,8 +1255,8 @@ def _script_to_callable(code: str, name: str):
     # Decode base64 code
     script_code = base64.b64decode(code).decode('utf-8')
 
-    # Wrap script code in an async main() function
-    # This allows sys.settrace() to capture variables properly
+    # Wrap script code in an async main() function whose locals are captured
+    # when it returns
     # Add return statement to capture 'result' variable if set
     wrapped_code = f"""async def main():
 {textwrap.indent(script_code, '    ')}
@@ -695,13 +1265,17 @@ def _script_to_callable(code: str, name: str):
 
     # Compile wrapped script
     compiled_code = compile(wrapped_code, f'<script:{name}>', 'exec')
+    main_code = next(
+        const for const in compiled_code.co_consts
+        if isinstance(const, CodeType) and const.co_name == 'main'
+    )
 
     async def script_wrapper(context: ExecutionContext, **parameters):
         """
         Async wrapper that executes the script code.
 
         The script code runs inside an async main() function, allowing:
-        - sys.settrace() to capture variables from main's frame
+        - variable capture from main's frame when it returns
         - await to work in user scripts
         - Proper logging with script-specific logger
         """
@@ -731,7 +1305,14 @@ def _script_to_callable(code: str, name: str):
         setattr(script_logging, 'critical', script_logger.critical)
         setattr(script_logging, 'exception', script_logger.exception)
         setattr(script_logging, 'log', script_logger.log)
-        setattr(script_logging, 'getLogger', lambda name=None: script_logger)  # Return our logger for any getLogger calls
+        def get_script_logger(name: str | None = None) -> logging.Logger:
+            # Third-party modules imported by a script bind this logger during
+            # import, so transport families must retain their real identities.
+            if name is not None and _is_runtime_transport_logger(name):
+                return logging.getLogger(name)
+            return script_logger
+
+        setattr(script_logging, 'getLogger', get_script_logger)
 
         # Temporarily replace logging in sys.modules so imports get our wrapper
         original_logging = sys.modules.get('logging')
@@ -766,9 +1347,10 @@ def _script_to_callable(code: str, name: str):
             # Clear exec namespace to release references to context, params, user objects
             exec_globals.clear()
 
-    # Set function metadata for trace filtering
+    # Set function metadata for logging and error messages
     script_wrapper.__name__ = name
     script_wrapper.__module__ = f'<script:{name}>'
+    setattr(script_wrapper, _CAPTURE_CODE_ATTR, main_code)
 
     return script_wrapper
 
@@ -781,10 +1363,11 @@ async def _execute_workflow_with_trace(
     broadcaster: Any = None
 ) -> tuple[Any, dict[str, Any], list[str]]:
     """
-    Execute a workflow function with variable capture using sys.settrace().
+    Execute a workflow function, capturing its local variables.
 
     This is the same approach used for scripts, ensuring consistency.
-    Captures all local variables from the function as it executes.
+    Captures the function's local variables when it returns, or from the
+    traceback when it raises.
     Streams logs in real-time via SignalR if broadcaster is provided.
 
     Args:
@@ -820,38 +1403,28 @@ async def _execute_workflow_with_trace(
 
     # Set up logging capture for the workflow
     class WorkflowLogHandler(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            # Fast reject known noisy third-party loggers
+        def filter(self, record: logging.LogRecord) -> bool:
+            if getattr(record, "_bifrost_log_transport", False):
+                return False
             if record.name.split(".")[0] in _NOISY_LOGGERS:
-                return
-
-            # Always capture TRACEBACK level (admin-only error details)
+                return False
             is_traceback = record.levelname == "TRACEBACK"
-
-            # Check if this is a script logger (logger name starts with 'script.')
-            is_script_log = record.name.startswith('script.')
-
-            # Only capture logs that originate from the workflow's file or workspace
-            # This prevents capturing third-party SDK, aiohttp, and infrastructure logs
-            # Use basename comparison since dynamically loaded modules may have different path formats
+            is_script_log = record.name.startswith("script.")
             workflow_basename = os.path.basename(workflow_module_file)
             record_basename = os.path.basename(record.pathname)
+            is_workspace_log = "workspace" in record.pathname or "/repo/" in record.pathname
+            # Keep transport/internal logs outside the handler lock, including
+            # logs emitted on a credential-refresh thread while sending a row.
+            return (
+                is_traceback or is_script_log
+                or record_basename == workflow_basename or is_workspace_log
+            )
 
-            # Also check if it's from workspace directory (for user workflows)
-            is_workspace_log = 'workspace' in record.pathname or '/repo/' in record.pathname
-            is_workflow_file = record_basename == workflow_basename
-
-            # Don't log from inside the handler to avoid infinite recursion
-            # Just filter and process
-
-            if not (is_traceback or is_script_log or is_workflow_file or is_workspace_log):
-                return
-
+        def emit(self, record: logging.LogRecord) -> None:
             # Format: [LEVEL] message
             message = record.getMessage()
             _current_secrets = context._collect_secret_values()
-            if _current_secrets:
-                message = redact_secrets(message, _current_secrets)
+            message = _sanitize_runtime_log_message(message, _current_secrets)
             log_entry = f"[{record.levelname}] {message}"
             workflow_logs.append(log_entry)
 
@@ -882,20 +1455,14 @@ async def _execute_workflow_with_trace(
                 # - PubSub delivers immediately to WebSocket clients
                 # - Background worker persists from Stream to Postgres
                 try:
-                    if STREAM_LOGGING_AVAILABLE and log_and_broadcast:
-                        log_and_broadcast(
-                            execution_id=execution_id,
-                            level=record.levelname,
-                            message=message,
-                        )
-                    # Fallback: logs are still captured in log_buffer for batch save at end
+                    write_log(level=record.levelname, message=message)
                 except Exception as e:
                     # Log errors but don't fail workflow execution
                     # Real-time updates are non-critical
                     logger.error(
                         f"Failed to stream log (non-fatal): {str(e)}",
                         exc_info=True,
-                        extra={"execution_id": execution_id}
+                        extra={"execution_id": execution_id, "_bifrost_log_transport": True}
                     )
 
     # Configure logging for workflows
@@ -904,7 +1471,10 @@ async def _execute_workflow_with_trace(
 
     # Attach to root logger since workflows use logging.info() which goes to root
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # Set logger level to capture DEBUG messages
+    logging_scope = ExitStack()
+    logging_scope.enter_context(
+        _runtime_logging_scope(root_logger, context._collect_secret_values)
+    )
     root_logger.addHandler(handler)
 
     def remove_circular_refs(obj, seen=None):
@@ -977,30 +1547,11 @@ async def _execute_workflow_with_trace(
 
     exception_to_raise = None
 
-    # Set up trace function to capture variables on return or exception
-    def trace_func(frame, event, arg):
-        # Trace the workflow function OR script's main() function
-        # Scripts wrap their code in an async main() function
-        if frame.f_code.co_name not in (func_name, 'main'):
-            return None
-
-        # Capture variables when returning or raising exception
-        if event in ('return', 'exception'):
-            capture_variables_from_locals(frame.f_locals)
-
-        return trace_func
-
-    # Build trace function chain (with existing trace if present, e.g., debugpy)
-    existing_trace = sys.gettrace()
-
-    def chained_trace_func(frame, event, arg):
-        # Call our trace function first
-        trace_func(frame, event, arg)
-
-        # Then call the existing trace function (e.g., debugpy)
-        if existing_trace:
-            return existing_trace(frame, event, arg)
-        return chained_trace_func
+    # Successful runs capture locals when the workflow (or a script's main())
+    # returns. The outer exception handler captures them from the traceback on
+    # failures. Unwrap functools.wraps decorators so the user's function, not
+    # a wrapper such as a retry decorator, is the one observed.
+    capture_code = getattr(func, _CAPTURE_CODE_ATTR, None) or inspect.unwrap(func).__code__
 
     try:
         # Inspect function signature to determine if it expects context parameter
@@ -1064,30 +1615,14 @@ async def _execute_workflow_with_trace(
         if BIFROST_CONTEXT_AVAILABLE:
             set_execution_context(context)
 
-        # Initialize write buffer for SDK writes
-        if WRITE_BUFFER_AVAILABLE and WriteBuffer and set_write_buffer:
-            org_id = context.org_id if context.org_id != "GLOBAL" else None
-            buffer = WriteBuffer(
-                execution_id=execution_id or "",
-                org_id=org_id,
-                user_id=context.user_id,
-            )
-            set_write_buffer(buffer)
-
-        # Set up trace function for variable capture
-        sys.settrace(chained_trace_func if existing_trace else trace_func)
         try:
-            # Run the workflow directly - isolation is provided by subprocess
-            result = await _run_workflow_async()
+            with _capture_locals_on_return(capture_code, capture_variables_from_locals):
+                # Run the workflow directly - isolation is provided by subprocess
+                result = await _run_workflow_async()
         finally:
-            # Clear trace function
-            sys.settrace(None)
             # Clear context
             if BIFROST_CONTEXT_AVAILABLE:
                 clear_execution_context()
-            # Clear write buffer
-            if WRITE_BUFFER_AVAILABLE and clear_write_buffer:
-                clear_write_buffer()
     except TypeError as e:
         # Check if this is the "got multiple values" error caused by missing context parameter
         if "got multiple values for argument" in str(e):
@@ -1148,9 +1683,9 @@ async def _execute_workflow_with_trace(
         # has already been formatted and logged above, so the chain is no longer needed.
         e.__traceback__ = None
     finally:
-        # Note: trace function cleanup is handled in _run_workflow_in_thread
         # Clean up the logging handler
         root_logger.removeHandler(handler)
+        logging_scope.close()
         # Note: Extra params are now stored in context.parameters instead of being
         # injected into func.__globals__, so no cleanup needed here
 
@@ -1159,6 +1694,50 @@ async def _execute_workflow_with_trace(
         raise exception_to_raise
 
     return result, captured_vars, workflow_logs
+
+
+async def _read_runtime_data_provider_cache(
+    parameters: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Read this child workflow's cache entry through its runtime credential."""
+    from bifrost.client import get_client
+
+    try:
+        response = await get_client().engine_request(
+            "POST", "/api/sdk/runtime/data-provider-cache/read", json={"parameters": parameters},
+        )
+        if not response.is_success:
+            logger.debug("Data-provider cache read was unavailable: HTTP %s", response.status_code)
+            return None
+        payload = response.json()
+        if not payload.get("hit"):
+            return None
+        expires_at = payload.get("expires_at")
+        return {"data": payload.get("result"), "expires_at": expires_at}
+    except Exception as exc:
+        logger.debug("Data-provider cache read was unavailable: %s", type(exc).__name__)
+        return None
+
+
+async def _write_runtime_data_provider_cache(
+    parameters: dict[str, Any], result: Any,
+) -> str | None:
+    """Write this child workflow's result through its runtime credential."""
+    from bifrost.client import get_client
+
+    try:
+        response = await get_client().engine_request(
+            "POST", "/api/sdk/runtime/data-provider-cache/write",
+            json={"parameters": parameters, "result": result},
+        )
+        if not response.is_success:
+            logger.debug("Data-provider cache write was unavailable: HTTP %s", response.status_code)
+            return None
+        expires_at = response.json().get("expires_at")
+        return None if expires_at is None else str(expires_at)
+    except Exception as exc:
+        logger.debug("Data-provider cache write was unavailable: %s", type(exc).__name__)
+        return None
 
 
 def _build_cached_result(

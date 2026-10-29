@@ -26,14 +26,6 @@ _APP_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GET", re.compile(r"^/api/applications/[^/]+/dependencies$")),
     ("POST", re.compile(r"^/api/workflows/execute$")),
     ("GET", re.compile(r"^/api/executions/[0-9a-f-]{36}(?:/.*)?$")),
-    ("GET", re.compile(r"^/api/forms/[0-9a-f-]{36}/runtime$")),
-    ("POST", re.compile(r"^/api/forms/[0-9a-f-]{36}/startup$")),
-    ("POST", re.compile(r"^/api/forms/[0-9a-f-]{36}/upload$")),
-    ("POST", re.compile(r"^/api/forms/[0-9a-f-]{36}/submissions$")),
-    (
-        "POST",
-        re.compile(r"^/api/forms/[0-9a-f-]{36}/fields/[^/]+/options$"),
-    ),
 )
 
 _FORM_RUNTIME_RE = re.compile(
@@ -109,6 +101,39 @@ def embed_request_allowed(method: str, path: str, payload: dict[str, Any]) -> bo
     return method == expected_method
 
 
+async def register_embed_execution(jti: str, execution_id: str) -> None:
+    """Link an embed session (jti) to an execution it created.
+
+    Writes the same Redis key this middleware checks on
+    ``GET /api/executions/{id}...`` and the WebSocket execution subscription,
+    so an embed session can read back the executions it started. Shared by
+    every embed-authorized execution entry point (form submission, app
+    workflow-execute) to avoid each one re-deriving the key.
+    """
+    from src.core.cache.keys import TTL_EMBED_EXECUTION, embed_execution_key
+    from src.core.cache.redis_client import get_redis
+
+    async with get_redis() as redis:
+        await redis.setex(
+            embed_execution_key(jti, execution_id),
+            TTL_EMBED_EXECUTION,
+            "1",
+        )
+
+
+async def embed_session_owns_execution(jti: str, execution_id: str) -> bool:
+    """Return whether this embed session created this exact execution.
+
+    The mapping is server-owned and short lived. It is a capability binding,
+    not a substitute for the resource's persisted organization check.
+    """
+    from src.core.cache.keys import embed_execution_key
+    from src.core.cache.redis_client import get_redis
+
+    async with get_redis() as redis:
+        return bool(await redis.exists(embed_execution_key(jti, execution_id)))
+
+
 class EmbedScopeMiddleware(BaseHTTPMiddleware):
     """Apply the typed embed capability policy before router authorization."""
 
@@ -150,12 +175,7 @@ class EmbedScopeMiddleware(BaseHTTPMiddleware):
                     content={"detail": "Embed token missing session identifier"},
                 )
 
-            from src.core.cache.keys import embed_execution_key
-            from src.core.cache.redis_client import get_redis
-
-            async with get_redis() as redis:
-                exists = await redis.exists(embed_execution_key(jti, execution_id))
-            if not exists:
+            if not await embed_session_owns_execution(jti, execution_id):
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "Access denied to this execution"},

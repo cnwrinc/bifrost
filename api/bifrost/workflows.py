@@ -1,8 +1,13 @@
 """
-bifrost/workflows.py - Workflows SDK (API-only)
+bifrost/workflows.py - Workflows SDK
 
 Provides Python API for workflow operations (list, get status, execute).
-All operations go through HTTP API endpoints.
+
+Every fixed operation sends the ordinary HTTP request through the shared
+``BifrostClient``: over the worker's private Unix socket when the engine
+injected one, and over the network API otherwise. The worker parent owns the
+pooled database and the queue; an engine child holds neither, and a local
+attempt never falls back to the network API.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ class workflows:
                 - description: str | None - Human-readable description
                 - category: str - Category for organization
                 - tags: list[str] - Tags for categorization
-                - parameters: dict - Workflow parameters
+                - parameters: list[dict] - Workflow parameters
                 - execution_mode: str - Execution mode
                 - timeout_seconds: int - Max execution time
                 - retry_policy: dict | None - Retry configuration
@@ -60,7 +65,7 @@ class workflows:
             ...     print(f"{wf.name}: {wf.description}")
         """
         client = get_client()
-        response = await client.get("/api/workflows")
+        response = await client.engine_request("GET", "/api/workflows")
         raise_for_status_with_detail(response)
         data = response.json()
         return [WorkflowMetadata.model_validate(wf) for wf in data]
@@ -72,6 +77,7 @@ class workflows:
         *,
         org_id: str | None = None,
         run_as: str | None = None,
+        solution: str | None = None,
         scheduled_at: datetime | None = None,
         delay_seconds: int | None = None,
     ) -> str:
@@ -84,10 +90,14 @@ class workflows:
         Args:
             workflow: Workflow UUID or path::function_name ref
             input_data: Input parameters for the workflow
-            org_id: Override execution org context (admin only).
+            org_id: Execute in this organization within the caller's reach.
                      Like `bifrost run --org <org_id>`.
-            run_as: Execute as this user UUID (admin only).
-                    The execution will run under this user's identity.
+            run_as: Execute as this user UUID. Requires Impersonate Users
+                    in that user's organization. The execution runs under
+                    this user's identity; its reach stays the caller's.
+            solution: Target solution install (UUID or slug/name) in the
+                resolved scope. Unset → today's behavior (own install if
+                running inside one, else _repo/). Per-call only.
             scheduled_at: Run at this timezone-aware datetime (ISO-8601 in
                 the payload). Must be strictly in the future and within 1
                 year of now. Mutually exclusive with ``delay_seconds``.
@@ -100,8 +110,11 @@ class workflows:
         Raises:
             ValueError: If ``scheduled_at`` and ``delay_seconds`` are both
                 provided, or if ``scheduled_at`` is naive (no tzinfo).
-            httpx.HTTPStatusError: If the request fails (403 for non-admin
-                using org_id/run_as, 404 for workflow not found, etc.)
+            httpx.HTTPStatusError: If the request fails (403 for an organization
+                outside the caller's reach, or for a run_as user outside the caller's
+                Impersonate Users, which includes an unknown user when a
+                person calls; 404 for workflow not found, or for a Run As
+                user not found when a workflow calls, etc.)
             RuntimeError: If not authenticated
 
         Example:
@@ -119,12 +132,15 @@ class workflows:
         if scheduled_at is not None and scheduled_at.tzinfo is None:
             raise ValueError("'scheduled_at' must be timezone-aware")
 
-        from ._context import get_default_scope, _execution_context
+        from ._context import get_caller_solution, get_default_scope, get_effective_solution
 
         # Auto-include org_id from execution context if not explicitly provided,
         # same as tables, config, etc.
         if org_id is None:
             org_id = get_default_scope()
+
+        solution_id = get_effective_solution(solution)
+        caller = get_caller_solution()
 
         client = get_client()
         payload: dict[str, Any] = {
@@ -132,10 +148,10 @@ class workflows:
             "input_data": input_data or {},
             "sync": False,
         }
-        ctx = _execution_context.get()
-        solution_id = getattr(ctx, "solution_id", None) if ctx is not None else None
         if solution_id:
             payload["solution_id"] = str(solution_id)
+        if caller:
+            payload["caller_solution_id"] = str(caller)
         if org_id is not None:
             payload["org_id"] = org_id
         if run_as is not None:
@@ -144,7 +160,9 @@ class workflows:
             payload["scheduled_at"] = scheduled_at.isoformat()
         if delay_seconds is not None:
             payload["delay_seconds"] = delay_seconds
-        response = await client.post("/api/workflows/execute", json=payload)
+        response = await client.engine_request(
+            "POST", "/api/workflows/execute", json=payload
+        )
         raise_for_status_with_detail(response)
         return response.json()["execution_id"]
 
@@ -165,8 +183,8 @@ class workflows:
             >>> await workflows.cancel("exec-123")
         """
         client = get_client()
-        response = await client.post(
-            f"/api/workflows/executions/{execution_id}/cancel"
+        response = await client.engine_request(
+            "POST", f"/api/workflows/executions/{execution_id}/cancel"
         )
         raise_for_status_with_detail(response)
 

@@ -8,6 +8,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_serializer, model_validator
 
+from src.models.contracts.role_assignments import RoleBoundaryPublic
+
 if TYPE_CHECKING:
     pass
 
@@ -122,8 +124,19 @@ class UserPublic(UserBase):
     last_login: datetime | None
     created_at: datetime
     updated_at: datetime
+    identity_kind: str | None = Field(
+        default=None,
+        description="org_default, global_default or custom for an identity; null for a person.",
+    )
     invite_status: str = "active"  # one of InviteStatus values; populated by router
     registration_url: str | None = None  # only populated immediately after invite creation
+    is_protected: bool = Field(
+        default=False,
+        description=(
+            "The user holds privileged access somewhere (or is a Platform "
+            "Admin), so only a Platform Admin can change them."
+        ),
+    )
 
     @field_serializer("created_at", "updated_at", "last_login")
     def serialize_dt(self, dt: datetime | None) -> str | None:
@@ -191,6 +204,15 @@ class BulkUserResponse(BaseModel):
     failed: list[BulkUserFailure]
 
 
+class UserMfaResetResponse(BaseModel):
+    """What an administrator's MFA reset removed."""
+    totp_removed: bool
+    recovery_codes_removed: int
+    passkeys_removed: int
+    trusted_devices_revoked: int
+    sessions_revoked: int
+
+
 # ==================== ROLE MODELS ====================
 
 
@@ -199,7 +221,6 @@ class Role(BaseModel):
     id: str = Field(..., description="Role ID (GUID)")
     name: str = Field(..., min_length=1, max_length=100)
     description: str | None = None
-    permissions: dict = Field(default_factory=dict)
     created_by: str
     created_at: datetime
     updated_at: datetime
@@ -209,14 +230,12 @@ class CreateRoleRequest(BaseModel):
     """Request model for creating a role"""
     name: str = Field(..., min_length=1, max_length=100)
     description: str | None = None
-    permissions: dict | None = Field(default=None)
 
 
 class UpdateRoleRequest(BaseModel):
     """Request model for updating a role"""
     name: str | None = Field(default=None, min_length=1, max_length=100)
     description: str | None = None
-    permissions: dict | None = Field(default=None)
 
 
 # CRUD Pattern Models for Role
@@ -231,14 +250,19 @@ class RoleCreate(RoleBase):
 
     Roles are globally defined - org scoping happens at the entity level.
     """
-    permissions: dict | None = Field(default=None)
 
 
 class RoleUpdate(BaseModel):
     """Input for updating a role."""
     name: str | None = None
     description: str | None = None
-    permissions: dict | None = Field(default=None)
+
+
+class RolePlacementSummary(BaseModel):
+    """Where a role's assignments apply, across everyone who holds it."""
+    organizations: int = Field(description="Distinct organizations the role is placed on")
+    managed: bool = Field(description="Placed on every managed (customer) organization")
+    platform: bool = Field(description="Placed platform-wide")
 
 
 class RolePublic(RoleBase):
@@ -249,7 +273,8 @@ class RolePublic(RoleBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
-    permissions: dict = Field(default_factory=dict)
+    is_base: bool = False
+    is_builtin: bool = False
     created_by: str
     created_at: datetime
     updated_at: datetime
@@ -259,6 +284,21 @@ class RolePublic(RoleBase):
             "Inline counts of every consumer type. Populated on list-roles for the "
             "Roles UI; may be None on single-role responses where it's not needed."
         ),
+    )
+    holders: int | None = Field(
+        default=None,
+        description=(
+            "Distinct users holding the role as their base role or an additional role. "
+            "Populated with consumer_counts."
+        ),
+    )
+    grants: list[str] | None = Field(
+        default=None,
+        description="Permissions the role grants, sorted. Populated with consumer_counts.",
+    )
+    placements: RolePlacementSummary | None = Field(
+        default=None,
+        description="Where the role's assignments are placed. Populated with consumer_counts.",
     )
 
     @field_serializer("created_at", "updated_at")
@@ -329,9 +369,36 @@ class UnassignWorkflowsFromRoleRequest(BaseModel):
     workflow_ids: list[str] = Field(..., min_length=1, max_length=500)
 
 
+class RoleUserSummary(BaseModel):
+    """Display-ready user identity returned by the role detail endpoint."""
+
+    id: UUID
+    name: str | None
+    email: str
+    organization_id: UUID | None
+    organization_name: str | None
+    organization_is_provider: bool = False
+    identity_kind: str | None = Field(
+        default=None,
+        description="org_default, global_default or custom for an identity; null for a person.",
+    )
+    boundaries: list[RoleBoundaryPublic] = Field(
+        default_factory=list,
+        description="Where the role applies for this user.",
+    )
+
+
 class RoleUsersResponse(BaseModel):
     """Response model for getting users assigned to a role"""
     user_ids: list[str] = Field(..., description="List of user IDs assigned to the role")
+    users: list[RoleUserSummary] = Field(
+        default_factory=list,
+        description="Display-ready summaries for users assigned to the role",
+    )
+    total: int = Field(
+        default=0,
+        description="Total users assigned to the role after filtering",
+    )
 
 
 class RoleFormsResponse(BaseModel):
@@ -349,34 +416,6 @@ class RoleWorkflowsResponse(BaseModel):
     workflow_ids: list[str] = Field(..., description="Workflow IDs assigned to the role")
 
 
-class RoleKnowledgeEntry(BaseModel):
-    """A single knowledge-namespace assignment under a role."""
-    id: UUID
-    namespace: str
-    organization_id: UUID | None = None
-
-
-class RoleKnowledgeResponse(BaseModel):
-    """Response model for getting knowledge namespaces assigned to a role."""
-    entries: list[RoleKnowledgeEntry] = Field(default_factory=list)
-
-
-class KnowledgeAssignmentInput(BaseModel):
-    """One namespace+org pair to assign to a role."""
-    namespace: str = Field(..., min_length=1, max_length=255)
-    organization_id: UUID | None = None
-
-
-class AssignKnowledgeToRoleRequest(BaseModel):
-    """Request body for bulk assigning knowledge namespaces to a role."""
-    entries: list[KnowledgeAssignmentInput] = Field(..., min_length=1, max_length=500)
-
-
-class UnassignKnowledgeFromRoleRequest(BaseModel):
-    """Request body for bulk unassigning knowledge namespaces from a role."""
-    assignment_ids: list[UUID] = Field(..., min_length=1, max_length=500)
-
-
 class RoleConsumerCounts(BaseModel):
     """Inline counts of every consumer type for a role."""
     users: int = 0
@@ -384,7 +423,6 @@ class RoleConsumerCounts(BaseModel):
     agents: int = 0
     apps: int = 0
     workflows: int = 0
-    knowledge: int = 0
 
 
 # ==================== PERMISSION MODELS ====================

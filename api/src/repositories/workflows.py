@@ -20,9 +20,11 @@ Access Control:
 - access_level field: 'authenticated' or 'role_based'
 """
 
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timezone
-from typing import Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Sequence
 from uuid import UUID
 
 from sqlalchemy import false, func, or_, select
@@ -34,10 +36,13 @@ from src.models import Workflow
 from src.models.orm.workflow_roles import WorkflowRole
 from src.repositories.org_scoped import OrgScopedRepository
 
+if TYPE_CHECKING:
+    from src.services.authorization.enforce import Caller
+
 logger = logging.getLogger(__name__)
 
 # Type discriminator values
-WorkflowType = Literal["workflow", "tool", "data_provider"]
+WorkflowType = Literal["workflow", "tool", "data_provider", "service"]
 
 
 class WorkflowRepository(OrgScopedRepository[Workflow]):
@@ -57,6 +62,79 @@ class WorkflowRepository(OrgScopedRepository[Workflow]):
     model = Workflow
     role_table = WorkflowRole
     role_entity_id_column = "workflow_id"
+
+    def __init__(
+        self,
+        session,
+        org_id: UUID | str | None,
+        user_id: UUID | str | None = None,
+        is_superuser: bool = False,
+        is_external: bool = False,
+        *,
+        caller: Caller | None = None,
+    ) -> None:
+        """Build a workflow repository, optionally from a verified caller.
+
+        The explicit Caller mode is for workflow launch. It preserves normal
+        workflow sharing for the original user, then permits the named
+        ``workflows.readwrite`` management authority at the row's real
+        organization. It deliberately does not inherit legacy
+        ``is_superuser`` repository bypasses.
+        """
+        self.caller = caller
+        if caller is not None:
+            user_id = caller.ctx.user_id if caller.ctx is not None else None
+            is_superuser = False
+            if not caller.principal.embed:
+                is_external = (
+                    caller.ctx.is_external
+                    if caller.ctx is not None
+                    else caller.principal.is_external
+                )
+        super().__init__(session, org_id, user_id, is_superuser, is_external)
+
+    async def get(
+        self, *, include_solution_managed: bool = False, **filters: Any
+    ) -> Workflow | None:
+        """Resolve an ID with the Caller-mode management decision at its row.
+
+        Name and path resolution remains on the canonical org cascade in the
+        base repository. UUID launch references need their real row first so
+        the named management decision is made against that row's organization.
+        """
+        if self.caller is None or "id" not in filters:
+            return await super().get(
+                include_solution_managed=include_solution_managed, **filters
+            )
+
+        query = select(Workflow)
+        for key, value in filters.items():
+            column = getattr(Workflow, key, None)
+            if column is not None:
+                query = query.where(column == value)
+        entity = (await self.session.execute(query)).scalar_one_or_none()
+        if entity is None or not await self._can_access_entity(entity):
+            return None
+        return entity
+
+    async def _can_access_entity(self, entity: Workflow) -> bool:
+        """Apply ordinary workflow ACL, then named management if requested."""
+        caller = self.caller
+        if caller is None:
+            return await super()._can_access_entity(entity)
+        from src.services.authorization.enforce import allows_permission, user_reach
+
+        entity_org_id = entity.organization_id
+        if not user_reach(caller).covers(entity_org_id):
+            return False
+        if caller.is_execution_credential:
+            # A verified child has already crossed its parent's workflow
+            # resource gate. Its named permissions and original-user reach are
+            # still enforced by the launch service.
+            return True
+        if await super()._can_access_entity(entity):
+            return True
+        return allows_permission(caller, "workflows.readwrite", entity_org_id)
 
     # ==========================================================================
     # Identifier Resolution
@@ -157,16 +235,17 @@ class WorkflowRepository(OrgScopedRepository[Workflow]):
                 Workflow.solution_id == solution_scope,
                 Workflow.is_active.is_(True),
             )
-            # The own-install match is already install-gated by solution_id;
-            # org-gate it only for regular users. Superusers act cross-org
-            # here exactly as resolve_solution_table_by_name does for tables:
-            # an ORG-BOUND install's rows carry the INSTALL's org, which
-            # routinely differs from an admin caller's effective org.
-            if not self.is_superuser:
+            # The own-install match is already install-gated by solution_id.
+            # Legacy callers keep their established cascade. Caller-mode
+            # launch resolution reads the install row then checks the original
+            # user's reach and ACL against that row's actual organization.
+            if self.caller is None and not self.is_superuser:
                 stmt = self._apply_cascade_scope(stmt)
             result = await self.session.execute(stmt)
             own = result.scalar_one_or_none()
             if own is not None:
+                if self.caller is not None and not await self._can_access_entity(own):
+                    return None
                 return own
             if not allow_shared_fallback:
                 return None
@@ -194,24 +273,22 @@ class WorkflowRepository(OrgScopedRepository[Workflow]):
             return None
 
         if solution_scope is not None:
-            # Own-install first, WITHOUT the caller-org cascade for superusers:
-            # the match is already install-gated by solution_id, and an
-            # ORG-BOUND install's rows carry the INSTALL's org — which
-            # routinely differs from an admin caller's effective org (a demo/
-            # support admin driving a customer install saw 404s here while
-            # global installs, whose rows have organization_id NULL, passed).
-            # Regular users keep the cascade: their org must be the install's
-            # (the cross-org negative below relies on it).
+            # Own-install first. Legacy callers retain their established
+            # superuser/regular cascade. Caller-mode launch resolution reads
+            # the install-gated row, then applies original-user reach and ACL
+            # at the install's organization.
             own_stmt = select(Workflow).where(
                 Workflow.path == path,
                 Workflow.function_name == function_name,
                 Workflow.is_active.is_(True),
                 Workflow.solution_id == solution_scope,
             )
-            if not self.is_superuser:
+            if self.caller is None and not self.is_superuser:
                 own_stmt = self._apply_cascade_scope(own_stmt)
             own_row = (await self.session.execute(own_stmt)).scalars().first()
             if own_row is not None:
+                if self.caller is not None and not await self._can_access_entity(own_row):
+                    return None
                 return own_row
             if not allow_shared_fallback:
                 return None
@@ -323,7 +400,15 @@ class WorkflowRepository(OrgScopedRepository[Workflow]):
         filter_org_id: UUID | None,
         active_only: bool = True,
     ) -> Sequence[Workflow]:
-        """List workflow tools for an already-resolved organization filter."""
+        """List workflow tools for an already-resolved organization filter.
+
+        Caller-mode listings apply the canonical entity check, including named
+        workflow-management authority at the workflow's persisted organization.
+        Legacy repository callers retain their access-level filter — the same rule
+        ``agent_write_policy.validate_user_tool_access`` enforces at save time (see
+        ``shared.workflow_access.user_can_access_workflow``) — so the agent
+        editor's tool picker never offers a tool the save would reject.
+        """
         stmt = (
             select(Workflow)
             .where(Workflow.type == "tool")
@@ -354,7 +439,60 @@ class WorkflowRepository(OrgScopedRepository[Workflow]):
 
         stmt = stmt.order_by(Workflow.name)
         result = await self.session.execute(stmt)
-        return list(result.scalars().all())
+        workflows = list(result.scalars().all())
+
+        if self.caller is not None:
+            return [
+                workflow
+                for workflow in workflows
+                if await self._can_access_entity(workflow)
+            ]
+
+        if self.is_superuser:
+            return workflows
+
+        return await self._filter_tools_by_access(workflows)
+
+    async def _filter_tools_by_access(
+        self, workflows: list[Workflow]
+    ) -> list[Workflow]:
+        """Filter tool workflows to the ones a non-bypass caller can use.
+
+        Two extra queries regardless of result size: the caller's role ids,
+        then a single IN-filtered join for the role assignments of every
+        role_based candidate in the input.
+        """
+        from src.models.orm.users import UserRole
+        from shared.workflow_access import user_can_access_workflow
+
+        user_role_ids: set[UUID] = set()
+        if self.user_id is not None:
+            result = await self.session.execute(
+                select(UserRole.role_id).where(UserRole.user_id == self.user_id)
+            )
+            user_role_ids = set(result.scalars().all())
+
+        role_based_ids = [w.id for w in workflows if w.access_level == "role_based"]
+        workflow_role_ids: dict[UUID, set[UUID]] = {}
+        if role_based_ids:
+            result = await self.session.execute(
+                select(WorkflowRole.workflow_id, WorkflowRole.role_id).where(
+                    WorkflowRole.workflow_id.in_(role_based_ids)
+                )
+            )
+            for workflow_id, role_id in result.all():
+                workflow_role_ids.setdefault(workflow_id, set()).add(role_id)
+
+        return [
+            w
+            for w in workflows
+            if user_can_access_workflow(
+                access_level=w.access_level,
+                is_external=self.is_external,
+                user_role_ids=user_role_ids,
+                workflow_role_ids=workflow_role_ids.get(w.id, set()),
+            )
+        ]
 
     async def get_workflows_only(
         self,
@@ -589,6 +727,7 @@ class WorkflowRepository(OrgScopedRepository[Workflow]):
             .where(Workflow.id == workflow_id)
             .where(Workflow.endpoint_enabled.is_(True))
             .where(Workflow.is_active.is_(True))
+            .where(Workflow.type != "service")
         )
         return result.scalar_one_or_none()
 
@@ -614,6 +753,7 @@ class WorkflowRepository(OrgScopedRepository[Workflow]):
             .where(Workflow.name == name)
             .where(Workflow.endpoint_enabled.is_(True))
             .where(Workflow.is_active.is_(True))
+            .where(Workflow.type != "service")
         )
         workflows = list(result.scalars().all())
 

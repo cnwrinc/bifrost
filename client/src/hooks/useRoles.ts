@@ -2,9 +2,15 @@
  * React Query hooks for roles management using openapi-react-query pattern
  */
 
-import { useQueryClient } from "@tanstack/react-query";
+import {
+	keepPreviousData,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
 import { $api, apiClient } from "@/lib/api-client";
 import type { components } from "@/lib/v1";
+import { invalidateAuthorization } from "@/lib/authorization";
+import { USER_ACCESS_QUERY_KEY } from "@/services/access";
 import { toast } from "sonner";
 type RoleCreate = components["schemas"]["RoleCreate"];
 type AssignUsersToRoleRequest =
@@ -12,8 +18,102 @@ type AssignUsersToRoleRequest =
 type AssignFormsToRoleRequest =
 	components["schemas"]["AssignFormsToRoleRequest"];
 
-export function useRoles() {
-	return $api.useQuery("get", "/api/roles", {});
+export function useRoles(options: { enabled?: boolean } = {}) {
+	return $api.useQuery("get", "/api/roles", {}, options);
+}
+
+export interface RolesPageParams {
+	search?: string;
+	sortBy: "name" | "created";
+	sortDirection: "asc" | "desc";
+	limit: number;
+	offset: number;
+}
+
+export function useRolesPage(params: RolesPageParams) {
+	return useQuery({
+		queryKey: ["get", "/api/roles", { page: params }],
+		queryFn: async () => {
+			const { data, error, response } = await apiClient.GET(
+				"/api/roles",
+				{
+					params: {
+						query: {
+							search: params.search?.trim() || undefined,
+							// The Roles page lists built-in roles too (read-only).
+							include_builtin: true,
+							sort_by: params.sortBy,
+							sort_direction: params.sortDirection,
+							limit: params.limit,
+							offset: params.offset,
+						},
+					},
+				},
+			);
+			if (error) throw error;
+			return {
+				items: data ?? [],
+				total: Number(
+					response.headers.get("X-Total-Count") ?? data?.length ?? 0,
+				),
+			};
+		},
+		placeholderData: keepPreviousData,
+	});
+}
+
+/** A role by id, builtin roles included (they show read-only). */
+export function useRole(roleId: string | undefined) {
+	return $api.useQuery(
+		"get",
+		"/api/roles/{role_id}",
+		{
+			params: {
+				path: { role_id: roleId ?? "" },
+				query: { include_builtin: true },
+			},
+		},
+		{ enabled: !!roleId },
+	);
+}
+
+/** Every permission a role holds, and the identity permissions an editor
+ * may choose from. */
+export function useRolePermissions(roleId: string | undefined) {
+	return $api.useQuery(
+		"get",
+		"/api/roles/{role_id}/permissions",
+		{ params: { path: { role_id: roleId ?? "" } } },
+		{ enabled: !!roleId },
+	);
+}
+
+/** Replace a role's identity permissions; its other permissions are kept. */
+export function useUpdateRolePermissions() {
+	const queryClient = useQueryClient();
+	return $api.useMutation("put", "/api/roles/{role_id}/permissions", {
+		onSuccess: (data, variables) => {
+			queryClient.setQueryData(
+				[
+					"get",
+					"/api/roles/{role_id}/permissions",
+					{
+						params: {
+							path: { role_id: variables.params.path.role_id },
+						},
+					},
+				],
+				data,
+			);
+			// Holders may have become (or stopped being) protected users.
+			queryClient.invalidateQueries({ queryKey: ["get", "/api/users"] });
+			queryClient.invalidateQueries({
+				queryKey: ["get", "/api/users/{user_id}/role-assignments"],
+			});
+			queryClient.invalidateQueries({ queryKey: USER_ACCESS_QUERY_KEY });
+			void invalidateAuthorization(queryClient);
+		},
+	});
 }
 
 export function useCreateRole() {
@@ -43,8 +143,15 @@ export function useUpdateRole() {
 	const queryClient = useQueryClient();
 
 	return $api.useMutation("patch", "/api/roles/{role_id}", {
-		onSuccess: () => {
-			queryClient.invalidateQueries({ queryKey: ["get", "/api/roles"] });
+		onSuccess: async () => {
+			await Promise.all([
+				queryClient.invalidateQueries({
+					queryKey: ["get", "/api/roles"],
+				}),
+				queryClient.invalidateQueries({
+					queryKey: ["get", "/api/roles/{role_id}"],
+				}),
+			]);
 			toast.success("Role updated", {
 				description: "The role has been updated successfully",
 			});
@@ -83,47 +190,74 @@ export function useDeleteRole() {
 	});
 }
 
-export function useRoleUsers(roleId: string | undefined) {
-	return $api.useQuery(
-		"get",
-		"/api/roles/{role_id}/users",
-		{ params: { path: { role_id: roleId ?? "" } } },
-		{ enabled: !!roleId },
-	);
+export interface RoleUsersPageParams {
+	search?: string;
+	limit: number;
+	offset: number;
 }
 
-export function useAssignUsersToRole() {
+export function useRoleUsersPage(
+	roleId: string | undefined,
+	params: RoleUsersPageParams,
+) {
+	return useQuery({
+		queryKey: [
+			"get",
+			"/api/roles/{role_id}/users",
+			{ roleId, page: params },
+		],
+		enabled: !!roleId,
+		queryFn: async () => {
+			const { data, error } = await apiClient.GET(
+				"/api/roles/{role_id}/users",
+				{
+					params: {
+						path: { role_id: roleId ?? "" },
+						query: {
+							search: params.search?.trim() || undefined,
+							limit: params.limit,
+							offset: params.offset,
+						},
+					},
+				},
+			);
+			if (error) throw error;
+			return data;
+		},
+		placeholderData: keepPreviousData,
+	});
+}
+
+export function useAssignUsersToRole(options: { toast?: boolean } = {}) {
 	const queryClient = useQueryClient();
 
 	return $api.useMutation("post", "/api/roles/{role_id}/users", {
 		onSuccess: (_, variables) => {
-			const roleId = variables.params?.path?.role_id;
 			const userIds =
 				(variables.body as AssignUsersToRoleRequest)?.user_ids || [];
 			queryClient.invalidateQueries({
-				queryKey: [
-					"get",
-					"/api/roles/{role_id}/users",
-					{ params: { path: { role_id: roleId } } },
-				],
+				queryKey: ["get", "/api/roles/{role_id}/users"],
 			});
-			toast.success("Users assigned", {
-				description: `${userIds.length} user(s) assigned to role`,
-			});
+			invalidateRoleList(queryClient);
+			if (options.toast !== false)
+				toast.success("Users assigned", {
+					description: `${userIds.length} user(s) assigned to role`,
+				});
 		},
 		onError: (error) => {
 			const message =
 				typeof error === "object" && error && "detail" in error
 					? String(error.detail)
 					: "Failed to assign users";
-			toast.error("Failed to assign users", {
-				description: message,
-			});
+			if (options.toast !== false)
+				toast.error("Failed to assign users", {
+					description: message,
+				});
 		},
 	});
 }
 
-export function useRemoveUserFromRole() {
+export function useRemoveUserFromRole(options: { toast?: boolean } = {}) {
 	const queryClient = useQueryClient();
 
 	return $api.useMutation("delete", "/api/roles/{role_id}/users/{user_id}", {
@@ -136,18 +270,20 @@ export function useRemoveUserFromRole() {
 					{ params: { path: { role_id: roleId } } },
 				],
 			});
-			toast.success("User removed", {
-				description: "User has been removed from the role",
-			});
+			if (options.toast !== false)
+				toast.success("User removed", {
+					description: "User has been removed from the role",
+				});
 		},
 		onError: (error) => {
 			const message =
 				typeof error === "object" && error && "detail" in error
 					? String(error.detail)
 					: "Failed to remove user";
-			toast.error("Failed to remove user", {
-				description: message,
-			});
+			if (options.toast !== false)
+				toast.error("Failed to remove user", {
+					description: message,
+				});
 		},
 	});
 }
@@ -211,11 +347,12 @@ export async function assignRolesToForm(
 }
 
 // =============================================================================
-// Agents / Apps / Workflows / Knowledge — consumer-tab hooks (Block 5)
+// Agents / Apps / Workflows — consumer-tab hooks (Block 5)
 // =============================================================================
 
 function invalidateRoleList(qc: ReturnType<typeof useQueryClient>) {
 	qc.invalidateQueries({ queryKey: ["get", "/api/roles"] });
+	qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}"] });
 }
 
 export function useRoleAgents(roleId: string | undefined) {
@@ -231,7 +368,9 @@ export function useAssignAgentsToRole() {
 	const qc = useQueryClient();
 	return $api.useMutation("post", "/api/roles/{role_id}/agents", {
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/agents"] });
+			qc.invalidateQueries({
+				queryKey: ["get", "/api/roles/{role_id}/agents"],
+			});
 			invalidateRoleList(qc);
 		},
 	});
@@ -241,7 +380,9 @@ export function useBulkUnassignAgents() {
 	const qc = useQueryClient();
 	return $api.useMutation("delete", "/api/roles/{role_id}/agents", {
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/agents"] });
+			qc.invalidateQueries({
+				queryKey: ["get", "/api/roles/{role_id}/agents"],
+			});
 			invalidateRoleList(qc);
 		},
 	});
@@ -251,7 +392,9 @@ export function useBulkUnassignUsers() {
 	const qc = useQueryClient();
 	return $api.useMutation("delete", "/api/roles/{role_id}/users", {
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/users"] });
+			qc.invalidateQueries({
+				queryKey: ["get", "/api/roles/{role_id}/users"],
+			});
 			invalidateRoleList(qc);
 		},
 	});
@@ -261,7 +404,9 @@ export function useBulkUnassignForms() {
 	const qc = useQueryClient();
 	return $api.useMutation("delete", "/api/roles/{role_id}/forms", {
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/forms"] });
+			qc.invalidateQueries({
+				queryKey: ["get", "/api/roles/{role_id}/forms"],
+			});
 			invalidateRoleList(qc);
 		},
 	});
@@ -280,7 +425,9 @@ export function useAssignAppsToRole() {
 	const qc = useQueryClient();
 	return $api.useMutation("post", "/api/roles/{role_id}/apps", {
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/apps"] });
+			qc.invalidateQueries({
+				queryKey: ["get", "/api/roles/{role_id}/apps"],
+			});
 			invalidateRoleList(qc);
 		},
 	});
@@ -290,7 +437,9 @@ export function useBulkUnassignApps() {
 	const qc = useQueryClient();
 	return $api.useMutation("delete", "/api/roles/{role_id}/apps", {
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/apps"] });
+			qc.invalidateQueries({
+				queryKey: ["get", "/api/roles/{role_id}/apps"],
+			});
 			invalidateRoleList(qc);
 		},
 	});
@@ -309,7 +458,9 @@ export function useAssignWorkflowsToRole() {
 	const qc = useQueryClient();
 	return $api.useMutation("post", "/api/roles/{role_id}/workflows", {
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/workflows"] });
+			qc.invalidateQueries({
+				queryKey: ["get", "/api/roles/{role_id}/workflows"],
+			});
 			invalidateRoleList(qc);
 		},
 	});
@@ -319,36 +470,9 @@ export function useBulkUnassignWorkflows() {
 	const qc = useQueryClient();
 	return $api.useMutation("delete", "/api/roles/{role_id}/workflows", {
 		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/workflows"] });
-			invalidateRoleList(qc);
-		},
-	});
-}
-
-export function useRoleKnowledge(roleId: string | undefined) {
-	return $api.useQuery(
-		"get",
-		"/api/roles/{role_id}/knowledge",
-		{ params: { path: { role_id: roleId ?? "" } } },
-		{ enabled: !!roleId },
-	);
-}
-
-export function useAssignKnowledgeToRole() {
-	const qc = useQueryClient();
-	return $api.useMutation("post", "/api/roles/{role_id}/knowledge", {
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/knowledge"] });
-			invalidateRoleList(qc);
-		},
-	});
-}
-
-export function useBulkUnassignKnowledge() {
-	const qc = useQueryClient();
-	return $api.useMutation("delete", "/api/roles/{role_id}/knowledge", {
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["get", "/api/roles/{role_id}/knowledge"] });
+			qc.invalidateQueries({
+				queryKey: ["get", "/api/roles/{role_id}/workflows"],
+			});
 			invalidateRoleList(qc);
 		},
 	});

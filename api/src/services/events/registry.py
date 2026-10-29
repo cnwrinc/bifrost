@@ -86,6 +86,33 @@ CURATED_TOPICS = [
         ),
     },
     {
+        "topic": "workflow.completed",
+        "description": "Fired after a workflow execution is durably recorded as successful.",
+        "category": "Workflows",
+        "emitted_by": "Workflow executor",
+        "example_body": _body(
+            actor=_SYSTEM_ACTOR,
+            workflow={
+                "id": "550e8400-e29b-41d4-a716-446655440040",
+                "name": "sync_tickets",
+            },
+            execution={
+                "id": "550e8400-e29b-41d4-a716-446655440050",
+                "status": "Success",
+                "attempt": 1,
+                "max_attempts": 1,
+                "started_at": "2026-05-28T12:34:54Z",
+                "completed_at": "2026-05-28T12:34:56Z",
+                "duration_ms": 1234,
+            },
+            trigger={
+                "type": "event",
+                "event_type": "ticket.created",
+                "event_id": "550e8400-e29b-41d4-a716-446655440060",
+            },
+        ),
+    },
+    {
         "topic": "workflow.retry_exhausted",
         "description": "Fired when a workflow has no retry attempts remaining.",
         "category": "Workflows",
@@ -243,6 +270,27 @@ CURATED_TOPICS = [
                 "slug": "acme-tenant-manager",
                 "installed_version": "1.0.0",
                 "available_version": "1.1.0",
+            },
+        ),
+    },
+    {
+        "topic": "solution.permission_request",
+        "description": "Fired when a Solution install has a new or changed workflow permission request awaiting admin approval.",
+        "category": "Solutions",
+        "emitted_by": "Solution deploy",
+        "example_body": _body(
+            actor=_SYSTEM_ACTOR,
+            solution={
+                "id": "550e8400-e29b-41d4-a716-446655440090",
+                "slug": "acme-tenant-manager",
+            },
+            workflow={
+                "id": "550e8400-e29b-41d4-a716-446655440040",
+                "name": "sync_tenant_users",
+            },
+            request={
+                "mode": "restricted",
+                "grants": [{"permission": "organizations.read", "boundary": "managed_organizations"}],
             },
         ),
     },

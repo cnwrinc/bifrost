@@ -11,12 +11,11 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import desc, func, literal_column, or_, select
-from sqlalchemy.orm import joinedload, selectinload
+from sqlalchemy import desc, func, literal_column, or_, select, update
+from sqlalchemy.orm import selectinload
 
+from shared.run_lineage import principal_lineage
 from src.core.auth import CurrentActiveUser
-from src.core.cache.keys import agent_run_steps_stream_key
-from src.core.cache.redis_client import get_redis
 from src.core.database import get_session_factory
 from src.core.db_deps import DbSession
 from src.core.log_safety import log_safe
@@ -26,12 +25,10 @@ from src.models.contracts.agent_run_flag_conversations import (
 )
 from src.models.contracts.agent_runs import (
     AgentRunCreateRequest,
-    AgentRunChildResponse,
-    AgentRunDetailResponse,
     AgentRunListResponse,
     AgentRunRerunResponse,
     AgentRunResponse,
-    AgentRunStepResponse,
+    AgentRunUsageSummary,
     BackfillEligibleResponse,
     BackfillSummariesRequest,
     BackfillSummariesResponse,
@@ -44,21 +41,38 @@ from src.models.contracts.agent_runs import (
     VerdictRequest,
     VerdictResponse,
 )
-from src.models.contracts.executions import AIUsagePublicSimple, AIUsageTotalsSimple
+from shared.sdk_agent_runs import (
+    SdkAgentRunError,
+    resolve_agent_run_actor,
+    resolve_executable_agent,
+    resolve_rerun_actor,
+)
+from src.models.enums import AgentAccessLevel
 from src.models.orm.agent_run_verdict_history import AgentRunVerdictHistory
 from src.models.orm.agent_runs import AgentRun
-from src.models.orm.ai_usage import AIUsage
 from src.models.orm.agents import Agent
-from src.models.orm.solutions import Solution
+from src.models.orm.ai_usage import AIUsage
 from src.models.orm.summary_backfill_job import SummaryBackfillJob
 from src.core.redis_client import get_redis_client
+from src.routers.agent_run_sdk import detail_router, enqueue_router
+from src.services.agent_run_usage_summary import summarize_run_usage
+from src.services.agent_write_policy import caller_user_id
+from src.services.authorization.enforce import (
+    allows_permission,
+    load_caller,
+    operation_reach,
+    org_target,
+    require_operation,
+    require_permission,
+    user_reach,
+)
 from src.services.execution.agent_run_access import agent_run_visibility_conditions
 from src.services.execution.agent_run_service import (
     enqueue_agent_run,
     wait_for_agent_run_result,
 )
 from src.services.execution.dry_run import evaluate_against_prompt
-from src.services.execution.run_summarizer import enqueue_summarize
+from src.services.execution.summary_dispatch import hand_off_summary, request_summary
 from src.services.execution.tuning_service import (
     append_user_message_and_reply,
     get_or_create_conversation,
@@ -69,7 +83,66 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent-runs", tags=["Agent Runs"])
 
 
-def _run_to_response(run: AgentRun) -> AgentRunResponse:
+async def _get_executable_agent(
+    db: DbSession,
+    agent_name: str,
+    user: CurrentActiveUser,
+) -> Agent:
+    """Resolve an agent and enforce solution execution availability.
+
+    Thin wrapper over the shared service so ``/execute`` keeps its exact
+    historical behavior (404 unknown name, 409 inactive Solution) while
+    the shared service enforces the access check.
+    """
+    try:
+        return await resolve_executable_agent(db, agent_name=agent_name, principal=user)
+    except SdkAgentRunError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+
+
+async def _require_own_private_agent_run(
+    db: DbSession, caller, run: AgentRun
+) -> None:
+    """Enforce the tuning-action rule on a run already passed visibility.
+
+    Tuning actions are narrower than plain run visibility: the owner may act
+    on a run of their own PRIVATE agent.  Another caller needs the exact
+    ``agentruns.readwrite.all`` power at the run's organization.  Runtime
+    credentials are evaluated as their original run user.
+    """
+    if (
+        user_reach(caller).covers(run.org_id)
+        and allows_permission(caller, "agentruns.readwrite.all", run.org_id)
+    ):
+        return
+
+    agent = (
+        await db.execute(select(Agent).where(Agent.id == run.agent_id))
+    ).scalar_one_or_none()
+    if (
+        agent is None
+        or agent.access_level != AgentAccessLevel.PRIVATE
+        or agent.owner_user_id != caller_user_id(caller)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Agent run {run.id} not found",
+        )
+
+
+def _may_cancel_run(caller, run: AgentRun) -> bool:
+    """Own cancellation is personal; cancelling another user's run is named."""
+    if run.caller_user_id == str(caller_user_id(caller)):
+        return True
+    return user_reach(caller).covers(run.org_id) and allows_permission(
+        caller, "agentruns.readwrite.all", run.org_id
+    )
+
+
+def _run_to_response(
+    run: AgentRun,
+    usage_summary: AgentRunUsageSummary | None = None,
+) -> AgentRunResponse:
     """Convert AgentRun ORM to AgentRunResponse."""
     return AgentRunResponse(
         id=run.id,
@@ -87,6 +160,9 @@ def _run_to_response(run: AgentRun) -> AgentRunResponse:
         caller_user_id=run.caller_user_id,
         caller_email=run.caller_email,
         caller_name=run.caller_name,
+        run_as_user_id=run.run_as_user_id,
+        run_as_user_name=run.run_as_user.name if run.run_as_user else None,
+        run_as_user_email=run.run_as_user.email if run.run_as_user else None,
         iterations_used=run.iterations_used,
         tokens_used=run.tokens_used,
         budget_max_iterations=run.budget_max_iterations,
@@ -109,6 +185,7 @@ def _run_to_response(run: AgentRun) -> AgentRunResponse:
         started_at=run.started_at,
         completed_at=run.completed_at,
         parent_run_id=run.parent_run_id,
+        usage_summary=usage_summary,
     )
 
 
@@ -142,8 +219,27 @@ async def list_agent_runs(
     ),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    cursor: str | None = Query(
+        None,
+        description="Opaque page position returned as next_cursor; offset remains supported.",
+    ),
 ) -> AgentRunListResponse:
     """List agent runs with optional filters."""
+    caller = await load_caller(db, user)
+    page_offset = offset
+    if cursor is not None:
+        try:
+            page_offset = int(cursor)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="cursor is invalid",
+            ) from exc
+        if page_offset < 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="cursor is invalid",
+            )
     # Global history stays root-only so one orchestration is counted once.
     # An individual agent's history includes delegated runs because those are
     # real executions of that agent and should not disappear from its Runs tab.
@@ -154,7 +250,7 @@ async def list_agent_runs(
             AgentRun.trigger_type != "delegation",
         )
 
-    query = query.where(*agent_run_visibility_conditions(user))
+    query = query.where(*agent_run_visibility_conditions(caller))
 
     # Apply optional filters
     if agent_id is not None:
@@ -241,13 +337,25 @@ async def list_agent_runs(
     total = total_result.scalar_one()
 
     # Fetch paginated results
-    query = query.order_by(desc(AgentRun.created_at)).limit(limit).offset(offset)
+    query = (
+        query.options(selectinload(AgentRun.run_as_user))
+        .order_by(desc(AgentRun.created_at))
+        .limit(limit + 1)
+        .offset(page_offset)
+    )
     result = await db.execute(query)
-    runs = result.scalars().all()
+    runs = list(result.scalars().all())
+    has_more = len(runs) > limit
+    if has_more:
+        runs = runs[:limit]
 
+    next_cursor = str(page_offset + len(runs)) if has_more else None
+
+    usage_summaries = await summarize_run_usage(db, [run.id for run in runs])
     return AgentRunListResponse(
-        items=[_run_to_response(run) for run in runs],
+        items=[_run_to_response(run, usage_summaries.get(run.id)) for run in runs],
         total=total,
+        next_cursor=next_cursor,
     )
 
 
@@ -284,10 +392,11 @@ async def get_metadata_keys(
     users don't have to guess which fields the summarizer actually
     extracts on this agent.
     """
+    caller = await load_caller(db, user)
     _enforce_agent_scope(agent_id, user)
     conditions = [
         AgentRun.agent_id == agent_id,
-        *agent_run_visibility_conditions(user),
+        *agent_run_visibility_conditions(caller),
     ]
 
     # jsonb_object_keys explodes the top-level keys of each row's metadata;
@@ -319,10 +428,11 @@ async def get_metadata_values(
     Used by the filter UI when the user picks the 'eq' operator — lets
     them pick from a known-value list instead of free-typing.
     """
+    caller = await load_caller(db, user)
     _enforce_agent_scope(agent_id, user)
     conditions = [
         AgentRun.agent_id == agent_id,
-        *agent_run_visibility_conditions(user),
+        *agent_run_visibility_conditions(caller),
     ]
 
     value_col = AgentRun.run_metadata[key].astext
@@ -354,15 +464,13 @@ async def list_backfill_jobs(
     Registered before ``/{run_id}`` so the literal path isn't swallowed by
     the run-detail handler.
     """
-    if not _is_platform_admin(user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only platform administrators can view backfill jobs",
-        )
+    caller = await load_caller(db, user)
+    reach = operation_reach(caller, "GET /api/agent-runs/backfill-jobs")
     q = select(SummaryBackfillJob).order_by(desc(SummaryBackfillJob.created_at))
     if active:
         q = q.where(SummaryBackfillJob.status == "running")
     jobs = (await db.execute(q)).scalars().all()
+    jobs = [job for job in jobs if await _backfill_job_in_reach(db, caller, job, reach)]
     return SummaryBackfillJobListResponse(
         items=[SummaryBackfillJobResponse.model_validate(j) for j in jobs]
     )
@@ -391,17 +499,15 @@ async def get_backfill_eligible(
       - ``include_completed=true``          → above + ALL completed summaries
                                                regardless of version
     """
-    if not _is_platform_admin(user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only platform administrators can preview backfills",
-        )
+    caller = await load_caller(db, user)
+    reach = operation_reach(caller, "GET /api/agent-runs/backfill-eligible")
     statuses = ["pending", "failed"]
     if prompt_version_below is not None or include_completed:
         statuses.append("completed")
     conditions = [
         AgentRun.status == "completed",
         AgentRun.summary_status.in_(statuses),
+        *_agent_run_reach_conditions(reach),
     ]
     if agent_id is not None:
         conditions.append(AgentRun.agent_id == agent_id)
@@ -422,7 +528,7 @@ async def get_backfill_eligible(
         )
     ).scalar() or 0
 
-    per_run_cost, basis = await _estimate_per_run_cost(db)
+    per_run_cost, basis = await _estimate_per_run_cost(db, reach=reach)
     estimated_total = (per_run_cost * Decimal(count)).quantize(Decimal("0.0001"))
 
     return BackfillEligibleResponse(
@@ -432,200 +538,9 @@ async def get_backfill_eligible(
     )
 
 
-@router.get("/{run_id}")
-async def get_agent_run(
-    run_id: UUID,
-    db: DbSession,
-    user: CurrentActiveUser,
-) -> AgentRunDetailResponse:
-    """Get agent run detail with steps."""
-    query = (
-        select(AgentRun)
-        .options(selectinload(AgentRun.steps))
-        .where(AgentRun.id == run_id)
-    )
-
-    query = query.where(*agent_run_visibility_conditions(user))
-
-    result = await db.execute(query)
-    run = result.scalar_one_or_none()
-
-    if not run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent run {run_id} not found",
-        )
-
-    # Fetch AI usage records for this run
-    ai_usage_result = await db.execute(
-        select(AIUsage)
-        .where(AIUsage.agent_run_id == run_id)
-        .order_by(AIUsage.timestamp)
-    )
-    ai_usage_entries = ai_usage_result.scalars().all()
-
-    ai_usage_list: list[AIUsagePublicSimple] | None = None
-    ai_totals_response: AIUsageTotalsSimple | None = None
-
-    if ai_usage_entries:
-        ai_usage_list = [
-            AIUsagePublicSimple(
-                provider=entry.provider,
-                model=entry.model,
-                input_tokens=entry.input_tokens,
-                output_tokens=entry.output_tokens,
-                cache_read_tokens=entry.cache_read_tokens,
-                cache_write_tokens=entry.cache_write_tokens,
-                provider_cost=(str(entry.provider_cost) if entry.provider_cost is not None else None),
-                cost=str(entry.cost) if entry.cost else None,
-                duration_ms=entry.duration_ms,
-                timestamp=entry.timestamp.isoformat(),
-                sequence=entry.sequence,
-            )
-            for entry in ai_usage_entries
-        ]
-
-        # Calculate totals
-        totals_result = await db.execute(
-            select(
-                func.sum(AIUsage.input_tokens).label("total_input"),
-                func.sum(AIUsage.output_tokens).label("total_output"),
-                func.sum(AIUsage.cache_read_tokens).label("total_cache_read"),
-                func.sum(AIUsage.cache_write_tokens).label("total_cache_write"),
-                func.sum(AIUsage.provider_cost).label("total_provider_cost"),
-                func.sum(AIUsage.cost).label("total_cost"),
-                func.sum(AIUsage.duration_ms).label("total_duration"),
-                func.count(AIUsage.id).label("call_count"),
-            ).where(AIUsage.agent_run_id == run_id)
-        )
-        totals_row = totals_result.one()
-        ai_totals_response = AIUsageTotalsSimple(
-            total_input_tokens=int(totals_row.total_input or 0),
-            total_output_tokens=int(totals_row.total_output or 0),
-            total_cache_read_tokens=int(totals_row.total_cache_read or 0),
-            total_cache_write_tokens=int(totals_row.total_cache_write or 0),
-            total_provider_cost=str(totals_row.total_provider_cost or Decimal("0")),
-            total_cost=str(totals_row.total_cost or Decimal("0")),
-            total_duration_ms=int(totals_row.total_duration or 0),
-            call_count=int(totals_row.call_count or 0),
-        )
-
-    # Fetch delegation sub-runs and their agents in one ordered query. Keep the
-    # legacy ID list while also returning enough context for a user-facing view.
-    child_runs_result = await db.execute(
-        select(AgentRun)
-        .options(joinedload(AgentRun.agent))
-        .where(AgentRun.parent_run_id == run_id)
-        .order_by(AgentRun.created_at, AgentRun.id)
-    )
-    child_runs = child_runs_result.scalars().all()
-    child_run_ids = [child.id for child in child_runs]
-    child_runs_response = [
-        AgentRunChildResponse(
-            id=child.id,
-            agent_id=child.agent_id,
-            agent_name=child.agent.name,
-            status=child.status,
-            asked=child.asked,
-            did=child.did,
-            answered=child.answered,
-            duration_ms=child.duration_ms,
-            created_at=child.created_at,
-        )
-        for child in child_runs
-    ]
-
-    # Dual-read steps: Redis Stream when in-progress, DB when complete
-    steps_response: list[AgentRunStepResponse] = []
-    is_in_progress = run.status in ("queued", "running", "cancelling")
-
-    if is_in_progress:
-        # Read from Redis Stream (steps are uncommitted in DB during execution)
-        try:
-            async with get_redis() as r:
-                stream_key = agent_run_steps_stream_key(str(run_id))
-                entries = await r.xrange(stream_key, min="-", max="+")  # type: ignore[misc]
-                for _entry_id, data in entries:
-                    content_raw = data.get("content", "{}")
-                    content = json.loads(content_raw) if content_raw else None
-                    tokens_str = data.get("tokens_used", "")
-                    duration_str = data.get("duration_ms", "")
-                    steps_response.append(AgentRunStepResponse(
-                        id=UUID(data["id"]),
-                        run_id=UUID(data["run_id"]),
-                        step_number=int(data["step_number"]),
-                        type=data["type"],
-                        content=content,
-                        tokens_used=int(tokens_str) if tokens_str else None,
-                        duration_ms=int(duration_str) if duration_str else None,
-                        created_at=datetime.fromisoformat(data["created_at"]),
-                    ))
-        except Exception:
-            logger.warning(f"Failed to read steps from Redis for run {log_safe(run_id)}, falling back to DB")
-            # Fall back to DB steps (may be empty if uncommitted)
-            steps_response = [
-                AgentRunStepResponse(
-                    id=step.id, run_id=step.run_id, step_number=step.step_number,
-                    type=step.type, content=step.content, tokens_used=step.tokens_used,
-                    duration_ms=step.duration_ms, created_at=step.created_at,
-                )
-                for step in run.steps
-            ]
-    else:
-        # Completed — read from DB (steps are committed)
-        steps_response = [
-            AgentRunStepResponse(
-                id=step.id, run_id=step.run_id, step_number=step.step_number,
-                type=step.type, content=step.content, tokens_used=step.tokens_used,
-                duration_ms=step.duration_ms, created_at=step.created_at,
-            )
-            for step in run.steps
-        ]
-
-    return AgentRunDetailResponse(
-        id=run.id,
-        agent_id=run.agent_id,
-        agent_name=run.agent.name if run.agent else None,
-        trigger_type=run.trigger_type,
-        trigger_source=run.trigger_source,
-        conversation_id=run.conversation_id,
-        event_delivery_id=run.event_delivery_id,
-        input=run.input,
-        output=run.output,
-        status=run.status,
-        error=run.error,
-        org_id=run.org_id,
-        caller_user_id=run.caller_user_id,
-        caller_email=run.caller_email,
-        caller_name=run.caller_name,
-        iterations_used=run.iterations_used,
-        tokens_used=run.tokens_used,
-        budget_max_iterations=run.budget_max_iterations,
-        budget_max_tokens=run.budget_max_tokens,
-        duration_ms=run.duration_ms,
-        llm_model=run.llm_model,
-        asked=run.asked,
-        did=run.did,
-        answered=run.answered,
-        metadata=run.run_metadata or {},
-        confidence=run.confidence,
-        confidence_reason=run.confidence_reason,
-        summary_status=run.summary_status,
-        summary_error=run.summary_error,
-        verdict=run.verdict,
-        verdict_note=run.verdict_note,
-        verdict_set_at=run.verdict_set_at,
-        verdict_set_by=run.verdict_set_by,
-        created_at=run.created_at,
-        started_at=run.started_at,
-        completed_at=run.completed_at,
-        parent_run_id=run.parent_run_id,
-        child_run_ids=child_run_ids,
-        child_runs=child_runs_response,
-        steps=steps_response,
-        ai_usage=ai_usage_list,
-        ai_totals=ai_totals_response,
-    )
+# These routes already carry the public prefix and tags. Append them at their
+# original registration positions so route precedence and OpenAPI stay exact.
+router.routes.extend(detail_router.routes)
 
 
 @router.post("/{run_id}/rerun")
@@ -635,9 +550,10 @@ async def rerun_agent_run(
     user: CurrentActiveUser,
 ) -> AgentRunRerunResponse:
     """Rerun an agent run with the same input (async, non-blocking)."""
+    caller = await load_caller(db, user)
     query = select(AgentRun).where(AgentRun.id == run_id)
 
-    query = query.where(*agent_run_visibility_conditions(user))
+    query = query.where(*agent_run_visibility_conditions(caller))
 
     result = await db.execute(query)
     original = result.scalar_one_or_none()
@@ -647,6 +563,13 @@ async def rerun_agent_run(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent run {run_id} not found",
         )
+    await _require_own_private_agent_run(db, caller, original)
+
+    try:
+        actor = await resolve_rerun_actor(db, user, original)
+    except SdkAgentRunError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    require_permission(caller, "agents.execute", actor.org_id)
 
     new_run_id = await enqueue_agent_run(
         agent_id=str(original.agent_id),
@@ -654,11 +577,16 @@ async def rerun_agent_run(
         input_data=original.input,
         trigger_source=str(run_id),
         output_schema=original.output_schema,
-        org_id=str(original.org_id) if original.org_id else None,
+        org_id=str(actor.org_id) if actor.org_id else None,
         caller_user_id=str(user.user_id),
         caller_email=user.email,
         caller_name=getattr(user, "name", None),
+        caller_is_superuser=user.is_superuser,
+        caller_is_external=user.is_external,
+        caller_is_provider_org=user.is_provider_org,
         sync=False,
+        lineage=await principal_lineage(db, user),
+        run_as_user_id=actor.run_as_user_id,
     )
 
     return AgentRunRerunResponse(run_id=UUID(new_run_id))
@@ -681,9 +609,10 @@ async def cancel_agent_run(
     user: CurrentActiveUser,
 ) -> dict:
     """Cancel a queued or running agent run."""
+    caller = await load_caller(db, user)
     query = select(AgentRun).where(AgentRun.id == run_id)
 
-    query = query.where(*agent_run_visibility_conditions(user))
+    query = query.where(*agent_run_visibility_conditions(caller))
 
     result = await db.execute(query)
     agent_run = result.scalar_one_or_none()
@@ -693,6 +622,8 @@ async def cancel_agent_run(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent run {run_id} not found",
         )
+    if not _may_cancel_run(caller, agent_run):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent run {run_id} not found")
 
     if agent_run.status in TERMINAL_STATUSES:
         raise HTTPException(
@@ -707,26 +638,30 @@ async def cancel_agent_run(
     redis_client = get_redis_client()
 
     if agent_run.status == "queued":
-        # Not yet picked up by worker — cancel directly
-        agent_run.status = "cancelled"
-        agent_run.completed_at = datetime.now(timezone.utc)
-        await db.commit()
+        # Claim cancellation only while the run is still queued. If the worker
+        # wins this transition, refresh and continue through running cancel.
+        cancelled_at = datetime.now(timezone.utc)
+        cancel_result = await db.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id, AgentRun.status == "queued")
+            .values(status="cancelled", completed_at=cancelled_at)
+            .returning(AgentRun.id)
+        )
+        if cancel_result.scalar_one_or_none() is None:
+            await db.refresh(agent_run)
+        else:
+            await db.commit()
+            return {"run_id": str(run_id), "status": "cancelled"}
 
-        # Also mark the Redis context so worker skips if it picks up concurrently
-        from src.core.cache.redis_client import get_redis
-        redis_key = f"bifrost:agent_run:{run_id}:context"
-        async with get_redis() as r:
-            context_raw = await r.get(redis_key)
-            if context_raw:
-                ctx = json.loads(context_raw)
-                ctx["cancelled"] = True
-                ttl = await r.ttl(redis_key)
-                await r.set(redis_key, json.dumps(ctx), ex=max(ttl, 60))
-
-        return {"run_id": str(run_id), "status": "cancelled"}
+    if agent_run.status in TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel agent run with status '{agent_run.status}'",
+        )
 
     # Running — set to cancelling and signal via Redis
     agent_run.status = "cancelling"
+    agent_run.cancel_requested_at = datetime.now(timezone.utc)
     await db.commit()
 
     await redis_client.set_agent_run_cancel_flag(str(run_id))
@@ -750,9 +685,10 @@ async def set_verdict(
     user: CurrentActiveUser,
 ) -> VerdictResponse:
     """Set a verdict on a completed run. Records an audit row."""
+    caller = await load_caller(db, user)
     query = select(AgentRun).where(AgentRun.id == run_id)
 
-    query = query.where(*agent_run_visibility_conditions(user))
+    query = query.where(*agent_run_visibility_conditions(caller))
 
     result = await db.execute(query)
     run = result.scalar_one_or_none()
@@ -762,6 +698,7 @@ async def set_verdict(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent run {run_id} not found",
         )
+    await _require_own_private_agent_run(db, caller, run)
     if run.status != "completed":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -803,9 +740,10 @@ async def clear_verdict(
     user: CurrentActiveUser,
 ) -> VerdictResponse:
     """Clear the verdict on a run. Records an audit row."""
+    caller = await load_caller(db, user)
     query = select(AgentRun).where(AgentRun.id == run_id)
 
-    query = query.where(*agent_run_visibility_conditions(user))
+    query = query.where(*agent_run_visibility_conditions(caller))
 
     result = await db.execute(query)
     run = result.scalar_one_or_none()
@@ -815,6 +753,7 @@ async def clear_verdict(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent run {run_id} not found",
         )
+    await _require_own_private_agent_run(db, caller, run)
 
     now = datetime.now(timezone.utc)
     previous = run.verdict
@@ -858,14 +797,16 @@ async def get_flag_conversation(
     Creates an empty conversation row if none exists yet so the UI can
     stream messages into a stable ``id``.
     """
+    caller = await load_caller(db, user)
     query = select(AgentRun).where(AgentRun.id == run_id)
-    query = query.where(*agent_run_visibility_conditions(user))
+    query = query.where(*agent_run_visibility_conditions(caller))
     run = (await db.execute(query)).scalar_one_or_none()
     if not run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent run {run_id} not found",
         )
+    await _require_own_private_agent_run(db, caller, run)
 
     conv = await get_or_create_conversation(run_id, db)
     # Persist the created-empty conversation so subsequent GETs see the same id.
@@ -890,14 +831,16 @@ async def send_flag_message(
     user: CurrentActiveUser,
 ) -> FlagConversationResponse:
     """Append a user turn and synchronously get the tuning-model reply."""
+    caller = await load_caller(db, user)
     query = select(AgentRun).where(AgentRun.id == run_id)
-    query = query.where(*agent_run_visibility_conditions(user))
+    query = query.where(*agent_run_visibility_conditions(caller))
     run = (await db.execute(query)).scalar_one_or_none()
     if not run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent run {run_id} not found",
         )
+    await _require_own_private_agent_run(db, caller, run)
     if run.status != "completed":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -924,26 +867,25 @@ async def regenerate_summary(
     user: CurrentActiveUser,
 ) -> dict:
     """Reset summary state and re-enqueue a summarization job. Admin-only."""
-    if not _is_platform_admin(user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only platform administrators can regenerate run summaries",
-        )
-
     run = (
-        await db.execute(select(AgentRun).where(AgentRun.id == run_id))
+        await db.execute(
+            select(AgentRun)
+            .where(AgentRun.id == run_id)
+            .with_for_update(of=AgentRun)
+        )
     ).scalar_one_or_none()
     if not run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent run {run_id} not found",
         )
+    caller = await load_caller(db, user)
+    require_operation(caller, "POST /api/agent-runs/{run_id}/regenerate-summary", org_target(run.org_id))
 
-    run.summary_status = "pending"
-    run.summary_error = None
+    summary = await request_summary(db, run)
     await db.commit()
 
-    await enqueue_summarize(run_id)
+    await hand_off_summary(summary)
 
     return {"status": "enqueued", "run_id": str(run_id)}
 
@@ -962,8 +904,9 @@ async def dry_run_agent_run(
     decision. Records an ``AIUsage`` row on the original run for cost
     tracking (``sequence=8000``).
     """
+    caller = await load_caller(db, user)
     query = select(AgentRun).where(AgentRun.id == run_id)
-    query = query.where(*agent_run_visibility_conditions(user))
+    query = query.where(*agent_run_visibility_conditions(caller))
 
     run = (await db.execute(query)).scalar_one_or_none()
     if not run:
@@ -971,6 +914,8 @@ async def dry_run_agent_run(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Agent run {run_id} not found",
         )
+    await _require_own_private_agent_run(db, caller, run)
+    require_permission(caller, "agents.execute", run.org_id)
     if run.status != "completed":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -996,6 +941,9 @@ async def dry_run_agent_run(
     )
 
 
+router.routes.extend(enqueue_router.routes)
+
+
 @router.post("/execute")
 async def execute_agent_run(
     request: AgentRunCreateRequest,
@@ -1003,17 +951,7 @@ async def execute_agent_run(
     user: CurrentActiveUser,
 ) -> dict:
     """Execute an agent synchronously via the SDK."""
-    # Look up agent by name (case-insensitive)
-    result = await db.execute(
-        select(Agent).where(Agent.name.ilike(request.agent_name))
-    )
-    agent = result.scalar_one_or_none()
-
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent '{request.agent_name}' not found",
-        )
+    agent = await _get_executable_agent(db, request.agent_name, user)
 
     # Paused agents short-circuit gracefully — HTTP 200 with structured body.
     # Downstream consumers (webhook senders, SDK) discriminate on status="paused".
@@ -1025,21 +963,11 @@ async def execute_agent_run(
             "agent_id": str(agent.id),
         }
 
-    # Inactive-solution gate: an agent belonging to an inactive solution must not
-    # execute (mirrors the worker-side gate in get_workflow_for_execution).
-    if agent.solution_id is not None:
-        sol_result = await db.execute(
-            select(Solution.status).where(Solution.id == agent.solution_id)
-        )
-        sol_status = sol_result.scalar_one_or_none()
-        if sol_status != "active":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Agent '{agent.name}' belongs to an inactive solution. "
-                    "Reinstall the solution to execute this agent."
-                ),
-            )
+    try:
+        actor = await resolve_agent_run_actor(db, user, agent, request.run_as)
+    except SdkAgentRunError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from None
+    require_permission(await load_caller(db, user), "agents.execute", actor.org_id)
 
     # Enqueue the agent run for sync execution
     run_id = await enqueue_agent_run(
@@ -1047,11 +975,16 @@ async def execute_agent_run(
         trigger_type="api",
         input_data=request.input,
         output_schema=request.output_schema,
-        org_id=str(user.organization_id) if user.organization_id else None,
+        org_id=str(actor.org_id) if actor.org_id else None,
         caller_user_id=str(user.user_id),
         caller_email=user.email,
         caller_name=getattr(user, "name", None),
+        caller_is_superuser=user.is_superuser,
+        caller_is_external=user.is_external,
+        caller_is_provider_org=user.is_provider_org,
         sync=True,
+        lineage=await principal_lineage(db, user),
+        run_as_user_id=actor.run_as_user_id,
     )
 
     # Wait for the result
@@ -1063,6 +996,8 @@ async def execute_agent_run(
             detail="Agent run timed out",
         )
 
+    if actor.run_as_user_id is not None:
+        return {**result_data, "run_as_user_id": str(actor.run_as_user_id)}
     return result_data
 
 
@@ -1073,18 +1008,28 @@ async def execute_agent_run(
 _BACKFILL_FALLBACK_PER_RUN_COST = Decimal("0.002")
 
 
-def _is_platform_admin(user) -> bool:  # type: ignore[no-untyped-def]
-    return user.has_platform_admin_grant()
+def _agent_run_reach_conditions(reach) -> tuple:
+    """SQL predicates for a named operation's original-user organization reach."""
+    predicate = reach.where(AgentRun.org_id)
+    return () if predicate is None else (predicate,)
 
 
-async def _estimate_per_run_cost(db) -> tuple[Decimal, str]:  # type: ignore[no-untyped-def]
+async def _backfill_job_in_reach(db, caller, job: SummaryBackfillJob, reach) -> bool:  # type: ignore[no-untyped-def]
+    """A backfill job inherits the actual organization of its selected Agent."""
+    if job.agent_id is None:
+        return reach.everything or job.requested_by == caller_user_id(caller)
+    organization_id = await db.scalar(select(Agent.organization_id).where(Agent.id == job.agent_id))
+    return organization_id is not None and reach.covers(organization_id) and user_reach(caller).covers(organization_id)
+
+
+async def _estimate_per_run_cost(db, *, reach) -> tuple[Decimal, str]:  # type: ignore[no-untyped-def]
     """Average cost-per-summarizer-call over the last 100 completed summaries.
 
     Returns ``(per_run_cost, basis)`` where basis is 'history' or 'fallback'.
     """
     recent_runs_subq = (
         select(AgentRun.id)
-        .where(AgentRun.summary_status == "completed")
+        .where(AgentRun.summary_status == "completed", *_agent_run_reach_conditions(reach))
         .order_by(desc(AgentRun.summary_generated_at))
         .limit(100)
         .subquery()
@@ -1121,16 +1066,14 @@ async def backfill_summaries(
     per run tagged with the job_id; progress is broadcast on the
     ``summary-backfill:{job_id}`` channel.
     """
-    if not _is_platform_admin(user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only platform administrators can trigger summary backfills",
-        )
+    caller = await load_caller(db, user)
+    reach = operation_reach(caller, "POST /api/agent-runs/backfill-summaries")
 
     # Build the base query: completed runs that still need (re-)summarization.
     conditions = [
         AgentRun.status == "completed",
         AgentRun.summary_status.in_(request.statuses),
+        *_agent_run_reach_conditions(reach),
     ]
     if request.agent_id is not None:
         conditions.append(AgentRun.agent_id == request.agent_id)
@@ -1153,7 +1096,7 @@ async def backfill_summaries(
     run_ids = list((await db.execute(id_query)).scalars().all())
     eligible = len(run_ids)
 
-    per_run_cost, basis = await _estimate_per_run_cost(db)
+    per_run_cost, basis = await _estimate_per_run_cost(db, reach=reach)
     estimated_total = (per_run_cost * Decimal(eligible)).quantize(Decimal("0.0001"))
 
     if request.dry_run or eligible == 0:
@@ -1172,12 +1115,14 @@ async def backfill_summaries(
     job = SummaryBackfillJob(
         id=central_job_id,
         agent_id=request.agent_id,
-        requested_by=user.user_id,
+        requested_by=caller_user_id(caller),
         status="running",
         total=eligible,
         estimated_cost_usd=estimated_total,
     )
     db.add(job)
+    # The runs reference the job, so it must exist before they are updated.
+    await db.flush()
 
     # Flip all targeted runs back to pending so the UI reflects the queued state
     # immediately (the summarizer's idempotent short-circuit on 'completed' will
@@ -1186,7 +1131,11 @@ async def backfill_summaries(
     await db.execute(
         sql_update(AgentRun)
         .where(AgentRun.id.in_(run_ids))
-        .values(summary_status="pending", summary_error=None)
+        .values(
+            summary_status="pending",
+            summary_error=None,
+            summary_backfill_job_id=central_job_id,
+        )
     )
     from src.jobs.platform.summary_backfill import (
         SUMMARY_BACKFILL_DEFINITION,
@@ -1201,7 +1150,7 @@ async def backfill_summaries(
         dedupe_key=str(job.id),
         priority=100,
         organization_id=None,
-        requested_by_user_id=user.user_id,
+        requested_by_user_id=caller_user_id(caller),
         requested_by_email=user.email,
         requested_by_name=user.name or user.email or "Unknown",
         resource_type="summary_backfill",
@@ -1232,11 +1181,8 @@ async def get_backfill_job(
     user: CurrentActiveUser,
 ) -> SummaryBackfillJobResponse:
     """Admin-only: current progress for a summary backfill job."""
-    if not _is_platform_admin(user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only platform administrators can view backfill jobs",
-        )
+    caller = await load_caller(db, user)
+    reach = operation_reach(caller, "GET /api/agent-runs/backfill-jobs/{job_id}")
     job = (
         await db.execute(
             select(SummaryBackfillJob).where(SummaryBackfillJob.id == job_id)
@@ -1247,6 +1193,8 @@ async def get_backfill_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Summary backfill job {job_id} not found",
         )
+    if not await _backfill_job_in_reach(db, caller, job, reach):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Summary backfill job {job_id} not found")
     return SummaryBackfillJobResponse.model_validate(job)
 
 
@@ -1261,23 +1209,18 @@ async def cancel_backfill_job(
 ) -> SummaryBackfillJobResponse:
     """Mark a backfill job as cancelled so the UI unblocks.
 
-    This does NOT drain messages already on the ``agent-summarization``
-    queue — RabbitMQ will keep delivering them and the worker will keep
-    summarising individual runs. What it does do:
+    This does NOT withdraw summaries already dispatched — executors keep
+    summarising those runs. What it does do:
 
     - flips ``status`` from ``running`` to ``cancelled``
     - sets ``completed_at`` so the row stops appearing in "active" queries
     - broadcasts final state so the progress card dismisses itself
 
-    Use this when progress has stalled (e.g. the worker was restarted
-    mid-job and prefetched messages went back on the queue but the counter
-    never advanced) — admins need a way out.
+    Use this when progress has stalled and the counter never advanced —
+    admins need a way out.
     """
-    if not _is_platform_admin(user):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only platform administrators can cancel backfill jobs",
-        )
+    caller = await load_caller(db, user)
+    reach = operation_reach(caller, "POST /api/agent-runs/backfill-jobs/{job_id}/cancel")
     job = (
         await db.execute(
             select(SummaryBackfillJob).where(SummaryBackfillJob.id == job_id)
@@ -1288,6 +1231,8 @@ async def cancel_backfill_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Summary backfill job {job_id} not found",
         )
+    if not await _backfill_job_in_reach(db, caller, job, reach):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Summary backfill job {job_id} not found")
     if job.status != "running":
         # Already terminal — return current state without re-broadcasting.
         return SummaryBackfillJobResponse.model_validate(job)

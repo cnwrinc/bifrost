@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select
+from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy import case, func, or_, select
 
 from src.core.auth import Context, CurrentUser
 from src.models.contracts.platform_jobs import (
     PlatformJobCancelResponse,
     PlatformJobListResponse,
     PlatformJobPublic,
+    PlatformJobStatus,
 )
 from src.models.orm.platform_jobs import PlatformJob
 from src.services.platform_jobs import (
@@ -19,28 +20,32 @@ from src.services.platform_jobs import (
     platform_job_to_public,
     request_platform_job_cancel,
 )
+from src.services.operation_catalog import operation_route
+from src.services.authorization.enforce import load_caller
+from src.services.platform_job_access import (
+    PlatformJobAccessDenied,
+    platform_job_visibility_filter,
+    require_platform_job_access,
+)
 
 router = APIRouter(prefix="/api/platform-jobs", tags=["Platform Jobs"])
-
-
-def _can_read(job: PlatformJob, user: CurrentUser) -> bool:
-    return (
-        user.is_platform_admin
-        or job.requested_by_user_id == str(user.user_id)
-    )
 
 
 async def _get_visible_job(
     ctx: Context,
     user: CurrentUser,
     job_id: UUID,
+    *,
+    cancel: bool = False,
 ) -> PlatformJob:
     job = await ctx.db.get(PlatformJob, job_id)
-    if job is None or not _can_read(job, user):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Platform job not found",
-        )
+    caller = await load_caller(ctx.db, user)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Platform job not found")
+    try:
+        require_platform_job_access(caller, job, cancel=cancel)
+    except PlatformJobAccessDenied:
+        raise HTTPException(status_code=404, detail="Platform job not found") from None
     return job
 
 
@@ -54,19 +59,49 @@ async def list_platform_jobs(
     user: CurrentUser,
     active_only: bool = Query(default=True),
     limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    job_status: PlatformJobStatus | None = Query(default=None, alias="status"),
+    search: str | None = Query(default=None, min_length=1, max_length=200),
 ) -> PlatformJobListResponse:
-    query = select(PlatformJob).order_by(PlatformJob.created_at.desc()).limit(limit)
-    if not user.is_platform_admin:
-        query = query.where(
-            PlatformJob.requested_by_user_id == str(user.user_id)
-        )
-    if active_only:
-        query = query.where(
+    caller = await load_caller(ctx.db, user)
+    filters = [platform_job_visibility_filter(caller)]
+    if job_status is not None:
+        filters.append(PlatformJob.status == job_status.value)
+    elif active_only:
+        filters.append(
             PlatformJob.status.in_(ACTIVE_PLATFORM_JOB_STATUSES)
         )
-    jobs = (await ctx.db.execute(query)).scalars().all()
+    normalized_search = search.strip() if search else ""
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        filters.append(
+            or_(
+                PlatformJob.title.ilike(pattern),
+                PlatformJob.job_type.ilike(pattern),
+                PlatformJob.requested_by_name.ilike(pattern),
+                PlatformJob.resource_type.ilike(pattern),
+            )
+        )
+
+    total_query = select(func.count()).select_from(PlatformJob).where(*filters)
+    total = (await ctx.db.execute(total_query)).scalar_one()
+    active_first = case(
+        (PlatformJob.status.in_(ACTIVE_PLATFORM_JOB_STATUSES), 0),
+        else_=1,
+    )
+    jobs_query = (
+        select(PlatformJob)
+        .where(*filters)
+        .order_by(active_first, PlatformJob.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    jobs = (await ctx.db.execute(jobs_query)).scalars().all()
     return PlatformJobListResponse(
-        jobs=[platform_job_to_public(job) for job in jobs]
+        jobs=[platform_job_to_public(job) for job in jobs],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -74,7 +109,7 @@ async def list_platform_jobs(
     "/{job_id}",
     response_model=PlatformJobPublic,
     summary="Get durable platform-job status",
-)
+**operation_route("platform.jobs.get"))
 async def get_platform_job_status(
     job_id: UUID,
     ctx: Context,
@@ -93,7 +128,7 @@ async def cancel_platform_job(
     ctx: Context,
     user: CurrentUser,
 ) -> PlatformJobCancelResponse:
-    job = await _get_visible_job(ctx, user, job_id)
+    job = await _get_visible_job(ctx, user, job_id, cancel=True)
     job, accepted = await request_platform_job_cancel(ctx.db, job)
     return PlatformJobCancelResponse(
         job=platform_job_to_public(job),

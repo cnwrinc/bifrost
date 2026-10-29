@@ -21,6 +21,8 @@ KNOWN_USER_FIELDS: Final[frozenset[str]] = frozenset({
     "user_id",
     "email",
     "organization_id",
+    # The only legacy admin term retained after cutover: policies resolve it by the
+    # built-in Platform Admin role ID, never an administrative flag.
     "is_platform_admin",
     "is_provider_org",
     "is_external",
@@ -28,11 +30,17 @@ KNOWN_USER_FIELDS: Final[frozenset[str]] = frozenset({
     "role_names",
 })
 
+# Internal policy authority used by the built-in admin-bypass policy. It is a
+# policy view of configured powers, not a third permission mode or a user role
+# fact: a Full workflow may hold it without changing its engine principal.
+KNOWN_POLICY_AUTHORITIES: Final[frozenset[str]] = frozenset({"platform_admin"})
+
 # Operators that produce boolean results.
 _LOGIC_OPS: Final[frozenset[str]] = frozenset({"and", "or", "not"})
 _COMPARE_OPS: Final[frozenset[str]] = frozenset({"eq", "neq", "lt", "lte", "gt", "gte"})
 _OTHER_OPS: Final[frozenset[str]] = frozenset({"in", "is_null", "call"})
 _ALL_OPS: Final[frozenset[str]] = _LOGIC_OPS | _COMPARE_OPS | _OTHER_OPS
+_FILE_ONLY_OPS: Final[frozenset[str]] = frozenset({"path_within_any"})
 
 # Bound on AST recursion depth. Prevents pathological deeply-nested imports
 # (e.g., manifest expressions from an untrusted source) from hitting Python's
@@ -97,6 +105,14 @@ def _validate_operand(
                 f"available: {sorted(KNOWN_USER_FIELDS)}"
             )
         return
+    if keys == {"authority"}:
+        ref = node["authority"]
+        if ref not in KNOWN_POLICY_AUTHORITIES:
+            raise ValueError(
+                f"{path}: unknown policy authority {ref!r}; "
+                f"available: {sorted(KNOWN_POLICY_AUTHORITIES)}"
+            )
+        return
     if keys == {"call", "args"} or keys == {"call"}:
         _validate_call(
             node,
@@ -111,7 +127,10 @@ def _validate_operand(
             f"{path}: operator node must have exactly one key, got {sorted(keys)}"
         )
     op = next(iter(keys))
-    if op not in _ALL_OPS:
+    allowed_ops = _ALL_OPS
+    if extra_ref_namespaces and "file" in extra_ref_namespaces:
+        allowed_ops |= _FILE_ONLY_OPS
+    if op not in allowed_ops:
         raise ValueError(f"{path}: unknown operator {op!r}")
     _validate_op_node(
         op,
@@ -171,12 +190,12 @@ def _validate_op_node(
                 extra_ref_namespaces=extra_ref_namespaces,
             )
         return
-    if op == "in":
+    if op in {"in", "path_within_any"}:
         if not isinstance(value, list) or len(value) != 2:
             raise ValueError(
-                f"{path}.{op}: in requires [operand, [literal, ...]] or "
+                f"{path}.{op}: {op} requires [operand, [literal, ...]] or "
                 f"[operand, {{claims: <name>}}]"
-        )
+            )
         left, right = value
         _validate_operand(
             left,
@@ -197,11 +216,20 @@ def _validate_op_node(
 
         if not isinstance(right, list) or not right:
             raise ValueError(
-                f"{path}.{op}: in requires a non-empty literal list or "
+                f"{path}.{op}: {op} requires a non-empty literal list or "
                 f"{{claims: <name>}} as RHS"
             )
         for i, item in enumerate(right):
-            if not isinstance(item, (str, int, float, bool)) and item is not None:
+            if op == "path_within_any" and not isinstance(item, str):
+                raise ValueError(
+                    f"{path}.{op}[1][{i}]: path_within_any literal list items "
+                    "must be strings"
+                )
+            if (
+                op == "in"
+                and not isinstance(item, (str, int, float, bool))
+                and item is not None
+            ):
                 raise ValueError(
                     f"{path}.{op}[1][{i}]: in literal list items must be scalars or null"
                 )

@@ -54,6 +54,113 @@ class TestTableUpdatePublic:
         assert get_resp.status_code == 200
         assert get_resp.json()["name"] == new_name
 
+    def test_create_with_nonexistent_target_org_returns_422(
+        self, e2e_client, platform_admin
+    ):
+        """A bogus organization_id 422s before hitting the DB FK (_validate_table_target_org)."""
+        resp = e2e_client.post(
+            "/api/tables",
+            headers=platform_admin.headers,
+            json={
+                "name": f"bogus_org_{uuid4().hex[:8]}",
+                "organization_id": str(uuid4()),
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        assert "does not reference an existing organization" in resp.text
+
+    def test_rename_collision_returns_409_not_422(self, e2e_client, platform_admin):
+        """Renaming a table onto an existing name in the same scope 409s
+        (IntegrityError -> 409), not a raw 422 exception string."""
+        existing_name = f"rn_taken_{uuid4().hex[:8]}"
+        _create_table(e2e_client, platform_admin.headers, existing_name)
+        other_id = _create_table(e2e_client, platform_admin.headers, f"rn_other_{uuid4().hex[:8]}")
+
+        resp = e2e_client.patch(
+            f"/api/tables/{other_id}",
+            headers=platform_admin.headers,
+            json={"name": existing_name},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "already exists" in resp.text
+
+    def test_update_rescope_global_to_org(self, e2e_client, platform_admin, org1):
+        table_id = _create_table(e2e_client, platform_admin.headers, f"rs_g2o_{uuid4().hex[:8]}")
+        resp = e2e_client.patch(
+            f"/api/tables/{table_id}",
+            headers=platform_admin.headers,
+            json={"organization_id": org1["id"]},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["organization_id"] == org1["id"]
+
+    def test_update_rescope_org_to_global(self, e2e_client, platform_admin, org1):
+        table_id = _create_table(
+            e2e_client, platform_admin.headers, f"rs_o2g_{uuid4().hex[:8]}", org1["id"]
+        )
+        resp = e2e_client.patch(
+            f"/api/tables/{table_id}",
+            headers=platform_admin.headers,
+            json={"organization_id": None},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["organization_id"] is None
+
+    def test_update_rescope_org_to_other_org(
+        self, e2e_client, platform_admin, org1
+    ):
+        other_org_resp = e2e_client.post(
+            "/api/organizations",
+            headers=platform_admin.headers,
+            json={"name": f"Rescope Target Org {uuid4().hex[:8]}"},
+        )
+        assert other_org_resp.status_code == 201, other_org_resp.text
+        other_org_id = other_org_resp.json()["id"]
+
+        table_id = _create_table(
+            e2e_client, platform_admin.headers, f"rs_o2o_{uuid4().hex[:8]}", org1["id"]
+        )
+        try:
+            resp = e2e_client.patch(
+                f"/api/tables/{table_id}",
+                headers=platform_admin.headers,
+                json={"organization_id": other_org_id},
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["organization_id"] == other_org_id
+        finally:
+            e2e_client.delete(
+                f"/api/organizations/{other_org_id}", headers=platform_admin.headers
+            )
+
+    def test_update_rescope_nonexistent_org_returns_422(
+        self, e2e_client, platform_admin
+    ):
+        table_id = _create_table(e2e_client, platform_admin.headers, f"rs_bogus_{uuid4().hex[:8]}")
+        resp = e2e_client.patch(
+            f"/api/tables/{table_id}",
+            headers=platform_admin.headers,
+            json={"organization_id": str(uuid4())},
+        )
+        assert resp.status_code == 422, resp.text
+        assert "does not reference an existing organization" in resp.text
+
+    def test_update_rescope_name_clash_in_target_scope_returns_409(
+        self, e2e_client, platform_admin, org1
+    ):
+        """Moving a global table into an org where the name is already taken 409s."""
+        shared_name = f"rs_clash_{uuid4().hex[:8]}"
+        _create_table(e2e_client, platform_admin.headers, shared_name, org1["id"])
+        moving_id = _create_table(e2e_client, platform_admin.headers, shared_name)
+
+        resp = e2e_client.patch(
+            f"/api/tables/{moving_id}",
+            headers=platform_admin.headers,
+            json={"organization_id": org1["id"]},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "already exists" in resp.text
+
 
 @pytest.mark.e2e
 class TestTableDefaultDeny:
@@ -189,17 +296,10 @@ class TestDocumentScopeQueryParam:
         assert bd.json()["deleted"] == 1
         assert bd.json()["deleted_ids"] == [doc_id]
 
-    def test_non_superuser_scope_silently_ignored(
+    def test_non_superuser_scope_outside_reach_is_forbidden(
         self, e2e_client, platform_admin, alice_user, org2
     ):
-        """Non-superuser passing ?scope=<other_org_id> resolves to caller's own org.
-
-        At the REST layer ``resolve_target_org`` ignores ``scope`` for
-        non-superusers — there is no 422. Cross-org access is prevented
-        because the resolved org becomes Alice's (org1), so the org2 table
-        is invisible: name lookup yields 404 (a global table by that name
-        doesn't exist either).
-        """
+        """An explicit scope outside the caller's reach is rejected before lookup."""
         org2_id = org2["id"]
         name = f"scope_xorg_{uuid4().hex[:8]}"
         # Table lives in org2; alice has no access.
@@ -210,16 +310,15 @@ class TestDocumentScopeQueryParam:
             organization_id=org2_id,
         )
 
-        # Alice tries to query with ?scope=<org2_id>. The server resolves the
-        # target org to alice.organization_id (== org1), so the org2 table
-        # by that name is not visible → 404.
+        # Alice names an org outside her reach. The target is refused before
+        # the table lookup, so it discloses neither the table nor its rows.
         q = e2e_client.post(
             f"/api/tables/{name}/documents/query",
             headers=alice_user.headers,
             params={"scope": org2_id},
             json={},
         )
-        assert q.status_code == 404, q.text
+        assert q.status_code == 403, q.text
 
     def test_user_scope_to_own_org_works(self, e2e_client, platform_admin, alice_user):
         """Alice passes ?scope=<her-own-org-id> — works (resolves to home org)."""
@@ -422,7 +521,7 @@ class TestDocumentScopeQueryParam:
     def test_non_superuser_cannot_reach_other_org_table_by_uuid(
         self, e2e_client, platform_admin, alice_user, org2
     ):
-        """Hard rule: non-superuser + non-self-org + non-global = 404 at every endpoint.
+        """Foreign tables stay hidden; an explicit foreign scope is refused.
 
         The org gate fires before the policy layer in get_table_or_404. UUID
         lookup is org-blind, so the gate runs after fetch — alice cannot reach
@@ -445,7 +544,9 @@ class TestDocumentScopeQueryParam:
         assert ins.status_code == 201, ins.text
         doc_id = ins.json()["id"]
 
-        # Every document endpoint must 404 (or 403 for body-bearing rejects).
+        # Every document endpoint hides the foreign table. An explicit org2
+        # scope is rejected before lookup; default and global scopes still
+        # return 404 because neither resolves the org2 row.
         # All CRUD verbs against the UUID, with and without scope. Includes
         # the upsert and batch endpoints added in the consolidation work —
         # they share get_table_or_404, so the gate covers them too, but
@@ -458,14 +559,15 @@ class TestDocumentScopeQueryParam:
                 params=params,
                 json={},
             )
-            assert q.status_code == 404, f"query {params} leaked: {q.status_code} {q.text}"
+            expected = 403 if params == {"scope": org2_id} else 404
+            assert q.status_code == expected, f"query {params} leaked: {q.status_code} {q.text}"
 
             g = e2e_client.get(
                 f"/api/tables/{table_id}/documents/{doc_id}",
                 headers=alice_user.headers,
                 params=params,
             )
-            assert g.status_code == 404, f"get {params} leaked: {g.status_code}"
+            assert g.status_code == expected, f"get {params} leaked: {g.status_code}"
 
             i = e2e_client.post(
                 f"/api/tables/{table_id}/documents",
@@ -473,7 +575,7 @@ class TestDocumentScopeQueryParam:
                 params=params,
                 json={"data": {"x": 1}},
             )
-            assert i.status_code == 404, f"insert {params} succeeded: {i.status_code}"
+            assert i.status_code == expected, f"insert {params} succeeded: {i.status_code}"
 
             p = e2e_client.patch(
                 f"/api/tables/{table_id}/documents/{doc_id}",
@@ -481,21 +583,21 @@ class TestDocumentScopeQueryParam:
                 params=params,
                 json={"data": {"x": 1}},
             )
-            assert p.status_code == 404, f"patch {params} leaked: {p.status_code}"
+            assert p.status_code == expected, f"patch {params} leaked: {p.status_code}"
 
             d = e2e_client.delete(
                 f"/api/tables/{table_id}/documents/{doc_id}",
                 headers=alice_user.headers,
                 params=params,
             )
-            assert d.status_code == 404, f"delete {params} leaked: {d.status_code}"
+            assert d.status_code == expected, f"delete {params} leaked: {d.status_code}"
 
             c = e2e_client.get(
                 f"/api/tables/{table_id}/documents/count",
                 headers=alice_user.headers,
                 params=params,
             )
-            assert c.status_code == 404, f"count {params} leaked: {c.status_code}"
+            assert c.status_code == expected, f"count {params} leaked: {c.status_code}"
 
             # Upsert verb (new in consolidation).
             up = e2e_client.post(
@@ -504,7 +606,7 @@ class TestDocumentScopeQueryParam:
                 params=params,
                 json={"id": "k1", "data": {"x": 1}},
             )
-            assert up.status_code == 404, f"upsert {params} leaked: {up.status_code}"
+            assert up.status_code == expected, f"upsert {params} leaked: {up.status_code}"
 
             # Batch insert/upsert.
             b = e2e_client.post(
@@ -513,7 +615,7 @@ class TestDocumentScopeQueryParam:
                 params=params,
                 json={"documents": [{"data": {"x": 1}}]},
             )
-            assert b.status_code == 404, f"batch {params} leaked: {b.status_code}"
+            assert b.status_code == expected, f"batch {params} leaked: {b.status_code}"
 
             # Batch delete.
             bd = e2e_client.post(
@@ -522,7 +624,7 @@ class TestDocumentScopeQueryParam:
                 params=params,
                 json={"ids": [doc_id]},
             )
-            assert bd.status_code == 404, f"batch-delete {params} leaked: {bd.status_code}"
+            assert bd.status_code == expected, f"batch-delete {params} leaked: {bd.status_code}"
 
         # Same checks via NAME (the existing _resolve_target_org_safe path
         # already 404s here because the resolved org is alice's, and her org
@@ -582,6 +684,59 @@ class TestDocumentScopeQueryParam:
         assert q.status_code == 200, q.text
         assert q.json()["table_id"] == table_id
         assert len(q.json()["documents"]) == 1
+
+    def test_org_scoped_name_writes_cascade_to_the_global_table(
+        self, e2e_client, platform_admin, alice_user
+    ):
+        """The SDK always sends the run's org as ``scope``. A name that only
+        exists at Global must resolve there for writes and reads alike."""
+        name = f"global_cascade_{uuid4().hex[:8]}"
+        resp = e2e_client.post(
+            "/api/tables",
+            headers=platform_admin.headers,
+            json={
+                "name": name,
+                "organization_id": None,
+                "policies": {
+                    "policies": [
+                        {
+                            "name": "everyone_writes",
+                            "actions": ["read", "create", "update"],
+                            "when": None,
+                        },
+                    ],
+                },
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        table_id = resp.json()["id"]
+        own_scope = {"scope": str(alice_user.organization_id)}
+
+        ins = e2e_client.post(
+            f"/api/tables/{name}/documents",
+            headers=alice_user.headers,
+            params=own_scope,
+            json={"id": "run-1", "data": {"status": "in_progress"}},
+        )
+        assert ins.status_code == 201, ins.text
+        assert ins.json()["table_id"] == table_id
+
+        upd = e2e_client.patch(
+            f"/api/tables/{name}/documents/run-1",
+            headers=alice_user.headers,
+            params=own_scope,
+            json={"data": {"status": "success"}},
+        )
+        assert upd.status_code == 200, upd.text
+
+        got = e2e_client.get(
+            f"/api/tables/{name}/documents/run-1",
+            headers=alice_user.headers,
+            params=own_scope,
+        )
+        assert got.status_code == 200, got.text
+        assert got.json()["table_id"] == table_id
+        assert got.json()["data"]["status"] == "success"
 
 
 @pytest.mark.e2e
@@ -688,7 +843,7 @@ class TestDocumentAttributionOverride:
             json={"data": {"x": 1}, "created_by": str(platform_admin.user_id)},
         )
         assert forge.status_code == 403, forge.text
-        assert "override" in forge.json()["detail"].lower()
+        assert "attribution" in forge.json()["detail"].lower()
 
     def test_non_superuser_with_updated_by_returns_403(
         self, e2e_client, platform_admin, non_admin_user, org1
@@ -730,7 +885,7 @@ class TestDocumentAttributionOverride:
             json={"data": {"x": 2}, "updated_by": str(platform_admin.user_id)},
         )
         assert forge.status_code == 403, forge.text
-        assert "override" in forge.json()["detail"].lower()
+        assert "attribution" in forge.json()["detail"].lower()
 
     def test_non_superuser_without_override_defaults_to_caller(
         self, e2e_client, platform_admin, non_admin_user, org1
@@ -910,7 +1065,7 @@ class TestDocumentUpsertVerb:
         self, e2e_client, platform_admin, non_admin_user, org1
     ):
         """If a row already exists, the upsert is gated by the `update` action
-        on the pre-image (same as PATCH semantics)."""
+        on both the pre-image and the post-image (same as PATCH semantics)."""
         org1_id = org1["id"]
         table_name = f"upsert_gate_{uuid4().hex[:8]}"
         # Policy: anyone can create, but only admins can update
@@ -1204,6 +1359,16 @@ class TestDocumentIdUniquePerTable:
         )
         assert get_b.status_code == 200, get_b.text
         assert get_b.json()["data"] == {"table": "b"}
+
+        query_a = e2e_client.post(
+            f"/api/tables/{table_a}/documents/query",
+            headers=platform_admin.headers,
+            json={"document_ids": [doc_id], "skip_count": True},
+        )
+        assert query_a.status_code == 200, query_a.text
+        assert [doc["data"] for doc in query_a.json()["documents"]] == [
+            {"table": "a"}
+        ]
 
     def test_same_doc_id_in_two_tables_via_insert(
         self, e2e_client, platform_admin

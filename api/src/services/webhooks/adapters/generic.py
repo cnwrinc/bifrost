@@ -15,6 +15,7 @@ from src.services.webhooks.protocol import (
     WebhookAdapter,
     WebhookRequest,
 )
+from src.services.webhooks.signing_secret import read_signing_secret
 
 
 class GenericWebhookAdapter(WebhookAdapter):
@@ -47,7 +48,7 @@ class GenericWebhookAdapter(WebhookAdapter):
                 "description": "HMAC secret for signature verification (optional)",
                 "format": "password",
                 "x-help": {
-                    "text": "Shared secret used to verify webhook signatures via HMAC-SHA256. Set the same secret in both Bifrost and the sending service.",
+                    "text": "Shared secret used to verify webhook signatures via HMAC-SHA256. Bifrost accepts hex- or base64-encoded digests. Set the same secret in both Bifrost and the sending service.",
                     "code": (
                         "# Python example: sign a webhook request\n"
                         "import hmac, hashlib\n"
@@ -73,7 +74,7 @@ class GenericWebhookAdapter(WebhookAdapter):
                 "description": "Prefix in signature value (e.g., 'sha256=')",
                 "default": "sha256=",
                 "x-help": {
-                    "text": "Prefix before the hex digest in the signature header value. Bifrost strips this before comparing. Use 'sha256=' for GitHub-style signatures, or leave empty if the header contains only the hex digest.",
+                    "text": "Prefix before the encoded digest in the signature header value. Bifrost strips the prefix and surrounding whitespace before comparing. Use 'sha256=' for GitHub-style signatures, or leave empty if the header contains only the digest.",
                 },
             },
             "event_type_header": {
@@ -104,16 +105,12 @@ class GenericWebhookAdapter(WebhookAdapter):
         """
         Create subscription for generic webhook.
 
-        No external service call - just returns the state.
+        No external service call. The events router stores the signing secret
+        encrypted in state (see ``signing_secret``), so subscribe stores none.
         """
-        # Store secret in state if provided (will be encrypted at rest)
-        state = {}
-        if config.get("secret"):
-            state["secret"] = config["secret"]
-
         return SubscribeResult(
             external_id=None,  # No external subscription
-            state=state,
+            state={},
             expires_at=None,  # Never expires
         )
 
@@ -141,8 +138,7 @@ class GenericWebhookAdapter(WebhookAdapter):
 
         Validates signature if secret is configured, then delivers the payload.
         """
-        # Get secret from state (set during subscribe)
-        secret = state.get("secret")
+        secret = read_signing_secret(state)
 
         if secret:
             # Validate signature

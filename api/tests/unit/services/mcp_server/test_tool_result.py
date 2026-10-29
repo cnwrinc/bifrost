@@ -1,14 +1,14 @@
 # api/tests/unit/services/mcp_server/test_tool_result.py
 """Tests for MCP tool result helpers."""
 
-from fastmcp.tools import ToolResult
+from mcp.types import CallToolResult
 
 from src.services.mcp_server.tool_result import (
+    ToolResult,
     direct_result,
     error_result,
     format_diff,
     format_file_content,
-    format_grep_matches,
     success_result,
 )
 
@@ -24,27 +24,34 @@ class TestSuccessResult:
         assert isinstance(result, ToolResult)
         assert result.structured_content == {"count": 5, "items": ["a", "b"]}
 
+    def test_converts_to_sdk_result_without_fastmcp(self):
+        result = success_result("Found items", {"count": 5})
+
+        sdk_result = result.to_call_tool_result()
+
+        assert isinstance(sdk_result, CallToolResult)
+        assert sdk_result.structuredContent == {"count": 5}
+        assert sdk_result.content[0].text.startswith("Found items")
+
 
 class TestDirectResult:
     def test_returns_array_as_the_only_content(self):
         result = direct_result([{"echo": "hello"}])
 
         assert result.structured_content is None
-        assert len(result.content) == 1
-        assert result.content[0].text == '[{"echo":"hello"}]'
+        assert result.to_call_tool_result().content[0].text == '[{"echo":"hello"}]'
 
     def test_returns_object_without_a_gateway_envelope(self):
         result = direct_result({"echo": "hello"})
 
         assert result.structured_content is None
-        assert len(result.content) == 1
-        assert result.content[0].text == '{"echo":"hello"}'
+        assert result.to_call_tool_result().content[0].text == '{"echo":"hello"}'
 
     def test_serializes_null_result(self):
         result = direct_result(None)
 
         assert result.structured_content is None
-        assert result.content[0].text == "null"
+        assert result.to_call_tool_result().content[0].text == "null"
 
 
 class TestErrorResult:
@@ -57,20 +64,6 @@ class TestErrorResult:
         result = error_result("Failed", {"code": 500})
         assert result.structured_content["error"] == "Failed"
         assert result.structured_content["code"] == 500
-
-
-class TestFormatGrepMatches:
-    def test_formats_matches(self):
-        matches = [
-            {"path": "file.py", "line_number": 10, "match": "def foo():"},
-        ]
-        result = format_grep_matches(matches, "def")
-        assert "Found 1 match for 'def'" in result
-        assert "file.py:10: def foo():" in result
-
-    def test_handles_empty_matches(self):
-        result = format_grep_matches([], "pattern")
-        assert "No matches found" in result
 
 
 class TestFormatDiff:

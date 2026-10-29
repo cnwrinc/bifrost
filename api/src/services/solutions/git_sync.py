@@ -22,16 +22,12 @@ import asyncio
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
-
-import yaml
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.orm.solutions import Solution
 from src.services.solutions.deploy import (
     DeployResult,
     SolutionBundle,
-    SolutionFinalizeIncomplete,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,43 +67,25 @@ def resolve_repo_subpath(checkout_root: Path, repo_subpath: str | None) -> Path:
     return Path(root)
 
 
-def _collect_python_files(workspace: Path) -> dict[str, str]:
+def _collect_python_files(workspace: Path, *, definition=None) -> dict[str, str]:
     # Reuse the CLI's canonical, layout-agnostic collector so the git-connected
     # deploy path bundles the SAME files as `bifrost deploy` — a divergent
     # allow-list here is exactly what dropped functions/*.py from CLI deploys
     # (shakeout HIGH). git_sync already imports _collect_apps from the same module.
     from bifrost.commands.solution import _collect_python_files as _cli_collect
 
-    return _cli_collect(workspace)
-
-
-def _collect_entities(workspace: Path, manifest_file: str, key: str) -> list[dict[str, Any]]:
-    from bifrost.commands.solution import _bifrost_manifest
-
-    path = _bifrost_manifest(workspace, manifest_file)
-    if path is None or not path.is_file():
-        return []
-    data = yaml.safe_load(path.read_text()) or {}
-    out: list[dict[str, Any]] = []
-    for map_key, body in (data.get(key, {}) or {}).items():
-        if isinstance(body, dict):
-            out.append({**body, "id": body.get("id", map_key)})
-    return out
+    return _cli_collect(workspace, definition=definition)
 
 
 def read_workspace_bundle(solution: Solution, workspace: Path) -> SolutionBundle:
     """Build a SolutionBundle from a checked-out Solution workspace dir."""
-    workflows = _collect_entities(workspace, "workflows.yaml", "workflows")
-    # Normalize workflow name (manifest is keyed by UUID; name is in the body).
-    for wf in workflows:
-        wf.setdefault("name", wf["id"])
-    tables = _collect_entities(workspace, "tables.yaml", "tables")
-    forms = _collect_entities(workspace, "forms.yaml", "forms")
-    for f in forms:
-        f.setdefault("name", f["id"])
-    agents = _collect_entities(workspace, "agents.yaml", "agents")
-    for a in agents:
-        a.setdefault("name", a["id"])
+    from bifrost.solution_definition import read_solution_definition
+
+    definition = read_solution_definition(workspace)
+    workflows = definition.entries("workflows")
+    tables = definition.entries("tables")
+    forms = definition.entries("forms")
+    agents = definition.entries("agents")
     # Apps and config schemas reuse the CLI collectors so the connected-mode
     # bundle stays identical to a disconnected `bifrost deploy` — any entity
     # type missing from the bundle gets DELETED by deploy's reconcile sweep
@@ -115,37 +93,29 @@ def read_workspace_bundle(solution: Solution, workspace: Path) -> SolutionBundle
     # this collected them).
     from bifrost.commands.solution import (
         _collect_apps,
-        _collect_claims,
-        _collect_config_schemas,
-        _collect_connection_schemas,
-        _collect_events,
-        _collect_file_locations,
     )
-    from bifrost.solution_descriptor import is_solution_workspace, load_descriptor
-
-    apps = _collect_apps(workspace)
+    apps = _collect_apps(workspace, definition=definition)
     # The descriptor carries the bundle's declared version (Task 20) — read it
     # the same way zip_install does, so a connected sync records versions too.
-    version: str | None = None
-    if is_solution_workspace(workspace):
-        version = load_descriptor(workspace).version
+    version = definition.descriptor.version if definition.descriptor is not None else None
     return SolutionBundle(
         solution=solution,
-        python_files=_collect_python_files(workspace),
+        python_files=_collect_python_files(workspace, definition=definition),
         workflows=workflows,
         tables=tables,
         apps=apps,
         forms=forms,
         agents=agents,
-        claims=_collect_claims(workspace),
-        config_schemas=_collect_config_schemas(workspace),
-        file_locations=_collect_file_locations(workspace),
+        claims=definition.entries("claims"),
+        config_schemas=definition.config_entries(),
+        file_locations=definition.manifest.files.locations,
+        file_policies=definition.install_entries("file_policies"),
         # Declared integrations (connection refs): a git-connected deploy must
         # create the same integration shells + SolutionConnectionSchema rows the
         # zip path does, else a git-installed solution silently drops its
         # integrations and Setup never surfaces them (drive F1).
-        connection_schemas=_collect_connection_schemas(workspace),
-        events=_collect_events(workspace),
+        connection_schemas=definition.connection_entries(),
+        events=definition.entries("events"),
         version=version,
         # README.md at the repo root → Solution.readme (deploy-owned full-replace;
         # absent => cleared). Read straight off the checkout dir, same mechanism as
@@ -200,12 +170,13 @@ async def deploy_from_workspace(
     return await deploy_zip_to_solution(db, solution, data, force=True)
 
 
-async def sync(db: AsyncSession, solution: Solution) -> None:
+async def sync(db: AsyncSession, solution: Solution) -> bool:
     """Clone the connected install's repo at its configured ref and deploy.
 
     Called by the auto-pull trigger (webhook/poll) on a new commit. The clone
     uses the install's ``git_ref`` when set, or the repo's default branch when
-    none is configured.
+    none is configured. Returns whether this call performed the requested
+    update; an existing writer leaves a pending-rerun marker and returns false.
 
     Serialized per-install with a Redis lock so overlapping triggers can't race —
     an older clone finishing last would otherwise full-replace the newer commit's
@@ -248,7 +219,7 @@ async def sync(db: AsyncSession, solution: Solution) -> None:
             logger.info(
                 "Sync already in progress for solution %s; queued a rerun", solution.id
             )
-            return
+            return False
 
         # Released the lock. If a trigger arrived while we held it, run again so
         # the newest commit lands (bounded: each pass clears the flag under lock,
@@ -256,7 +227,7 @@ async def sync(db: AsyncSession, solution: Solution) -> None:
         if await redis.delete(pending_key):
             logger.info("Rerunning sync for solution %s (newer commit queued)", solution.id)
             continue
-        return
+        return True
 
 
 async def clone_repo_to_dir(repo_url: str, dest: Path, ref: str | None = None) -> None:
@@ -297,14 +268,5 @@ async def _run_sync_once(db: AsyncSession, solution: Solution) -> None:
     # can't interleave. The bundle is in-memory, so finalizing after the checkout
     # temp dir is gone is fine.
     await db.commit()
-    try:
-        await result.finalize_s3()
-    except SolutionFinalizeIncomplete:
-        # finalize_s3 already retried; storage is down. Auto-pull runs in a
-        # background job with no caller to surface a 502 to, and the deploy is
-        # full-replace + idempotent — the next sync trigger re-runs and heals it.
-        logger.error(
-            "Solution %s synced (DB committed) but storage finalize failed "
-            "after retries; the next sync will re-run and heal it.",
-            solution.id,
-        )
+    await result.finalize_s3()
+    await db.commit()  # source search index rows written by finalize

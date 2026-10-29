@@ -6,12 +6,17 @@
  * once per host mount. This preserves browser ES-module identity across lazy
  * chunks while still giving every mount its own React root and bootstrap.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { ApplicationUpdateScreen } from "@/components/ApplicationUpdateScreen";
+import { AppLoadingSkeleton } from "./AppLoadingSkeleton";
+import { BundleLoadFailure } from "./BundleFeedback";
+import { getAppLoadErrorMessage } from "./app-load-error";
+import { useAuth } from "@/contexts/AuthContext";
 import { useOrgScope } from "@/hooks/useOrgScope";
 import { authFetch } from "@/lib/api-client";
 import { clearAuthTokens, getActiveToken } from "@/lib/auth-token";
+import { ImpersonationBanner } from "@/components/layout/ImpersonationBanner";
 
 export interface BifrostAppBootstrap {
 	/** Router basename so app URLs live below /apps/{slug}. */
@@ -24,6 +29,8 @@ export interface BifrostAppBootstrap {
 	orgScope: string | null;
 	/** Installed app id used to scope portable workflow references. */
 	appId: string;
+	/** Owning Solution supplied by the host, or null for an unowned app. */
+	solutionId?: string | null;
 	/** Ask the platform to log out. */
 	onLogout: () => void;
 	/** Platform theme at mount time. */
@@ -213,6 +220,7 @@ function loadLegacyOrUnmarkedModule(
 
 interface StandaloneV2AppProps {
 	appId: string;
+	solutionId?: string | null;
 	appSlug: string;
 	isPreview: boolean;
 	entry: string;
@@ -237,8 +245,18 @@ interface StandaloneBundleManifest {
 	runtime_contract?: StandaloneV2RuntimeContract;
 }
 
+function StandaloneV2Frame({ children }: { children: ReactNode }) {
+	return (
+		<div className="flex h-full w-full flex-col overflow-hidden">
+			<ImpersonationBanner />
+			{children}
+		</div>
+	);
+}
+
 export function StandaloneV2App({
 	appId,
+	solutionId = null,
 	appSlug,
 	isPreview,
 	entry,
@@ -255,9 +273,11 @@ export function StandaloneV2App({
 		[entry, css, baseUrl, runtimeContract],
 	);
 	const sourceKey = useMemo(
-		() => JSON.stringify({ appId, isPreview, assets: sourceAssets }),
-		[appId, isPreview, sourceAssets],
+		() => JSON.stringify({ appId, solutionId, isPreview, assets: sourceAssets }),
+		[appId, solutionId, isPreview, sourceAssets],
 	);
+	const [loadedSourceKey, setLoadedSourceKey] = useState(sourceKey);
+	const [isBootstrapping, setIsBootstrapping] = useState(true);
 	const [recovery, setRecovery] = useState<{
 		sourceKey: string;
 		assets: StandaloneAssets;
@@ -265,20 +285,37 @@ export function StandaloneV2App({
 	const assets = recovery?.sourceKey === sourceKey ? recovery.assets : sourceAssets;
 	const recoveryAttempts = useRef(new Set<string>());
 	const { scope } = useOrgScope();
+	const { isPlatformAdmin } = useAuth();
 
 	const token = getActiveToken();
-	const error = token ? loadError : "Not authenticated — cannot mount the application.";
+	const isAuthenticated = Boolean(token);
+	if (loadedSourceKey !== sourceKey) {
+		setLoadedSourceKey(sourceKey);
+		setIsBootstrapping(true);
+		setLoadError(null);
+	}
+	const unauthenticatedError = "Not authenticated — cannot mount the application.";
 
 	useEffect(() => {
 		const mountEl = containerRef.current;
-		if (!mountEl || !token) return;
+		// Read the bootstrap seed only when a mount is actually starting. The
+		// boolean dependency below tears down on logout, but ordinary token
+		// rotation keeps the app's React tree mounted.
+		const bootstrapToken = getActiveToken();
+		if (!mountEl || !bootstrapToken) return;
 
+		setIsBootstrapping(true);
 		setLoadError(null);
 		const basename = isPreview
 			? `/apps/${appSlug}/preview`
 			: `/apps/${appSlug}`;
-		const orgScope =
-			appOrgId ?? (scope.type === "organization" ? scope.orgId : null);
+		// Visibility/deployment scope is separate from runtime data scope.
+		// Platform admins use an App's owning organization when present;
+		// global Apps and other users use their selected organization.
+		const selectedOrg = scope.type === "organization" ? scope.orgId : null;
+		const orgScope = isPlatformAdmin
+			? (appOrgId ?? selectedOrg)
+			: selectedOrg;
 		const entryUrl = new URL(
 			`${assets.baseUrl}/${assets.entry}`,
 			window.location.origin,
@@ -311,9 +348,10 @@ export function StandaloneV2App({
 		const bootstrap: BifrostAppBootstrap = {
 			basename,
 			baseUrl: window.location.origin,
-			token,
+			token: bootstrapToken,
 			orgScope,
 			appId,
+			solutionId,
 			onLogout: () => {
 				clearAuthTokens();
 				window.location.assign("/login");
@@ -327,6 +365,7 @@ export function StandaloneV2App({
 				setLoadError(
 					value instanceof Error ? value.message : "Failed to load the application.",
 				);
+				setIsBootstrapping(false);
 				return;
 			}
 			const failedAssetKey = JSON.stringify(assets);
@@ -335,6 +374,7 @@ export function StandaloneV2App({
 				setLoadError(
 					value instanceof Error ? value.message : "Failed to load the application.",
 				);
+				setIsBootstrapping(false);
 				return;
 			}
 			recoveryAttempts.current.add(recoveryAttemptKey);
@@ -350,7 +390,7 @@ export function StandaloneV2App({
 					},
 				);
 				if (!response.ok) {
-					throw new Error(`Bundle manifest refresh failed: ${response.status}`);
+					throw new Error(getAppLoadErrorMessage(response.status));
 				}
 				const manifest = (await response.json()) as StandaloneBundleManifest;
 				if (manifest.app_model !== "standalone_v2" || !manifest.entry) {
@@ -370,6 +410,7 @@ export function StandaloneV2App({
 				if (!cancelled) {
 					setRecovery({ sourceKey, assets: refreshed });
 					setIsRecovering(false);
+					setIsBootstrapping(true);
 				}
 			} catch (recoveryError) {
 				if (!cancelled) {
@@ -379,6 +420,7 @@ export function StandaloneV2App({
 							? recoveryError.message
 							: "Failed to recover the application after deployment.",
 					);
+					setIsBootstrapping(false);
 				}
 			}
 		};
@@ -389,6 +431,7 @@ export function StandaloneV2App({
 				throw new Error("The application's mount() function must return an unmount function.");
 			}
 			appTeardown = teardown;
+			setIsBootstrapping(false);
 		};
 
 		let legacyBootstrap: LegacyBifrostAppBootstrap | null = null;
@@ -413,6 +456,7 @@ export function StandaloneV2App({
 						mountModule(result.appModule);
 					} else if (result.kind === "legacy-loaded") {
 						activeLegacyEntries.add(entryUrl);
+						setIsBootstrapping(false);
 					} else if (result.kind === "legacy-reload") {
 						window.location.reload();
 					} else {
@@ -446,34 +490,52 @@ export function StandaloneV2App({
 			}
 			mountEl.replaceChildren();
 		};
-	}, [
-		appId,
-		appSlug,
-		isPreview,
-		assets,
-		sourceKey,
-		appOrgId,
-		scope,
-		token,
-	]);
+	}, [appId, solutionId, appSlug, isPreview, assets, sourceKey, scope, appOrgId, isPlatformAdmin, isAuthenticated]);
 
-	if (error) {
+	if (!isAuthenticated) {
 		return (
-			<div className="flex h-full w-full items-center justify-center p-6">
-				<pre className="max-w-xl whitespace-pre-wrap text-sm text-destructive">
-					{error}
-				</pre>
-			</div>
+			<StandaloneV2Frame>
+				<div className="flex min-h-0 flex-1 items-center justify-center p-6">
+					<pre className="max-w-xl whitespace-pre-wrap text-sm text-destructive">
+						{unauthenticatedError}
+					</pre>
+				</div>
+			</StandaloneV2Frame>
 		);
 	}
 
-	if (isRecovering) return <ApplicationUpdateScreen />;
+	if (loadError) {
+		return (
+			<StandaloneV2Frame>
+				<BundleLoadFailure
+					error={loadError}
+					onRetry={() => window.location.reload()}
+				/>
+			</StandaloneV2Frame>
+		);
+	}
+
+	if (isRecovering)
+		return (
+			<StandaloneV2Frame>
+				<ApplicationUpdateScreen />
+			</StandaloneV2Frame>
+		);
 
 	return (
-		<div
-			ref={containerRef}
-			className="h-full w-full"
-			data-testid="solution-v2-app-root"
-		/>
+		<StandaloneV2Frame>
+			<div className="relative min-h-0 flex-1">
+				<div
+					ref={containerRef}
+					className="h-full w-full"
+					data-testid="solution-v2-app-root"
+				/>
+				{isBootstrapping ? (
+					<div className="absolute inset-0 z-10">
+						<AppLoadingSkeleton />
+					</div>
+				) : null}
+			</div>
+		</StandaloneV2Frame>
 	);
 }

@@ -82,9 +82,9 @@ Tips:
 
 ## Technologies
 
--   **Backend**: Python 3.11 (FastAPI), SQLAlchemy, Pydantic, PostgreSQL, RabbitMQ, Redis
+-   **Backend**: Python 3.11 (FastAPI), SQLAlchemy, Pydantic, PostgreSQL, Redis
 -   **Frontend**: TypeScript 4.9+, React, Vite
--   **Storage**: PostgreSQL (data), Redis (cache/sessions), RabbitMQ (message queue)
+-   **Storage**: PostgreSQL (data and work dispatch), Redis (cache/sessions)
 -   **Infrastructure**: Docker, Docker Compose, GitHub Actions for CI/CD
 
 ## Development Environment (CRITICAL - READ FIRST)
@@ -105,7 +105,7 @@ Start the development stack (per-worktree isolated):
 
 The default mode allocates a free local port for the client (deterministic per worktree, in 30000-39999). If `NETBIRD_SETUP_KEY` is set in `~/.config/bifrost/debug.env`, the stack boots with a NetBird sidecar that provides both private mesh access and an ephemeral public HTTPS proxy through `netbird expose` — no host ports, durable Admin proxy mapping, or NetBird API key.
 
-Stack contains: API (port 8000 internal), Client (port 80 internal), Scheduler, Worker, Postgres, RabbitMQ, Redis, SeaweedFS. All Bifrost services build from `api/Dockerfile.dev` / `client/Dockerfile.dev` (source build, not public images).
+Stack contains: API (port 8000 internal), Client (port 80 internal), Scheduler, Worker, Postgres, Redis, SeaweedFS. All Bifrost services build from `api/Dockerfile.dev` / `client/Dockerfile.dev` (source build, not public images).
 
 ### Hot Reload is Automatic
 
@@ -181,6 +181,12 @@ The git sync system uses a **manifest** (`.bifrost/*.yaml`) to round-trip platfo
 
 `ManifestApp` in `.bifrost/apps.yaml` carries all app metadata (name, description, dependencies, access_level, roles). The `path` field points to the app source directory (e.g. `apps/my-app`), which contains only TSX/TS/CSS source code — no metadata files. App npm dependencies are stored in the `Application.dependencies` JSON column in the DB.
 
+## V2 App SDK updates and retained source
+
+The web SDK source of truth is `client/src/lib/app-sdk/`; the platform packages and injects it at build time. Every successful V2 build must stamp `sdk_package_version`, the content-derived `sdk_fingerprint`, `sdk_contract_version`, and `sdk_built_at` on the active App. Change `client/src/lib/app-sdk/sdk-contract.json` only for an intentionally breaking SDK↔server wire-contract change; ordinary compatible SDK edits change the fingerprint automatically.
+
+Independent V2 deploys and Solution deploys retain sanitized source so the platform can rebuild an App without a full Solution reconciliation. Retained source excludes `.env*`, `node_modules`, build output, caches, and VCS data; never add secrets or generated dependencies to it. An SDK-only rebuild must use the shared `application.sdk_update` PlatformJob, atomically activate its new deployment, and leave Git state, manifests, Solution metadata, and other Solution entities untouched. See `docs/runbooks/application-sdk-update.md` and `docs/runbooks/web-sdk.md`.
+
 ### Critical: non-destructive upsert pattern
 
 `_resolve_integration` syncs config schema and mappings using **upsert-by-natural-key** (not delete-all + re-insert):
@@ -214,6 +220,10 @@ Entity mutations have three parallel surfaces: **CLI** (`bifrost <entity> ...`),
 **`.bifrost/` is export-only.** Watch only syncs code (`apps/`, `workflows/*.py`); it does NOT push `.bifrost/` content. Entity mutations go through the CLI (`bifrost orgs create`, `bifrost roles update`, etc.) or MCP. To distribute a packaged set of entities into an org, use **Solutions** (`bifrost solution deploy` / `solution install <zip>`) — the install-scoped, lifecycle-aware successor to the older `bifrost export --portable` / `bifrost import` flow. **`bifrost export` / `bifrost import` were REMOVED** (they predated Solutions and the `--portable` scrub never actually stripped org IDs). For raw `_repo/` workspace movement across environments, use git sync.
 
 **MCP vs REST routers (existing drift):** the MCP tools for `agents`, `forms`, `tables`, `apps`, `events` re-implement router logic and have diverged (different permission models, missing side effects, divergent validation). See `docs/plans/2026-04-18-mcp-router-reconciliation.md` for the catalog and reconciliation sequence. **New MCP tools must be thin HTTP wrappers that call the REST endpoints** (see `api/src/services/mcp_server/tools/roles.py` / `configs.py` / `_http_bridge.py` for the pattern) — no direct ORM access, no repository imports. A unit test (`api/tests/unit/test_mcp_thin_wrapper.py`) enforces this.
+
+## Product Updates
+
+For a user-visible change, classify the PR in its canonical disposition file, `product-updates/dispositions/pr-<number>.json`, and author approved entry prose in the shared `product-updates/` source. The PR template is a proposal, not the durable decision. Read [`docs/product-updates-authoring.md`](docs/product-updates-authoring.md) before editing entries, preparing a release, or validating Product Updates; it defines draft versus approved content, source/credit evidence, and deterministic release-body preparation.
 
 ## Project Structure
 
@@ -267,6 +277,7 @@ Summarizer-generated `AIUsage` rows roll up into `AgentStats.total_cost_7d` (the
     -   Never manually write TypeScript types for API endpoints
 -   **API Services**: Create service files in `client/src/services/` for new endpoints
 -   **Scrollable content sizing**: Prefer "content-sized until constrained" for lists, tables, drawers, panels, and other scrollable regions. Let the region size to its contents when short; cap it with available-space `max-height` and apply `overflow-auto` only after it reaches that cap. Avoid `flex-1` / forced full-height scroll containers for short content unless the design explicitly calls for a fill-height workspace. In drawers and dialogs, keep fixed headers/metadata outside the scroller and put `overflow-auto` on the long content region itself.
+-   **Copy**: Title Case for anything that isn't a sentence (buttons, headings, tabs, labels, badges, menu items, permission names); sentence case for sentences. See the Copy rule in `DESIGN.md`.
 
 Example service pattern:
 ```typescript
@@ -286,13 +297,14 @@ export async function getDataProviders() {
 
 -   **Tests**: All work requires tests. Backend logic → unit tests in `api/tests/unit/`. Endpoint/workflow/integration changes → e2e tests in `api/tests/e2e/`. React components → sibling `*.test.tsx` (vitest). User-facing features → happy-path spec in `client/e2e/` (Playwright).
     -   **Functional frontend modules require vitest coverage.** New or modified `.ts` files under `client/src/lib/**` and `client/src/services/**` that export functions (auth helpers, storage adapters, API wrappers, formatters, etc.) need a sibling `*.test.ts` covering the public API. Pure type/constant re-export files and files that only import and re-configure third-party SDKs are exempt. If the module has a cross-tab, cross-window, or storage-boundary concern (like `auth-token.ts`), the test MUST exercise that boundary — a regression that only reproduces with two tabs open is one a future refactor will silently re-introduce otherwise.
-    -   **Scoped verification is the development-loop default.** Run the tests that directly exercise the changed behavior, its known consumers, and any affected contract boundaries while iterating. Before opening or queueing a PR, commit the exact candidate and run `./test.sh pre-pr`; this broad local gate is mandatory even when the change itself is narrowly scoped. Rerun it after any commit, rebase, or merge. Report exact targeted commands and the pre-PR candidate SHA.
+    -   **Focused verification is the local requirement before opening or queueing a PR.** Run the tests that directly exercise the change surface: the tests added or changed; existing coverage of the changed behavior and its known consumers; the relevant contract tripwires (DTO/CLI/MCP surfaces, manifests, permissions, storage, scheduling) when those boundaries change; one targeted live-service or Playwright happy path when the changed boundary requires it; and the applicable lint/type checks. Report the exact targeted commands run and which broader suites were not run. Full suites and `./test.sh pre-pr` are optional local reproductions, not PR prerequisites — the merge queue is the authoritative complete-suite gate.
     -   **A known failure must receive a durable disposition.** If a broader local or CI run finds a failure outside the scoped set, determine whether it is a regression, product race, leaked state, harness defect, overcomplicated test, or obsolete coverage. Fix the cause, simplify the test, or delete genuinely redundant coverage with a documented replacement. "Unrelated" or "flaky" alone is not a disposition.
     -   **Never rerun until green or mask instability.** Do not add retries, longer timeouts, `skip`, or `xfail`. Reproduce the exposing condition, fix the hypothesized cause, then use repetition only to validate the fix. See `.claude/skills/bifrost-testing/SKILL.md` for the full protocol.
     -   **Prefer simple, durable tests.** Keep one observable contract per test, minimal fixtures, deterministic state, explicit cleanup, and only one useful end-to-end happy path. Move edge cases down to unit/component tests; complexity is not evidence of rigor.
-    -   **IMPORTANT**: Always use `./test.sh` — it manages the Dockerized test stack (PostgreSQL, Redis, RabbitMQ, SeaweedFS, API, worker). Running pytest directly on the host will FAIL for anything touching DB/queue/cache.
+    -   **Expensive backend E2E tests:** Before adding a deploy, install, publish, build, sync, or worker job to a test, follow `.claude/skills/bifrost-testing/authoring-rules.md` → “Expensive backend E2E tests.” Count the jobs and identify the unique cross-process contract each one proves.
+    -   **IMPORTANT**: Always use `./test.sh` — it manages the Dockerized test stack (PostgreSQL, Redis, SeaweedFS, API, worker). Running pytest directly on the host will FAIL for anything touching DB/cache/storage.
     -   **Stack lifecycle is separate from test execution.** Boot once per worktree, run tests many times. See the Commands section below.
-    -   **Test results**: `./test.sh` writes JUnit XML to `/tmp/bifrost/test-results.xml` — parse this for pass/fail details instead of grepping stdout.
+    -   **Test results**: `./test.sh` writes JUnit XML to `/tmp/bifrost-<project>/test-results.xml` on the host (the project name is printed by `./test.sh stack status`) — parse this for pass/fail details instead of grepping stdout.
     -   **Logs**: Container logs are exported to `/tmp/bifrost-<project>/*.log` after test runs (per-worktree, so parallel worktrees don't clobber each other).
 -   **Type Checking**: Must pass `pyright` (API) and `npm run tsc` (client)
 -   **Linting**: Must pass `ruff check` (API) and `npm run lint` (client)
@@ -325,8 +337,8 @@ export async function getDataProviders() {
 ./test.sh client e2e --screenshots                 # Capture screenshots for every test (UX review)
 ./test.sh client e2e e2e/auth.unauth.spec.ts       # Passthrough to Playwright
 
-# CI (one-shot: boot → all tests → tear down)
-./test.sh pre-pr                         # Required clean-commit gate before opening/queueing a PR
+# Optional full local reproduction (diagnostic — the merge queue is the broad gate)
+./test.sh pre-pr                         # Optional one-shot local reproduction of the merge gate
 ./test.sh ci
 
 # Type Generation (requires dev stack running via ./debug.sh)
@@ -353,6 +365,8 @@ export async function getDataProviders() {
 2. Edit the migration file
 3. Restart `bifrost-init` to run alembic: `docker compose restart bifrost-init`
 4. Restart API: `docker compose restart api`
+
+**Withdrawing a migration:** never turn an already-applied migration into a no-op without a forward migration that removes what it created. Databases that ran it keep that schema, fresh databases never get it, and later migrations collide with the difference. Fresh-database tests cannot see this, so add a rehearsal that applies the residue to a disposable database at the prior revision and upgrades to head (see `api/tests/e2e/platform/test_builder_residue_migration_rehearsal.py`), and register the tombstone in `api/tests/unit/test_migration_tombstones.py`.
 
 **After adding a Python dependency:**
 1. Add to `pyproject.toml` (root)
@@ -399,6 +413,6 @@ Before marking work complete, select verification from the actual change surface
 
 The selected tests must cover the changed behavior, known consumers, and contract tripwires. During iteration, do not run `./test.sh all`, the full Vitest suite, or the full Playwright suite by default; use targeted coverage to get fast, relevant feedback.
 
-Before opening or queueing a PR, the worktree must be clean and based on current `origin/main`, and `./test.sh pre-pr` must pass for the exact `HEAD`. This is separate from scoped completion verification: it runs every locally reproducible required PR/merge-queue check, including the full backend E2E and critical browser-smoke suites. GitHub still owns non-local boundaries such as the synthetic merge ref, registry publication, signing, and attestation.
+Before opening or queueing a PR, the worktree must be clean and based on current `origin/main`, and the focused verification above must be green for the changed surface. The merge queue is the authoritative complete-suite gate: it runs the full backend E2E and browser-smoke suites on the exact synthetic `main + queued PRs` candidate, plus the boundaries a workstation cannot reproduce (registry publication, signing, attestation). `./test.sh pre-pr` remains available as an optional full local reproduction of that gate — useful when diagnosing a queue failure or ahead of an unusually risky change — but it is not a PR prerequisite and does not need rerunning after every commit, amend, rebase, or merge.
 
 In the final handoff, list the exact checks and tests run, state which broader suites were not run, and disclose any known failure. A known out-of-scope failure must be permanently fixed in the current change or split into a dedicated blocking repair change; it cannot be waived as flaky or left as an unowned follow-up.

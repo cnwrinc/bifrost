@@ -35,7 +35,7 @@ export function useNotifications() {
 	);
 
 	// Fetch initial notifications
-	const { isLoading, error } = useQuery({
+	const { isLoading, error, refetch, isFetching } = useQuery({
 		queryKey: ["notifications"],
 		queryFn: async () => {
 			const data = await getNotifications();
@@ -60,23 +60,16 @@ export function useNotifications() {
 	useEffect(() => {
 		if (!isAuthenticated || !user?.id) return;
 
-		// Connect to notification channel
 		const notificationChannel = `notification:${user.id}`;
-		webSocketService.connect([notificationChannel]);
-
-		// Also subscribe to admin notifications if user is superuser
-		if (user.isSuperuser) {
-			webSocketService.subscribe("notification:admins");
-		}
+		// The server decides whether this caller currently holds platform.read.
+		// Keeping the request unconditional avoids trusting stale client role claims.
+		webSocketService.connect([notificationChannel, "notification:admins"]);
 
 		return () => {
-			// Unsubscribe on cleanup
 			webSocketService.unsubscribe(notificationChannel);
-			if (user.isSuperuser) {
-				webSocketService.unsubscribe("notification:admins");
-			}
+			webSocketService.unsubscribe("notification:admins");
 		};
-	}, [isAuthenticated, user?.id, user?.isSuperuser]);
+	}, [isAuthenticated, user?.id]);
 
 	// Dismiss handler
 	const dismiss = useCallback(
@@ -103,6 +96,8 @@ export function useNotifications() {
 		completedNotifications,
 		isLoading,
 		error,
+		refetch,
+		isFetching,
 		dismiss,
 		clearAll: clearNotifications,
 	};

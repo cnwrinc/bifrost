@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, date, timezone
 from uuid import UUID
 
-from sqlalchemy import select, update, func, text, exists
+from sqlalchemy import Integer, select, func, text, exists
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +19,24 @@ from src.models import ExecutionMetricsDaily, WorkflowROIDaily, Workflow
 from src.models.enums import ExecutionStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_org_uuid(org_id: str | None) -> UUID | None:
+    """Parse an organization ID in either accepted wire format.
+
+    Callers pass either a bare UUID (workflow execution consumer) or the
+    legacy ``"ORG:<uuid>"`` form. Anything else (including garbage) maps to
+    ``None`` so the sample lands only on the global row instead of being
+    double-counted there.
+    """
+    if not org_id:
+        return None
+    candidate = org_id.replace("ORG:", "") if org_id.startswith("ORG:") else org_id
+    try:
+        return UUID(candidate)
+    except (ValueError, AttributeError):
+        logger.warning("Unparseable organization id for metrics; using global row")
+        return None
 
 
 async def update_daily_metrics(
@@ -49,28 +67,25 @@ async def update_daily_metrics(
         workflow_id: Workflow ID for per-workflow tracking
     """
     today = date.today()
-    org_uuid = (
-        UUID(org_id.replace("ORG:", ""))
-        if org_id and org_id.startswith("ORG:")
-        else None
-    )
+    org_uuid = _parse_org_uuid(org_id)
 
     try:
         # Use provided session if given; otherwise open a new one
         if db is None:
             session_factory = get_session_factory()
             async with session_factory() as session:
-                await _upsert_daily_metrics(
-                    session,
-                    today,
-                    org_uuid,
-                    status,
-                    duration_ms,
-                    peak_memory_bytes,
-                    cpu_total_seconds,
-                    time_saved,
-                    value,
-                )
+                if org_uuid is not None:
+                    await _upsert_daily_metrics(
+                        session,
+                        today,
+                        org_uuid,
+                        status,
+                        duration_ms,
+                        peak_memory_bytes,
+                        cpu_total_seconds,
+                        time_saved,
+                        value,
+                    )
 
                 await _upsert_daily_metrics(
                     session,
@@ -87,17 +102,18 @@ async def update_daily_metrics(
                 await session.commit()
         else:
             # Use provided session - caller manages commit
-            await _upsert_daily_metrics(
-                db,
-                today,
-                org_uuid,
-                status,
-                duration_ms,
-                peak_memory_bytes,
-                cpu_total_seconds,
-                time_saved,
-                value,
-            )
+            if org_uuid is not None:
+                await _upsert_daily_metrics(
+                    db,
+                    today,
+                    org_uuid,
+                    status,
+                    duration_ms,
+                    peak_memory_bytes,
+                    cpu_total_seconds,
+                    time_saved,
+                    value,
+                )
 
             await _upsert_daily_metrics(
                 db,
@@ -164,45 +180,61 @@ async def _upsert_daily_metrics(
 
     # PostgreSQL upsert
     stmt = insert(ExecutionMetricsDaily).values(**insert_values)
+    new_execution_count = ExecutionMetricsDaily.execution_count + 1
+    new_total_duration = (
+        ExecutionMetricsDaily.total_duration_ms + (duration_ms or 0)
+    )
+    new_avg_duration = func.floor(
+        new_total_duration / new_execution_count
+    ).cast(Integer)
 
     # On conflict, increment counters
     # Use different conflict target based on whether this is org-specific or global:
     # - org_id is not None: use named constraint "uq_metrics_daily_date_org"
     # - org_id is None (global): use index_elements with index_where for partial unique index
     #   (PostgreSQL's ON CONFLICT ON CONSTRAINT only works with constraints, not indexes)
+    #
+    # Unknown memory/CPU samples (None) add 0 to totals but never move the
+    # peak columns: a missing sample must not read as "no usage", and
+    # GREATEST(existing, 0) would drag a real peak down to 0 on rows whose
+    # first sample is unknown.
+    update_set: dict = {
+        "execution_count": ExecutionMetricsDaily.execution_count + 1,
+        "success_count": ExecutionMetricsDaily.success_count
+        + (1 if is_success else 0),
+        "failed_count": ExecutionMetricsDaily.failed_count
+        + (1 if is_failed else 0),
+        "timeout_count": ExecutionMetricsDaily.timeout_count
+        + (1 if is_timeout else 0),
+        "cancelled_count": ExecutionMetricsDaily.cancelled_count
+        + (1 if is_cancelled else 0),
+        "total_duration_ms": ExecutionMetricsDaily.total_duration_ms
+        + (duration_ms or 0),
+        "avg_duration_ms": new_avg_duration,
+        "max_duration_ms": func.greatest(
+            ExecutionMetricsDaily.max_duration_ms, duration_ms or 0
+        ),
+        "total_memory_bytes": ExecutionMetricsDaily.total_memory_bytes
+        + (peak_memory_bytes or 0),
+        "total_cpu_seconds": ExecutionMetricsDaily.total_cpu_seconds
+        + (cpu_total_seconds or 0.0),
+        "total_time_saved": ExecutionMetricsDaily.total_time_saved
+        + add_time_saved,
+        "total_value": ExecutionMetricsDaily.total_value + add_value,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if peak_memory_bytes is not None:
+        update_set["peak_memory_bytes"] = func.greatest(
+            ExecutionMetricsDaily.peak_memory_bytes, peak_memory_bytes
+        )
+    if cpu_total_seconds is not None:
+        update_set["peak_cpu_seconds"] = func.greatest(
+            ExecutionMetricsDaily.peak_cpu_seconds, cpu_total_seconds
+        )
     if org_id is not None:
         stmt = stmt.on_conflict_do_update(
             constraint="uq_metrics_daily_date_org",
-            set_={
-                "execution_count": ExecutionMetricsDaily.execution_count + 1,
-                "success_count": ExecutionMetricsDaily.success_count
-                + (1 if is_success else 0),
-                "failed_count": ExecutionMetricsDaily.failed_count
-                + (1 if is_failed else 0),
-                "timeout_count": ExecutionMetricsDaily.timeout_count
-                + (1 if is_timeout else 0),
-                "cancelled_count": ExecutionMetricsDaily.cancelled_count
-                + (1 if is_cancelled else 0),
-                "total_duration_ms": ExecutionMetricsDaily.total_duration_ms
-                + (duration_ms or 0),
-                "max_duration_ms": func.greatest(
-                    ExecutionMetricsDaily.max_duration_ms, duration_ms or 0
-                ),
-                "total_memory_bytes": ExecutionMetricsDaily.total_memory_bytes
-                + (peak_memory_bytes or 0),
-                "peak_memory_bytes": func.greatest(
-                    ExecutionMetricsDaily.peak_memory_bytes, peak_memory_bytes or 0
-                ),
-                "total_cpu_seconds": ExecutionMetricsDaily.total_cpu_seconds
-                + (cpu_total_seconds or 0.0),
-                "peak_cpu_seconds": func.greatest(
-                    ExecutionMetricsDaily.peak_cpu_seconds, cpu_total_seconds or 0.0
-                ),
-                "total_time_saved": ExecutionMetricsDaily.total_time_saved
-                + add_time_saved,
-                "total_value": ExecutionMetricsDaily.total_value + add_value,
-                "updated_at": datetime.now(timezone.utc),
-            },
+            set_=update_set,
         )
     else:
         # For global metrics (org_id IS NULL), use index_elements with index_where
@@ -210,65 +242,13 @@ async def _upsert_daily_metrics(
         stmt = stmt.on_conflict_do_update(
             index_elements=["date"],
             index_where=text("organization_id IS NULL"),
-            set_={
-                "execution_count": ExecutionMetricsDaily.execution_count + 1,
-                "success_count": ExecutionMetricsDaily.success_count
-                + (1 if is_success else 0),
-                "failed_count": ExecutionMetricsDaily.failed_count
-                + (1 if is_failed else 0),
-                "timeout_count": ExecutionMetricsDaily.timeout_count
-                + (1 if is_timeout else 0),
-                "cancelled_count": ExecutionMetricsDaily.cancelled_count
-                + (1 if is_cancelled else 0),
-                "total_duration_ms": ExecutionMetricsDaily.total_duration_ms
-                + (duration_ms or 0),
-                "max_duration_ms": func.greatest(
-                    ExecutionMetricsDaily.max_duration_ms, duration_ms or 0
-                ),
-                "total_memory_bytes": ExecutionMetricsDaily.total_memory_bytes
-                + (peak_memory_bytes or 0),
-                "peak_memory_bytes": func.greatest(
-                    ExecutionMetricsDaily.peak_memory_bytes, peak_memory_bytes or 0
-                ),
-                "total_cpu_seconds": ExecutionMetricsDaily.total_cpu_seconds
-                + (cpu_total_seconds or 0.0),
-                "peak_cpu_seconds": func.greatest(
-                    ExecutionMetricsDaily.peak_cpu_seconds, cpu_total_seconds or 0.0
-                ),
-                "total_time_saved": ExecutionMetricsDaily.total_time_saved
-                + add_time_saved,
-                "total_value": ExecutionMetricsDaily.total_value + add_value,
-                "updated_at": datetime.now(timezone.utc),
-            },
+            set_=update_set,
         )
 
+    # The average is derived atomically in the conflict update above. Keeping
+    # this to one statement minimizes the time the shared daily row is locked
+    # when many executions finish together.
     await db.execute(stmt)
-
-    # Recalculate average duration
-    # (We do this separately to get the new count)
-    # Build org filter correctly for NULL handling
-    if org_id is not None:
-        org_filter = ExecutionMetricsDaily.organization_id == org_id
-    else:
-        org_filter = ExecutionMetricsDaily.organization_id.is_(None)
-
-    result = await db.execute(
-        select(
-            ExecutionMetricsDaily.execution_count,
-            ExecutionMetricsDaily.total_duration_ms,
-        )
-        .where(ExecutionMetricsDaily.date == today)
-        .where(org_filter)
-    )
-    row = result.one_or_none()
-    if row and row.execution_count > 0:
-        avg_duration = row.total_duration_ms // row.execution_count
-        await db.execute(
-            update(ExecutionMetricsDaily)
-            .where(ExecutionMetricsDaily.date == today)
-            .where(org_filter)
-            .values(avg_duration_ms=avg_duration)
-        )
 
 
 async def update_workflow_roi_daily(
@@ -296,11 +276,7 @@ async def update_workflow_roi_daily(
     logger.debug(f"ROI update called: workflow_id={workflow_id}, org_id={org_id}, status={status}, db_provided={db is not None}")
     today = date.today()
     workflow_uuid = UUID(workflow_id)
-    org_uuid = (
-        UUID(org_id.replace("ORG:", ""))
-        if org_id and org_id.startswith("ORG:")
-        else None
-    )
+    org_uuid = _parse_org_uuid(org_id)
 
     def _is_missing_workflow_fk_violation(exc: IntegrityError) -> bool:
         orig = getattr(exc, "orig", None)

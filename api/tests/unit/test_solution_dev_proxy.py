@@ -6,12 +6,14 @@ import time
 
 import aiohttp
 import httpx
+import pytest
 import yarl
 from aiohttp import web
 
 from bifrost.solution_dev.function_host import (
     LocalWorkflowImportError,
     LocalWorkflowResolutionError,
+    set_dev_execution_context,
 )
 from bifrost.solution_dev.proxy import (
     DEV_AUTH_EXPIRED_DETAIL,
@@ -98,12 +100,29 @@ def test_join_upstream_retains_non_default_ports():
     )
 
 
-def _free_port() -> int:
+_reserved_ports: dict[int, socket.socket] = {}
+
+
+@pytest.fixture(autouse=True)
+def _release_unused_ports():
+    """Close reservations for intentionally unavailable upstreams after each test."""
+    yield
+    for reserved in _reserved_ports.values():
+        reserved.close()
+    _reserved_ports.clear()
+
+
+def _reserve_port(port: int = 0) -> int:
     s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", port))
+    assigned_port = s.getsockname()[1]
+    _reserved_ports[assigned_port] = s
+    return assigned_port
+
+
+def _free_port() -> int:
+    return _reserve_port()
 
 
 class _StubHost:
@@ -128,6 +147,13 @@ class _StubHost:
     async def run(self, ref, params):
         self.last_call = (ref, params)
         return {"ran_local": ref, "params": params}
+
+
+class _ContextHost(_StubHost):
+    async def run(self, ref, params):
+        from bifrost import context
+
+        return {"org_id": context.org_id, "solution_id": context.solution_id}
 
 
 def _make_upstream(record):
@@ -206,11 +232,38 @@ def _make_auth_refresh_upstream(record):
     return app
 
 
+def _make_auth_websocket_upstream(record):
+    async def echo(request):
+        record.setdefault("ws_tokens", []).append(request.rel_url.query.get("token"))
+        if request.rel_url.query.get("token") != "fresh-token":
+            return web.json_response({"detail": "Not authenticated"}, status=401)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                await ws.send_str(f"echo:{msg.data}")
+                break
+        await ws.close()
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/ws/echo", echo)
+    app.router.add_get("/api/echo", echo)
+    return app
+
+
 async def _serve(app, port):
+    sock = _reserved_ports.pop(port)
     runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", port)
-    await site.start()
+    try:
+        sock.listen(socket.SOMAXCONN)
+        await runner.setup()
+        site = web.SockSite(runner, sock)
+        await site.start()
+    except Exception:
+        await runner.cleanup()
+        sock.close()
+        raise
     return runner
 
 
@@ -247,6 +300,38 @@ async def test_local_path_ref_runs_in_function_host():
             }
         assert host.last_call == ("functions/hello.py::main", {"x": 1})
         assert "execute_body" not in record  # never hit upstream
+    finally:
+        await dev_runner.cleanup()
+        await up_runner.cleanup()
+
+
+async def test_app_start_forwards_workflow_to_live_platform_with_separate_scope():
+    record = {}
+    up_port, dev_port = _free_port(), _free_port()
+    up_runner = await _serve(_make_upstream(record), up_port)
+    cfg = DevProxyConfig(
+        upstream_url=f"http://127.0.0.1:{up_port}",
+        token="t",
+        app_id="app-id",
+        org_id="runtime-org",
+        local_workflows=False,
+    )
+    dev_runner = await _serve(
+        build_dev_app(cfg, None, vite_url="http://127.0.0.1:1"), dev_port
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://127.0.0.1:{dev_port}/api/workflows/execute",
+                json={"workflow_id": "loose-live-workflow", "input_data": {"x": 1}},
+            )
+        assert response.status_code == 200
+        assert record["execute_body"] == {
+            "workflow_id": "loose-live-workflow",
+            "input_data": {"x": 1},
+            "app_id": "app-id",
+            "org_id": "runtime-org",
+        }
     finally:
         await dev_runner.cleanup()
         await up_runner.cleanup()
@@ -388,10 +473,15 @@ async def test_unknown_ref_with_global_access_proxies_without_scope_signals():
     up_port, dev_port = _free_port(), _free_port()
     up_runner = await _serve(_make_upstream(record), up_port)
     host = _StubHost(set())
+
+    async def dev_headers():
+        raise AssertionError("Shared workflow fallback must not use install provenance")
+
     cfg = DevProxyConfig(
         upstream_url=f"http://127.0.0.1:{up_port}",
         token="t", app_id="A", org_id="O", solution_id="S",
         global_repo_access=True,
+        dev_context_headers=dev_headers,
     )
     dev_runner = await _serve(build_dev_app(cfg, host, vite_url="http://127.0.0.1:1"), dev_port)
     try:
@@ -418,6 +508,7 @@ async def test_unknown_ref_with_global_access_proxies_without_scope_signals():
         assert "form_id" not in body
         headers = {k.lower(): v for k, v in record["execute_headers"].items()}
         assert "x-bifrost-app" not in headers
+        assert "x-bifrost-dev-context" not in headers
         assert headers["x-bifrost-org"] == "O"          # org scope stays
         assert headers["authorization"] == "Bearer t"   # auth stays
     finally:
@@ -473,8 +564,97 @@ async def test_other_api_path_proxies_with_org_header():
         assert r.status_code == 200
         assert r.json()["upstream_other"] is True
         assert record["other_path"] == "/api/tables/foo"
-        assert record["other_query"] == "limit=10&solution=S"
+        assert record["other_query"] == "limit=10&solution=S&scope=O"
         assert record["other_org"] == "O"
+    finally:
+        await dev_runner.cleanup()
+        await up_runner.cleanup()
+
+
+async def test_local_workflow_uses_captured_bound_execution_context():
+    """The aiohttp request task retains solution-start's selected org/install."""
+    from bifrost._context import clear_execution_context
+
+    record = {}
+    up_port, dev_port = _free_port(), _free_port()
+    up_runner = await _serve(_make_upstream(record), up_port)
+    set_dev_execution_context(
+        user={"id": "user-1", "email": "dev@contoso.example", "name": "Dev"},
+        org={"id": "ORG", "name": "Contoso"},
+        solution_id="SOLUTION",
+    )
+    cfg = DevProxyConfig(
+        upstream_url=f"http://127.0.0.1:{up_port}", token="t", app_id="A", org_id="ORG"
+    )
+    dev_runner = await _serve(
+        build_dev_app(cfg, _ContextHost({"workflows/local.py::run"}), vite_url="http://127.0.0.1:1"),
+        dev_port,
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://127.0.0.1:{dev_port}/api/workflows/execute",
+                json={"workflow_id": "workflows/local.py::run", "input_data": {}},
+            )
+        assert response.status_code == 200
+        assert response.json()["result"] == {"org_id": "ORG", "solution_id": "SOLUTION"}
+    finally:
+        clear_execution_context()
+        await dev_runner.cleanup()
+        await up_runner.cleanup()
+
+
+async def test_api_proxy_replaces_browser_scope_with_bound_install_scope():
+    """A preview cannot use a query string to select a foreign organization."""
+    record = {}
+    up_port, dev_port = _free_port(), _free_port()
+    up_runner = await _serve(_make_upstream(record), up_port)
+    cfg = DevProxyConfig(
+        upstream_url=f"http://127.0.0.1:{up_port}",
+        token="t",
+        app_id="A",
+        org_id="O",
+        solution_id="S",
+    )
+    dev_runner = await _serve(
+        build_dev_app(cfg, _StubHost(set()), vite_url="http://127.0.0.1:1"), dev_port
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"http://127.0.0.1:{dev_port}/api/tables/foo?scope=FOREIGN&limit=10"
+            )
+        assert response.status_code == 200
+        assert yarl.URL(f"/?{record['other_query']}").query == {
+            "scope": "O",
+            "limit": "10",
+            "solution": "S",
+        }
+    finally:
+        await dev_runner.cleanup()
+        await up_runner.cleanup()
+
+
+async def test_api_proxy_binds_global_install_scope():
+    record = {}
+    up_port, dev_port = _free_port(), _free_port()
+    up_runner = await _serve(_make_upstream(record), up_port)
+    cfg = DevProxyConfig(
+        upstream_url=f"http://127.0.0.1:{up_port}",
+        token="t",
+        app_id="A",
+        org_id=None,
+    )
+    dev_runner = await _serve(
+        build_dev_app(cfg, _StubHost(set()), vite_url="http://127.0.0.1:1"), dev_port
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"http://127.0.0.1:{dev_port}/api/tables/foo?scope=FOREIGN"
+            )
+        assert response.status_code == 200
+        assert yarl.URL(f"/?{record['other_query']}").query == {"scope": "global"}
     finally:
         await dev_runner.cleanup()
         await up_runner.cleanup()
@@ -615,6 +795,77 @@ async def test_api_proxy_returns_dev_auth_expired_json_when_refresh_fails():
         await up_runner.cleanup()
 
 
+async def test_expired_proxy_recovers_before_forwarding_another_data_request():
+    """An already-rejected preview must not keep sending its stale bearer token."""
+    record = {}
+    up_port, dev_port = _free_port(), _free_port()
+    up_runner = await _serve(_make_auth_refresh_upstream(record), up_port)
+    login_replaced_credentials = False
+    refresh_observations: list[str] = []
+
+    async def refresh_token(observed_token):
+        refresh_observations.append(observed_token)
+        return "fresh-token" if login_replaced_credentials else None
+
+    cfg = DevProxyConfig(
+        upstream_url=f"http://127.0.0.1:{up_port}",
+        token="stale-token",
+        app_id="A",
+        org_id="O",
+        refresh_token=refresh_token,
+        auth_expired=True,
+    )
+    dev_runner = await _serve(
+        build_dev_app(cfg, _StubHost(set()), vite_url="http://127.0.0.1:1"),
+        dev_port,
+    )
+    try:
+        async with httpx.AsyncClient() as client:
+            rejected = await client.get(f"http://127.0.0.1:{dev_port}/api/auth/me")
+            login_replaced_credentials = True
+            recovered = await client.get(f"http://127.0.0.1:{dev_port}/api/auth/me")
+
+        assert rejected.status_code == 401
+        assert recovered.status_code == 200
+        assert refresh_observations == ["stale-token", "stale-token"]
+        assert record["auth_headers"] == ["Bearer fresh-token"]
+        assert cfg.auth_expired is False
+    finally:
+        await dev_runner.cleanup()
+        await up_runner.cleanup()
+
+
+async def test_expired_proactive_refresh_uses_poll_interval_after_failure(monkeypatch):
+    """A rejected credential is polled for replacement; it is not retried every 2s."""
+    from bifrost.solution_dev import proxy as proxy_mod
+
+    sleeps: list[float] = []
+
+    async def refresh_token(_observed_token):
+        return None
+
+    async def stop_after_sleep(seconds):
+        sleeps.append(seconds)
+        raise asyncio.CancelledError
+
+    cfg = DevProxyConfig(
+        upstream_url="http://127.0.0.1:1",
+        token=_jwt_with_exp(time.time() - 1),
+        app_id="A",
+        org_id="O",
+        refresh_token=refresh_token,
+    )
+    app = web.Application()
+    app[proxy_mod._CFG] = cfg
+    monkeypatch.setattr(proxy_mod.asyncio, "sleep", stop_after_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await proxy_mod._proactive_auth_refresh_loop(app)
+
+    assert cfg.auth_expired is True
+    assert sleeps == [proxy_mod._AUTH_REFRESH_POLL_SECONDS]
+
+
 async def test_document_reload_recovers_after_credentials_are_replaced():
     record = {}
     up_port, vite_port, dev_port = _free_port(), _free_port(), _free_port()
@@ -751,8 +1002,9 @@ async def test_vite_proxy_serves_branded_auth_expired_page_before_the_app():
         assert "/api/branding/logo/square" not in page.text
         assert "/api/branding/logo/rectangle" not in page.text
         assert "#aa3366" in page.text
-        assert "will keep trying automatically" in page.text
-        assert "no CLI restart is needed" in page.text
+        assert "Run <code>bifrost login</code> in another terminal" in page.text
+        assert "Then select Try Again to recover this preview" in page.text
+        assert "window.location.reload(), 3000" not in page.text
         assert "bifrost solution start" in page.text
         assert "Vite app" not in page.text
         assert record["auth_headers"] == ["Bearer stale-token"]
@@ -824,6 +1076,65 @@ async def test_ws_upgrade_replaces_baked_token_with_live_cli_token():
         await up_runner.cleanup()
 
 
+@pytest.mark.parametrize("path", ["/ws/echo", "/api/echo"])
+async def test_websocket_auth_rejection_blocks_stale_reconnects_and_recovers(path):
+    """API websocket routes close a rejected socket and recover after login."""
+    record = {}
+    up_port, dev_port = _free_port(), _free_port()
+    up_runner = await _serve(_make_auth_websocket_upstream(record), up_port)
+    login_replaced_credentials = False
+
+    async def refresh_token(_observed_token):
+        return "fresh-token" if login_replaced_credentials else None
+
+    cfg = DevProxyConfig(
+        upstream_url=f"http://127.0.0.1:{up_port}",
+        token="stale-token",
+        app_id="A",
+        org_id="O",
+        refresh_token=refresh_token,
+    )
+    dev_runner = await _serve(
+        build_dev_app(cfg, _StubHost(set()), vite_url="http://127.0.0.1:1"),
+        dev_port,
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            # The first upstream 401 is observed after the browser handshake.
+            # It must mark this API preview expired and close with an auth
+            # policy code, so subsequent reconnects do not keep reaching it.
+            rejected_socket = await session.ws_connect(
+                f"http://127.0.0.1:{dev_port}{path}?token=baked-stale-token"
+            )
+            close_message = await rejected_socket.receive()
+            assert close_message.type == aiohttp.WSMsgType.CLOSE
+            assert rejected_socket.close_code == aiohttp.WSCloseCode.POLICY_VIOLATION
+            assert cfg.auth_expired is True
+            assert record["ws_tokens"] == ["stale-token"]
+
+            with pytest.raises(aiohttp.WSServerHandshakeError) as error:
+                await session.ws_connect(
+                    f"http://127.0.0.1:{dev_port}{path}?token=baked-stale-token"
+                )
+            assert error.value.status == 401
+            assert record["ws_tokens"] == ["stale-token"]
+            login_replaced_credentials = True
+            async with session.ws_connect(
+                f"http://127.0.0.1:{dev_port}{path}?token=baked-stale-token"
+            ) as ws:
+                await ws.send_str("ping")
+                message = await ws.receive()
+
+        assert message.type == aiohttp.WSMsgType.TEXT
+        assert message.data == "echo:ping"
+        assert record["ws_tokens"] == ["stale-token", "fresh-token"]
+        assert cfg.token == "fresh-token"
+        assert cfg.auth_expired is False
+    finally:
+        await dev_runner.cleanup()
+        await up_runner.cleanup()
+
+
 async def test_browser_session_reload_signal_changes_after_same_origin_restart():
     record = {}
     up_port, vite_port, dev_port = _free_port(), _free_port(), _free_port()
@@ -859,6 +1170,7 @@ async def test_browser_session_reload_signal_changes_after_same_origin_restart()
     finally:
         await first_runner.cleanup()
 
+    _reserve_port(dev_port)
     second_cfg, second_runner = await _start_proxy()
     try:
         async with httpx.AsyncClient() as c:
@@ -912,10 +1224,15 @@ async def test_code_only_request_forwards_upstream_with_scope():
     up_port, dev_port = _free_port(), _free_port()
     up_runner = await _serve(_make_upstream(record), up_port)
     host = _StubHost(set())
+
+    async def dev_headers():
+        return {"X-Bifrost-Dev-Context": "server-signed-context"}
+
     cfg = DevProxyConfig(
         upstream_url=f"http://127.0.0.1:{up_port}",
         token="t", app_id="A", org_id="O", solution_id="S",
         global_repo_access=False,
+        dev_context_headers=dev_headers,
     )
     dev_runner = await _serve(build_dev_app(cfg, host, vite_url="http://127.0.0.1:1"), dev_port)
     try:
@@ -923,10 +1240,19 @@ async def test_code_only_request_forwards_upstream_with_scope():
             r = await c.post(
                 f"http://127.0.0.1:{dev_port}/api/workflows/execute",
                 json={"code": "print('hi')", "input_data": {}},
+                headers={
+                    "Authorization": "Bearer forged-user",
+                    "X-Bifrost-App": "forged-app",
+                    "X-Bifrost-Dev-Context": "forged-context",
+                },
             )
         assert r.status_code == 200
         assert r.json()["ran_upstream"] is True
         assert record["execute_body"]["solution_id"] == "S"
+        headers = {key.lower(): value for key, value in record["execute_headers"].items()}
+        assert headers["authorization"] == "Bearer t"
+        assert headers["x-bifrost-app"] == "A"
+        assert headers["x-bifrost-dev-context"] == "server-signed-context"
     finally:
         await dev_runner.cleanup()
         await up_runner.cleanup()

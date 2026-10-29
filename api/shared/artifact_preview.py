@@ -5,24 +5,24 @@ from __future__ import annotations
 import io
 from html import escape
 
-from docx import Document
-from openpyxl import load_workbook
-
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 _STYLE = """
 <style>
   :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
-  body { margin: 0; padding: 28px; color: #172033; background: #fff; line-height: 1.55; }
-  main { max-width: 900px; margin: 0 auto; }
+  body { margin: 0; padding: clamp(16px, 4vw, 28px); color: #172033; background: #fff; line-height: 1.55; }
+  main { min-width: 0; max-width: 900px; margin: 0 auto; overflow-wrap: anywhere; }
   h1, h2, h3 { line-height: 1.2; margin: 1.5em 0 .55em; }
   h1:first-child { margin-top: 0; }
   p { margin: .65em 0; }
   table { width: 100%; border-collapse: collapse; margin: 20px 0 30px; font-size: 13px; }
   th, td { border: 1px solid #d5dbea; padding: 7px 9px; text-align: left; vertical-align: top; }
   th { background: #edf1f7; font-weight: 650; }
-  .sheet { margin-bottom: 44px; overflow-x: auto; }
+  .sheet { margin-bottom: 32px; }
+  .table-scroll { max-width: 100%; overflow-x: auto; }
+  .table-scroll:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  .table-scroll table { overflow-wrap: normal; }
   .truncated { color: #67728a; font-size: 12px; }
   @media (prefers-color-scheme: dark) {
     body { color: #e6eaf2; background: #11141a; }
@@ -35,11 +35,13 @@ _STYLE = """
 
 
 def _page(body: str) -> str:
-    return f"<!doctype html><html><head><meta charset='utf-8'>{_STYLE}</head><body><main>{body}</main></body></html>"
+    return f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>{_STYLE}</head><body><main>{body}</main></body></html>"
 
 
 def preview_docx(content: bytes) -> str:
     """Render paragraphs and tables from a DOCX without executing active content."""
+    from docx import Document
+
     document = Document(io.BytesIO(content))
     parts: list[str] = []
     for paragraph in document.paragraphs[:500]:
@@ -63,12 +65,14 @@ def preview_docx(content: bytes) -> str:
             tag = "th" if row_index == 0 else "td"
             cells = "".join(f"<{tag}>{escape(cell.text)}</{tag}>" for cell in row.cells)
             rows.append(f"<tr>{cells}</tr>")
-        parts.append(f"<table>{''.join(rows)}</table>")
+        parts.append(f"<div class='table-scroll' tabindex='0' role='region' aria-label='Document table'><table>{''.join(rows)}</table></div>")
     return _page("".join(parts) or "<p>No previewable document content.</p>")
 
 
 def preview_xlsx(content: bytes) -> str:
     """Render a bounded workbook preview without evaluating formulas."""
+    from openpyxl import load_workbook
+
     workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=False)
     parts: list[str] = []
     try:
@@ -83,7 +87,7 @@ def preview_xlsx(content: bytes) -> str:
                 rows.append(f"<tr>{cells}</tr>")
             parts.append(
                 f"<section class='sheet'><h2>{escape(worksheet.title)}</h2>"
-                f"<table>{''.join(rows)}</table>"
+                f"<div class='table-scroll' tabindex='0' role='region' aria-label='Worksheet table'><table>{''.join(rows)}</table></div>"
                 + (
                     "<p class='truncated'>Preview limited to the first 200 rows.</p>"
                     if worksheet.max_row > 201

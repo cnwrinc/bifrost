@@ -12,14 +12,14 @@ import pytest
 
 
 def _create_app(e2e_client, headers, slug, name=None, params=None, **json_extra):
-    """Create an app and return the response JSON with id."""
+    """Create an app for metadata tests without unrelated V1 scaffold writes."""
     kwargs = {}
     if params:
         kwargs["params"] = params
     response = e2e_client.post(
         "/api/applications",
         headers=headers,
-        json={"name": name or slug, "slug": slug, "app_model": "inline_v1", **json_extra},
+        json={"name": name or slug, "slug": slug, "app_model": "standalone_v2", **json_extra},
         **kwargs,
     )
     assert response.status_code == 201, f"Create app '{slug}' failed: {response.text}"
@@ -88,6 +88,58 @@ class TestApplicationCRUD:
 
         # Cleanup
         _delete_app(e2e_client, platform_admin.headers, app["id"])
+
+    def test_create_independent_v2_application_has_no_repo_source(
+        self, e2e_client, platform_admin
+    ):
+        response = e2e_client.post(
+            "/api/applications",
+            headers=platform_admin.headers,
+            json={
+                "name": "Independent V2 App",
+                "slug": "independent-v2-app",
+                "app_model": "standalone_v2",
+            },
+        )
+        assert response.status_code == 201, response.text
+        app = response.json()
+        assert app["repo_path"] is None
+        assert app["solution_id"] is None
+        assert app["is_published"] is False
+        assert app["has_unpublished_changes"] is False
+
+        source_response = e2e_client.get(
+            f"/api/applications/{app['id']}/files",
+            headers=platform_admin.headers,
+        )
+        assert source_response.status_code == 409
+        assert "source is local" in source_response.json()["detail"]
+
+        _delete_app(e2e_client, platform_admin.headers, app["id"])
+
+    def test_non_admin_cannot_deploy_an_application(
+        self, e2e_client, platform_admin, org1_user, org1
+    ):
+        app = _create_app(
+            e2e_client,
+            platform_admin.headers,
+            f"deploy-denied-{uuid.uuid4().hex[:8]}",
+            organization_id=org1["id"],
+        )
+        try:
+            # Multipart requests supply their own Content-Type boundary.
+            headers = {
+                key: value for key, value in org1_user.headers.items()
+                if key.lower() != "content-type"
+            }
+            response = e2e_client.post(
+                f"/api/applications/{app['id']}/deploy",
+                headers=headers,
+                files={"source": ("source.zip", b"not-a-zip", "application/zip")},
+            )
+            assert response.status_code == 403, response.text
+        finally:
+            _delete_app(e2e_client, platform_admin.headers, app["id"])
 
     def test_get_application_by_slug(self, e2e_client, platform_admin):
         """Get application by slug."""
@@ -250,7 +302,7 @@ class TestApplicationDuplicateSlugs:
         response2 = e2e_client.post(
             "/api/applications",
             headers=platform_admin.headers,
-            json={"name": "Second App", "slug": "duplicate-slug", "app_model": "inline_v1"},
+            json={"name": "Second App", "slug": "duplicate-slug", "app_model": "standalone_v2"},
         )
         assert response2.status_code == 409, \
             f"Expected 409 Conflict for duplicate slug, got {response2.status_code}"
@@ -274,7 +326,7 @@ class TestApplicationDuplicateSlugs:
         response2 = e2e_client.post(
             "/api/applications",
             headers=platform_admin.headers,
-            json={"name": "Global App", "slug": "cross-scope-dup", "app_model": "inline_v1"},
+            json={"name": "Global App", "slug": "cross-scope-dup", "app_model": "standalone_v2"},
             params={"scope": "global"},
         )
         assert response2.status_code == 409, \
@@ -403,7 +455,7 @@ class TestApplicationAccess:
         response = e2e_client.post(
             "/api/applications",
             headers=platform_admin.headers,
-            json={"name": "Global App", "slug": "global-app", "app_model": "inline_v1", "organization_id": None},
+            json={"name": "Global App", "slug": "global-app", "app_model": "standalone_v2", "organization_id": None},
         )
         assert response.status_code == 201
         app = response.json()
@@ -421,6 +473,92 @@ class TestApplicationAccess:
 
 
 @pytest.mark.e2e
+class TestApplicationWriteScope:
+    """App reads and writes require their respective named permissions."""
+
+    def test_org_user_cannot_update_global_app(self, e2e_client, platform_admin, org1_user):
+        """A reader without apps.readwrite cannot change a shared Global app."""
+        create_response = e2e_client.post(
+            "/api/applications",
+            headers=platform_admin.headers,
+            json={
+                "name": "Global Write Scope App",
+                "slug": "global-write-scope-app",
+                "app_model": "standalone_v2",
+                "organization_id": None,
+            },
+        )
+        assert create_response.status_code == 201, create_response.text
+        app = create_response.json()
+
+        # Read access does not grant management permission.
+        read_response = e2e_client.get(
+            f"/api/applications/{app['slug']}",
+            headers=org1_user.headers,
+        )
+        assert read_response.status_code == 200, read_response.text
+
+        write_response = e2e_client.patch(
+            f"/api/applications/{app['id']}",
+            headers=org1_user.headers,
+            json={"description": "should be denied"},
+        )
+        assert write_response.status_code == 403, write_response.text
+        unchanged = e2e_client.get(
+            f"/api/applications/{app['slug']}", headers=org1_user.headers
+        )
+        assert unchanged.status_code == 200, unchanged.text
+        assert unchanged.json()["description"] == app["description"]
+
+        # Cleanup
+        _delete_app(e2e_client, platform_admin.headers, app["id"], params={"scope": "global"})
+
+    def test_org_user_cannot_update_own_org_app(
+        self, e2e_client, platform_admin, org1_user, org1
+    ):
+        """Home-organization reach still requires apps.readwrite to update."""
+        app = _create_app(
+            e2e_client,
+            platform_admin.headers,
+            "own-org-write-scope-app",
+            organization_id=org1["id"],
+        )
+
+        read_response = e2e_client.get(
+            f"/api/applications/{app['slug']}",
+            headers=org1_user.headers,
+        )
+        assert read_response.status_code == 200, read_response.text
+
+        write_response = e2e_client.patch(
+            f"/api/applications/{app['id']}",
+            headers=org1_user.headers,
+            json={"description": "should be denied"},
+        )
+        assert write_response.status_code == 403, write_response.text
+        unchanged = e2e_client.get(
+            f"/api/applications/{app['slug']}", headers=org1_user.headers
+        )
+        assert unchanged.status_code == 200, unchanged.text
+        assert unchanged.json()["description"] == app["description"]
+
+        _delete_app(e2e_client, platform_admin.headers, app["id"])
+
+    def test_org_user_cannot_create_application(self, e2e_client, org1_user):
+        """Creation requires apps.readwrite even within the caller's home org."""
+        response = e2e_client.post(
+            "/api/applications",
+            headers=org1_user.headers,
+            json={
+                "name": "Should Be Denied",
+                "slug": "org-user-create-denied-app",
+                "app_model": "standalone_v2",
+            },
+        )
+        assert response.status_code == 403, response.text
+
+
+@pytest.mark.e2e
 class TestApplicationScopeFiltering:
     """Test application scope filtering."""
 
@@ -434,7 +572,7 @@ class TestApplicationScopeFiltering:
         response = e2e_client.post(
             "/api/applications",
             headers=platform_admin.headers,
-            json={"name": "Global App", "slug": f"global-scope-app-{suffix}", "app_model": "inline_v1", "organization_id": None},
+            json={"name": "Global App", "slug": f"global-scope-app-{suffix}", "app_model": "standalone_v2", "organization_id": None},
         )
         assert response.status_code == 201
         apps["global"] = response.json()
@@ -443,7 +581,7 @@ class TestApplicationScopeFiltering:
         response = e2e_client.post(
             "/api/applications",
             headers=platform_admin.headers,
-            json={"name": "Org App", "slug": f"org-scope-app-{suffix}", "app_model": "inline_v1", "organization_id": org1["id"]},
+            json={"name": "Org App", "slug": f"org-scope-app-{suffix}", "app_model": "standalone_v2", "organization_id": org1["id"]},
         )
         assert response.status_code == 201
         apps["org"] = response.json()
@@ -591,7 +729,7 @@ class TestApplicationDBStorage:
         response = e2e_client.post(
             "/api/applications",
             headers=platform_admin.headers,
-            json={"name": "Immediate Query App", "slug": "immediate-query-app", "app_model": "inline_v1"},
+            json={"name": "Immediate Query App", "slug": "immediate-query-app", "app_model": "standalone_v2"},
         )
         assert response.status_code == 201
         created = response.json()

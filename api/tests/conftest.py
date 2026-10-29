@@ -3,11 +3,11 @@ Pytest fixtures for Bifrost API testing infrastructure.
 
 This module provides:
 1. Database fixtures (PostgreSQL with SQLAlchemy async)
-2. Message queue fixtures (RabbitMQ)
-3. Cache fixtures (Redis)
-4. Authentication/authorization fixtures
+2. Cache fixtures (Redis)
+3. Authentication/authorization fixtures
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -49,11 +49,6 @@ TEST_DATABASE_URL_SYNC = os.getenv(
     "postgresql://bifrost:bifrost_test@pgbouncer:5432/bifrost_test",
 )
 
-TEST_RABBITMQ_URL = os.getenv(
-    "BIFROST_RABBITMQ_URL",
-    "amqp://bifrost:bifrost_test@rabbitmq:5672/",
-)
-
 TEST_REDIS_URL = os.getenv(
     "BIFROST_REDIS_URL",
     "redis://redis:6379/0",
@@ -74,7 +69,6 @@ def setup_test_environment(tmp_path_factory):
     os.environ["BIFROST_ENVIRONMENT"] = "testing"
     os.environ["BIFROST_DATABASE_URL"] = TEST_DATABASE_URL
     os.environ["BIFROST_DATABASE_URL_SYNC"] = TEST_DATABASE_URL_SYNC
-    os.environ["BIFROST_RABBITMQ_URL"] = TEST_RABBITMQ_URL
     os.environ["BIFROST_REDIS_URL"] = TEST_REDIS_URL
     os.environ["BIFROST_SECRET_KEY"] = "test-secret-key-for-e2e-testing-must-be-32-chars"
 
@@ -141,6 +135,52 @@ async def db_session(async_session_factory) -> AsyncGenerator[AsyncSession, None
     async with async_session_factory() as session:
         yield session
         await session.rollback()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def isolate_global_db_engine() -> AsyncGenerator[None, None]:
+    """Dispose the global pooled engine around every async test.
+
+    pytest-asyncio runs each test on a fresh event loop, but
+    ``src.core.database``'s engine (``pool_pre_ping=True``) persists across
+    tests. Checking out a connection minted on a previous test's loop can
+    raise "attached to a different loop" instead of recycling, because the
+    ping failure surfaces as RuntimeError rather than a disconnect the
+    pool recognizes. Disposing up front means every checkout in the test
+    mints connections on the current loop; disposing afterwards leaves
+    nothing stale behind. The NullPool test engine behind the
+    ``db_session`` fixture is a separate object and is unaffected.
+    """
+    from src.core.database import close_db
+
+    try:
+        await close_db()
+    except Exception as e:
+        raise RuntimeError("Global DB engine isolation failed") from e
+
+    yield
+
+    try:
+        await close_db()
+    except Exception as e:
+        raise RuntimeError("Global DB engine teardown failed") from e
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def isolate_global_redis_client() -> AsyncGenerator[None, None]:
+    """Close process-global Redis pools on their owning test loop."""
+    from src.core.cache.redis_client import close_shared_redis
+    from src.core.redis_client import close_redis_client
+    from src.services import work_dispatch
+
+    yield
+    # A committed enqueue wakes executors in the background through the shared
+    # client. Let this loop's wakes finish first, or one can bind the shared
+    # client after it is closed and leave it bound to a dead loop.
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(*(wake for wake in work_dispatch._wakes if wake.get_loop() is loop))
+    await close_redis_client()
+    await close_shared_redis()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -259,15 +299,6 @@ async def isolate_file_policies(request) -> AsyncGenerator[None, None]:
 
 
 @pytest.fixture
-def mock_rabbitmq():
-    """Mock RabbitMQ connection for unit tests."""
-    mock = AsyncMock()
-    mock.publish = AsyncMock(return_value=None)
-    mock.consume = AsyncMock(return_value=None)
-    return mock
-
-
-@pytest.fixture
 def mock_redis():
     """Mock Redis connection for unit tests."""
     mock = AsyncMock()
@@ -330,3 +361,22 @@ def pytest_configure(config):
         "e2e: End-to-end tests (Docker stack with database, message queue, and services)",
     )
     config.addinivalue_line("markers", "slow: Tests that take >1 second")
+
+
+# ==================== COLLECTION GUARDS ====================
+
+MAX_TEST_ID_CHARS = 1000
+
+
+def pytest_collection_modifyitems(config, items):
+    """Reject test IDs long enough to wedge CI.
+
+    Pytest prints each node ID under ``-v``; a parametrize value such as an
+    8 MiB bytes literal becomes a multi-megabyte log line that froze the
+    GitHub Actions runner with no retrievable log. Give such params ``ids=``.
+    """
+    oversized = [item.nodeid[:120] for item in items if len(item.nodeid) > MAX_TEST_ID_CHARS]
+    if oversized:
+        raise pytest.UsageError(
+            f"Test IDs over {MAX_TEST_ID_CHARS} chars (pass ids= to parametrize): {oversized}"
+        )

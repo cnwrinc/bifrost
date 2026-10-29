@@ -1,3 +1,9 @@
+declare global {
+	interface Window {
+		__v2LazyFixture?: { entryExecutions: number; mounts: number; unmounts: number };
+	}
+}
+
 /** Browser regression for canonical Apps v2 ES-module identity.
  *
  * Builds a normal Vite/React fixture whose React.lazy chunk imports a shared
@@ -215,8 +221,7 @@ test.describe("Apps v2 code splitting", () => {
 							`/api/solutions/deploy-jobs/${jobId}`,
 						);
 						const body = await response.json();
-						if (body.status === "failed")
-							throw new Error(body.error);
+						if (body.status === "failed") throw new Error(body.error);
 						return body.status;
 					},
 					{ timeout: 60_000 },
@@ -237,6 +242,32 @@ test.describe("Apps v2 code splitting", () => {
 			});
 			expect(entryRequests).toHaveLength(1);
 			expect(entryRequests[0]).not.toContain("?");
+
+			// An internal app URL change must not tear down and remount the v2 root.
+			// The host route still matches /apps/:slug/*, so the app owns this
+			// navigation and its runtime must remain continuous.
+			await page.getByTestId("v2-internal-route").click();
+			await expect(page).toHaveURL(
+				new RegExp(`/apps/${APP_SLUG}/details$`),
+			);
+			await expect(page.getByTestId("v2-details")).toHaveText(
+				"Details rendered",
+			);
+			expect(await page.evaluate(() => window.__v2LazyFixture)).toEqual({
+				entryExecutions: 1,
+				mounts: 1,
+				unmounts: 0,
+			});
+			await page.goBack();
+			await expect(page).toHaveURL(new RegExp(`/apps/${APP_SLUG}/?$`));
+			await expect(page.getByTestId("lazy-page")).toHaveText(
+				"Lazy chunk rendered",
+			);
+			expect(await page.evaluate(() => window.__v2LazyFixture)).toEqual({
+				entryExecutions: 1,
+				mounts: 1,
+				unmounts: 0,
+			});
 
 			// Leave and re-enter through the host SPA: the module stays evaluated once,
 			// while mount() and its returned teardown run for each visit.
@@ -317,7 +348,8 @@ test.describe("Apps v2 code splitting", () => {
 							`/api/solutions/deploy-jobs/${jobId}`,
 						);
 						const body = await job.json();
-						if (body.status === "failed") throw new Error(body.error);
+						if (body.status === "failed")
+							throw new Error(body.error);
 						return body.status;
 					},
 					{ timeout: 60_000 },
@@ -402,7 +434,10 @@ test.describe("Apps v2 code splitting", () => {
 				)
 				.toBe("rgb(219, 234, 254)");
 
-			expect(staleEntryFailures).toBe(1);
+			// The shell's modulepreload and the module script each request the
+			// stale entry once (a failed preload is not cached). Recovery then
+			// reads the manifest once and never requests the stale entry again.
+			expect(staleEntryFailures).toBe(2);
 			expect(manifestRequests).toBe(2);
 			expect(documentLoads).toBe(1);
 			await page.screenshot({

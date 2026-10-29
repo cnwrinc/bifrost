@@ -77,6 +77,7 @@ export function useDynamicValues(
 	adapterName: string | undefined,
 	operation: string | undefined,
 	integrationId: string | undefined,
+	organizationId: string | null | undefined,
 	currentConfig: Record<string, unknown>,
 	enabled = true,
 ) {
@@ -90,6 +91,7 @@ export function useDynamicValues(
 			body: {
 				operation: operation!,
 				integration_id: integrationId || undefined,
+				organization_id: organizationId || undefined,
 				current_config: currentConfig,
 			},
 		},
@@ -195,6 +197,59 @@ export function useDeleteEventSource() {
 			});
 		},
 	});
+}
+
+function invalidateEventSource(
+	queryClient: ReturnType<typeof useQueryClient>,
+	sourceId: string,
+) {
+	queryClient.invalidateQueries({
+		queryKey: ["get", "/api/events/sources"],
+	});
+	queryClient.invalidateQueries({
+		queryKey: [
+			"get",
+			"/api/events/sources/{source_id}",
+			{ params: { path: { source_id: sourceId } } },
+		],
+	});
+}
+
+/** Replace an event source's registration with its external provider. */
+export function useResubscribeEventSource() {
+	const queryClient = useQueryClient();
+
+	return $api.useMutation(
+		"post",
+		"/api/events/sources/{source_id}/resubscribe",
+		{
+			onSuccess: (_, variables) =>
+				invalidateEventSource(
+					queryClient,
+					variables.params.path.source_id,
+				),
+		},
+	);
+}
+
+/**
+ * Replace a webhook source's signing secret. The response's `raw_secret` is
+ * the only time the new secret is shown; no read returns it.
+ */
+export function useRotateWebhookSecret() {
+	const queryClient = useQueryClient();
+
+	return $api.useMutation(
+		"post",
+		"/api/events/sources/{source_id}/rotate-secret",
+		{
+			onSuccess: (_, variables) =>
+				invalidateEventSource(
+					queryClient,
+					variables.params.path.source_id,
+				),
+		},
+	);
 }
 
 // ============================================================================

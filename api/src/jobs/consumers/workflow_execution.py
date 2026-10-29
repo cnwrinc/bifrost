@@ -1,15 +1,15 @@
 """
 Workflow Execution Consumer
 
-Processes async workflow executions from RabbitMQ queue.
+Runs the workflow dispatches an executor claimed from PostgreSQL.
 
-Architecture (Redis-first):
-1. API stores pending execution in Redis, publishes to RabbitMQ
-2. Consumer reads pending execution from Redis
-3. Consumer creates PostgreSQL record when starting
-4. Consumer routes execution to ProcessPoolManager
-5. ProcessPoolManager executes in worker process, returns result via callback
-6. Consumer handles result: updates DB, flushes logs, cleans up Redis
+Architecture (PostgreSQL-durable with Redis acceleration):
+1. API accepts the run: a PENDING execution row and its dispatch
+2. An executor claims the dispatch and the run (PENDING -> RUNNING) in one
+   transaction, taking the run's context from the dispatch
+3. Consumer routes execution with a compact, parent-owned Redis lease
+4. ProcessPoolManager refreshes that lease while its child remains active
+5. Consumer records the result from the lease or reconstructs it from PostgreSQL
 
 For sync execution requests (sync=True in message):
 - Pushes result to Redis after completion
@@ -23,24 +23,37 @@ Execution Model:
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.database import get_db_context
 from src.core.pubsub import publish_execution_update, publish_history_update
-from src.core.redis_client import get_redis_client
-from src.jobs.rabbitmq import BaseConsumer
+from src.core.redis_client import ActiveExecution, PendingExecution, get_redis_client
+from src.models.enums import ExecutionStatus
+from src.models.orm import Execution, User
+from src.repositories.executions import create_execution, update_execution
+
+if TYPE_CHECKING:
+    from src.services.execution.process_pool import ProcessPoolManager
 
 logger = logging.getLogger(__name__)
 
-# Queue name
-QUEUE_NAME = "workflow-executions"
+# Sync callers are already awake when derived terminal work begins. A short
+# grace lets sibling authoritative result commits finish before shared daily
+# and ROI aggregate rows are updated.
+_SYNC_DERIVED_WORK_GRACE_SECONDS = 0.025
 
 
-class WorkflowExecutionConsumer(BaseConsumer):
+class WorkflowExecutionConsumer:
     """
-    Consumer for workflow execution queue.
+    Runs claimed workflow dispatches in the executor's process pool.
 
-    Message format (minimal - context is in Redis):
+    Message format (the dispatch's message; the context is the claimed run):
     {
         "execution_id": "uuid",
         "workflow_id": "uuid" (optional, for workflow execution),
@@ -48,53 +61,37 @@ class WorkflowExecutionConsumer(BaseConsumer):
         "script_name": "name" (optional, for inline scripts),
         "sync": false (optional, if true pushes result to Redis for API)
     }
-
-    Full execution context is read from Redis pending execution.
     """
 
-    def __init__(self):
-        from src.config import get_settings
-        from src.services.execution.process_pool import get_process_pool
+    # The executor incarnation this consumer writes results for: a result is
+    # written only while that executor still holds the run.
+    owner_worker_id: UUID | None = None
 
-        settings = get_settings()
-        super().__init__(
-            queue_name=QUEUE_NAME,
-            prefetch_count=settings.max_concurrency,
-        )
+    def __init__(self, pool: ProcessPoolManager | None = None):
         self._redis_client = get_redis_client()
 
-        # Get the global ProcessPoolManager instance
-        # This ensures package_install consumer can also update it
-        self._pool = get_process_pool()
-        # Set the result callback on the global pool
+        # Default to the process-wide manager so package installation keeps
+        # updating the same pool; API hosts may supply their canonical pool.
+        if pool is None:
+            from src.services.execution.process_pool import get_process_pool
+
+            pool = get_process_pool()
+        self._pool = pool
+        # Set the result callback on the selected pool.
         self._pool.on_result = self._handle_result
         self._pool_started = False
 
-    async def start(self) -> None:
-        """Start the process pool, then begin consuming messages.
-
-        The pool must be fully ready (including the template process) before
-        RabbitMQ can deliver work — otherwise route_execution would run while
-        the template is still starting, and there would be no valid way to
-        create worker processes for incoming messages.
-        """
+    async def start_pool(self) -> None:
+        """Start the process pool (and its template process)."""
         await self._pool.start()
         self._pool_started = True
         logger.info("Process pool started")
 
-        # Only now begin accepting messages from RabbitMQ.
-        await super().start()
-
-    async def stop(self) -> None:
-        """Stop the consumer and process pool."""
-        # Stop process pool
+    async def stop_pool(self) -> None:
         if self._pool_started:
             await self._pool.stop()
             self._pool_started = False
             logger.info("Process pool stopped")
-
-        # Call parent stop
-        await super().stop()
 
     async def _handle_result(self, result: dict[str, Any]) -> None:
         """
@@ -116,6 +113,173 @@ class WorkflowExecutionConsumer(BaseConsumer):
             logger.error(f"Failed to process result for {execution_id}: {e}")
             raise
 
+    async def _load_completion_metadata(
+        self,
+        execution_id: str,
+        session: AsyncSession | None = None,
+    ) -> tuple[ActiveExecution | None, bool]:
+        """Load compact metadata, rebuilding it from PostgreSQL if Redis lost it.
+
+        Returns the metadata and whether PostgreSQL recovery was required. The
+        recovery bit lets callers reconcile event delivery defensively because
+        the durable execution row does not retain the triggering event payload.
+        """
+        try:
+            active = await self._redis_client.get_active_execution(execution_id)
+        except Exception as exc:  # noqa: BLE001 - PostgreSQL is the fallback
+            logger.warning(
+                "Could not read active execution lease for %s: %s",
+                execution_id,
+                exc,
+            )
+            active = None
+
+        if active is not None:
+            return active, False
+
+        if session is None:
+            from src.core.database import get_session_factory
+
+            session_factory = get_session_factory()
+            async with session_factory() as recovery_session:
+                return await self._load_completion_metadata_from_database(
+                    execution_id, recovery_session
+                )
+
+        return await self._load_completion_metadata_from_database(
+            execution_id, session
+        )
+
+    async def _load_completion_metadata_from_database(
+        self,
+        execution_id: str,
+        session: AsyncSession,
+    ) -> tuple[ActiveExecution | None, bool]:
+        """Reconstruct terminal bookkeeping metadata from its durable row."""
+
+        row = (
+            await session.execute(
+                select(Execution, User.email)
+                .outerjoin(User, Execution.executed_by == User.id)
+                .where(
+                    Execution.id == UUID(execution_id),
+                    Execution.status.in_(
+                        [ExecutionStatus.RUNNING, ExecutionStatus.CANCELLING]
+                    ),
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None, True
+
+        execution, user_email = row
+        return (
+            ActiveExecution(
+                execution_id=str(execution.id),
+                workflow_id=(
+                    str(execution.workflow_id) if execution.workflow_id else None
+                ),
+                workflow_name=execution.workflow_name,
+                org_id=(
+                    str(execution.organization_id)
+                    if execution.organization_id
+                    else None
+                ),
+                user_id=(str(execution.executed_by) if execution.executed_by else None),
+                user_name=execution.executed_by_name,
+                user_email=user_email,
+                sync=False,
+                event=None,
+            ),
+            True,
+        )
+
+    async def _record_completion_metrics(
+        self,
+        *,
+        workflow_id: str | None,
+        org_id: str | None,
+        status: str,
+        duration_ms: int,
+        peak_memory_bytes: int | None = None,
+        cpu_total_seconds: float | None = None,
+        time_saved: int = 0,
+        value: float = 0.0,
+        include_workflow_roi: bool = False,
+    ) -> None:
+        """Persist derived aggregates outside the authoritative result commit.
+
+        Daily and workflow aggregates intentionally share rows across many
+        executions. PostgreSQL serializes their atomic increments, so keeping
+        them in the authoritative completion transaction makes concurrent sync
+        callers wait behind unrelated aggregate bookkeeping. The execution
+        record, buffered SDK writes, and captured logs are committed before
+        this method is called.
+
+        Aggregate failures have never been allowed to fail an execution. Keep
+        that contract here while ensuring the short-lived metrics transaction
+        is independently committed or rolled back.
+        """
+        from src.core.database import get_session_factory
+        from src.core.metrics import update_daily_metrics, update_workflow_roi_daily
+
+        try:
+            session_factory = get_session_factory()
+            async with session_factory() as session:
+                await update_daily_metrics(
+                    org_id=org_id,
+                    status=status,
+                    duration_ms=duration_ms,
+                    peak_memory_bytes=peak_memory_bytes,
+                    cpu_total_seconds=cpu_total_seconds,
+                    time_saved=time_saved,
+                    value=value,
+                    workflow_id=workflow_id,
+                    db=session,
+                )
+
+                if include_workflow_roi and workflow_id:
+                    await update_workflow_roi_daily(
+                        workflow_id=workflow_id,
+                        org_id=org_id,
+                        status=status,
+                        time_saved=time_saved,
+                        value=value,
+                        db=session,
+                    )
+
+                await session.commit()
+        except Exception as e:
+            logger.warning(
+                "Failed to update derived metrics for %s: %s",
+                workflow_id or "inline execution",
+                e,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _drop_fenced_result(execution_id: str) -> None:
+        logger.warning(
+            "Dropped the result of a run this executor no longer holds "
+            "(it was declared lost and the run already ended)",
+            extra={"execution_id": execution_id},
+        )
+
+    @staticmethod
+    async def _read_persisted_completion_timing(
+        session: AsyncSession,
+        execution_id: str,
+    ) -> tuple[datetime | None, datetime | None]:
+        """Read timing written by the authoritative terminal-status update."""
+        started_at, completed_at = (
+            await session.execute(
+                select(Execution.started_at, Execution.completed_at).where(
+                    Execution.id == UUID(execution_id)
+                )
+            )
+        ).one()
+        return started_at, completed_at
+
     async def _process_success(
         self,
         execution_id: str,
@@ -128,25 +292,28 @@ class WorkflowExecutionConsumer(BaseConsumer):
         DB sessions are short-lived — Redis and pub/sub happen outside sessions.
         """
         from src.core.database import get_session_factory
-        from src.core.metrics import update_daily_metrics, update_workflow_roi_daily
-        from src.models.enums import ExecutionStatus
-        from src.repositories.executions import update_execution
 
+        completion_started = time.perf_counter()
         workflow_result = result.get("result")
         duration_ms = result.get("duration_ms", 0)
 
-        # Redis read — no DB connection held
-        pending = await self._redis_client.get_pending_execution(execution_id)
-        if not pending:
-            logger.warning(f"No pending record found for result: {execution_id}")
+        metadata, recovered_from_database = await self._load_completion_metadata(
+            execution_id
+        )
+        if metadata is None:
+            logger.error(
+                "No active lease or durable execution row found for result: %s",
+                execution_id,
+            )
             return
+        metadata_read_ms = (time.perf_counter() - completion_started) * 1000
 
-        workflow_id = pending.get("workflow_id")
-        workflow_name = pending.get("workflow_name", "unknown")
-        org_id = pending.get("org_id")
-        user_id = pending.get("user_id")
-        user_name = pending.get("user_name")
-        is_sync = pending.get("sync", False)
+        workflow_id = metadata.get("workflow_id")
+        workflow_name = metadata.get("workflow_name", "unknown")
+        org_id = metadata.get("org_id")
+        user_id = metadata.get("user_id")
+        user_name = metadata.get("user_name")
+        is_sync = result["sync"]
 
         status_str = result.get("status", "Success")
         status = (
@@ -158,12 +325,15 @@ class WorkflowExecutionConsumer(BaseConsumer):
         roi_data = result.get("roi") or {}
         roi_time_saved = roi_data.get("time_saved", 0)
         roi_value = roi_data.get("value", 0.0)
+        started_at: datetime | None = None
+        completed_at: datetime | None = None
+        log_receipt = None
 
-        # DB operations + flush — single short-lived session
-        # (flush functions do Redis reads internally but DB writes share the session)
+        # DB operations and log flush — single short-lived session
+        # (log flush reads Redis internally but DB writes share the session)
         session_factory = get_session_factory()
         async with session_factory() as session:
-            await update_execution(
+            written = await update_execution(
                 execution_id=execution_id,
                 status=status,
                 result=workflow_result,
@@ -176,58 +346,48 @@ class WorkflowExecutionConsumer(BaseConsumer):
                 time_saved=roi_time_saved,
                 value=roi_value,
                 session=session,
+                owner_worker_id=self.owner_worker_id,
             )
+            if not written:
+                await session.rollback()
+                self._drop_fenced_result(execution_id)
+                return
+            execution_update_ms = (time.perf_counter() - completion_started) * 1000
+
+            if metadata.get("event") is not None or recovered_from_database:
+                try:
+                    from src.services.events.processor import update_delivery_from_execution
+                    await update_delivery_from_execution(
+                        execution_id, status.value, session=session
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to update event delivery for {execution_id[:8]}...: {e}"
+                    )
 
             try:
-                from src.services.events.processor import update_delivery_from_execution
-                await update_delivery_from_execution(execution_id, status.value, session=session)
+                from bifrost._logging import stage_logs_to_postgres
+
+                # Redis is authoritative for worker-side logs. Inspect it even
+                # when the result payload has no in-memory log list, then only
+                # acknowledge its receipt after this transaction commits.
+                log_receipt = await stage_logs_to_postgres(execution_id, session)
+                if log_receipt.count:
+                    logger.debug("Staged %d logs for %s", log_receipt.count, execution_id[:8])
             except Exception as e:
-                logger.warning(f"Failed to update event delivery for {execution_id[:8]}...: {e}")
+                logger.warning(f"Failed to stage logs for {execution_id[:8]}...: {e}")
+            logs_flushed_ms = (time.perf_counter() - completion_started) * 1000
 
-            # Flush pending changes and logs (Redis read + DB write in same session)
-            try:
-                from bifrost._sync import flush_pending_changes
-                changes_count = await flush_pending_changes(execution_id, session=session)
-                if changes_count > 0:
-                    logger.info(f"Flushed {changes_count} pending changes for {execution_id[:8]}...")
-            except Exception as e:
-                logger.warning(f"Failed to flush pending changes for {execution_id[:8]}...: {e}")
-
-            try:
-                from bifrost._logging import flush_logs_to_postgres
-                logs_count = await flush_logs_to_postgres(execution_id, session=session)
-                if logs_count > 0:
-                    logger.debug(f"Flushed {logs_count} logs for {execution_id[:8]}...")
-            except Exception as e:
-                logger.warning(f"Failed to flush logs for {execution_id[:8]}...: {e}")
-
-            metrics_data = result.get("metrics") or {}
-            await update_daily_metrics(
-                org_id=org_id,
-                status=status.value,
-                duration_ms=duration_ms,
-                peak_memory_bytes=metrics_data.get("peak_memory_bytes"),
-                cpu_total_seconds=metrics_data.get("cpu_total_seconds"),
-                time_saved=roi_time_saved,
-                value=roi_value,
-                workflow_id=workflow_id,
-                db=session,
-            )
-
-            if workflow_id:
-                await update_workflow_roi_daily(
-                    workflow_id=workflow_id,
-                    org_id=org_id,
-                    status=status.value,
-                    time_saved=roi_time_saved,
-                    value=roi_value,
-                    db=session,
+            if status == ExecutionStatus.SUCCESS:
+                started_at, completed_at = await self._read_persisted_completion_timing(
+                    session, execution_id
                 )
 
             await session.commit()
+        durable_ms = (time.perf_counter() - completion_started) * 1000
 
-        # Wake sync callers as soon as their result and buffered SDK writes are
-        # durably committed.  Everything below is terminal-event fan-out or
+        # Wake sync callers as soon as their result is durably committed.
+        # Everything below is terminal-event fan-out or
         # cleanup and must not add latency to the request/response path.
         if is_sync:
             await self._redis_client.push_result(
@@ -238,6 +398,54 @@ class WorkflowExecutionConsumer(BaseConsumer):
                 error_type=result.get("error_type"),
                 duration_ms=duration_ms,
             )
+        result_ready_ms = (time.perf_counter() - completion_started) * 1000
+
+        if is_sync:
+            await asyncio.sleep(_SYNC_DERIVED_WORK_GRACE_SECONDS)
+
+        if log_receipt is not None:
+            from bifrost._logging import acknowledge_staged_logs, recover_terminal_execution_logs
+
+            await acknowledge_staged_logs(log_receipt)
+            try:
+                await recover_terminal_execution_logs([execution_id], limit=1)
+            except Exception as e:
+                logger.warning(f"Failed terminal log recovery for {execution_id[:8]}...: {e}")
+
+        # This is deliberately after the authoritative execution commit and
+        # sync wakeup, before unrelated fan-out. Built-in event emission is
+        # best effort, matching workflow.failed: a crash in this gap can omit
+        # the event while preserving the durable execution result.
+        if status == ExecutionStatus.SUCCESS and completed_at is not None:
+            from src.services.events.builtins import emit_workflow_completed_event
+
+            await emit_workflow_completed_event(
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                execution_id=execution_id,
+                organization_id=org_id,
+                user_id=user_id,
+                user_email=metadata.get("user_email"),
+                user_name=user_name,
+                started_at=started_at,
+                completed_at=completed_at,
+                duration_ms=duration_ms,
+                trigger_event=metadata.get("event"),
+            )
+
+        metrics_data = result.get("metrics") or {}
+        await self._record_completion_metrics(
+            workflow_id=workflow_id,
+            org_id=org_id,
+            status=status.value,
+            duration_ms=duration_ms,
+            peak_memory_bytes=metrics_data.get("peak_memory_bytes"),
+            cpu_total_seconds=metrics_data.get("cpu_total_seconds"),
+            time_saved=roi_time_saved,
+            value=roi_value,
+            include_workflow_roi=True,
+        )
+        metrics_done_ms = (time.perf_counter() - completion_started) * 1000
 
         # Pub/sub — no DB connection held.  The result is already persisted and
         # execution clients fetch it from the result endpoint, so publishing it
@@ -249,7 +457,6 @@ class WorkflowExecutionConsumer(BaseConsumer):
             {"duration_ms": duration_ms},
         )
 
-        completed_at = datetime.now(timezone.utc)
         await publish_history_update(
             execution_id=execution_id,
             status=status.value,
@@ -257,7 +464,7 @@ class WorkflowExecutionConsumer(BaseConsumer):
             executed_by_name=user_name,
             workflow_name=workflow_name,
             org_id=org_id,
-            completed_at=completed_at,
+            completed_at=completed_at or datetime.now(timezone.utc),
             duration_ms=duration_ms,
         )
 
@@ -268,7 +475,19 @@ class WorkflowExecutionConsumer(BaseConsumer):
         except Exception as e:
             logger.warning(f"Failed to cleanup cache for {execution_id[:8]}...: {e}")
 
-        await self._redis_client.delete_pending_execution(execution_id)
+        logger.debug(
+            "Completion timing %s: metadata=%.1fms execution_update=%.1fms "
+            "logs=%.1fms durable=%.1fms result_ready=%.1fms "
+            "metrics=%.1fms total=%.1fms",
+            execution_id[:8],
+            metadata_read_ms,
+            execution_update_ms,
+            logs_flushed_ms,
+            durable_ms,
+            result_ready_ms,
+            metrics_done_ms,
+            (time.perf_counter() - completion_started) * 1000,
+        )
 
         logger.info(
             f"Execution result processed: {execution_id[:8]}... status={status.value}",
@@ -293,27 +512,28 @@ class WorkflowExecutionConsumer(BaseConsumer):
         DB sessions are short-lived — Redis and pub/sub happen outside sessions.
         """
         from src.core.database import get_session_factory
-        from src.core.metrics import update_daily_metrics
-        from src.models.enums import ExecutionStatus
-        from src.repositories.executions import update_execution
 
         error = result.get("error", "Unknown error")
         error_type = result.get("error_type", "ExecutionError")
         duration_ms = result.get("duration_ms", 0)
 
-        # Redis read — no DB connection held
-        pending = await self._redis_client.get_pending_execution(execution_id)
-        if not pending:
-            logger.warning(f"No pending record found for failed result: {execution_id}")
+        metadata, recovered_from_database = await self._load_completion_metadata(
+            execution_id
+        )
+        if metadata is None:
+            logger.error(
+                "No active lease or durable execution row found for failed result: %s",
+                execution_id,
+            )
             return
 
-        workflow_id = pending.get("workflow_id")
-        workflow_name = pending.get("workflow_name", "unknown")
-        org_id = pending.get("org_id")
-        user_id = pending.get("user_id")
-        user_email = pending.get("user_email")
-        user_name = pending.get("user_name")
-        is_sync = pending.get("sync", False)
+        workflow_id = metadata.get("workflow_id")
+        workflow_name = metadata.get("workflow_name", "unknown")
+        org_id = metadata.get("org_id")
+        user_id = metadata.get("user_id")
+        user_email = metadata.get("user_email")
+        user_name = metadata.get("user_name")
+        is_sync = result["sync"]
 
         if error_type == "TimeoutError":
             status = ExecutionStatus.TIMEOUT
@@ -321,52 +541,90 @@ class WorkflowExecutionConsumer(BaseConsumer):
             status = ExecutionStatus.CANCELLED
         else:
             status = ExecutionStatus.FAILED
+        log_receipt = None
 
-        # DB operations + flush — single short-lived session
+        # DB operations and log flush — single short-lived session
         session_factory = get_session_factory()
         async with session_factory() as session:
-            await update_execution(
+            # Forward resource metrics when the pool reports them (timeout,
+            # crash, and engine-error results can still carry memory/CPU
+            # samples). Failed executions are the highest-memory samples, so
+            # dropping them here would bias any future lane-sizing data low.
+            failure_metrics = result.get("metrics")
+            written = await update_execution(
                 execution_id=execution_id,
                 status=status,
                 error_message=error,
                 error_type=error_type,
                 duration_ms=duration_ms,
+                metrics=failure_metrics,
                 session=session,
+                owner_worker_id=self.owner_worker_id,
             )
+            if not written:
+                await session.rollback()
+                self._drop_fenced_result(execution_id)
+                return
+
+            if metadata.get("event") is not None or recovered_from_database:
+                try:
+                    from src.services.events.processor import update_delivery_from_execution
+                    await update_delivery_from_execution(
+                        execution_id,
+                        status.value,
+                        error_message=error,
+                        session=session,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to update event delivery for {execution_id[:8]}...: {e}"
+                    )
 
             try:
-                from src.services.events.processor import update_delivery_from_execution
-                await update_delivery_from_execution(
-                    execution_id, status.value, error_message=error, session=session
-                )
-            except Exception as e:
-                logger.warning(f"Failed to update event delivery for {execution_id[:8]}...: {e}")
+                from bifrost._logging import stage_logs_to_postgres
 
-            try:
-                from bifrost._sync import flush_pending_changes
-                changes_count = await flush_pending_changes(execution_id, session=session)
-                if changes_count > 0:
-                    logger.info(f"Flushed {changes_count} pending changes for failed {execution_id[:8]}...")
+                log_receipt = await stage_logs_to_postgres(execution_id, session)
+                if log_receipt.count:
+                    logger.debug(
+                        "Staged %d logs for failed %s", log_receipt.count, execution_id[:8]
+                    )
             except Exception as e:
-                logger.warning(f"Failed to flush pending changes for {execution_id[:8]}...: {e}")
-
-            try:
-                from bifrost._logging import flush_logs_to_postgres
-                logs_count = await flush_logs_to_postgres(execution_id, session=session)
-                if logs_count > 0:
-                    logger.debug(f"Flushed {logs_count} logs for failed {execution_id[:8]}...")
-            except Exception as e:
-                logger.warning(f"Failed to flush logs for {execution_id[:8]}...: {e}")
-
-            await update_daily_metrics(
-                org_id=org_id,
-                status=status.value,
-                duration_ms=duration_ms,
-                workflow_id=workflow_id,
-                db=session,
-            )
+                logger.warning(f"Failed to stage logs for {execution_id[:8]}...: {e}")
 
             await session.commit()
+
+        # A sync failure is just as latency-sensitive as a success. Wake the
+        # caller once the authoritative failure is durable; aggregates and
+        # terminal fan-out are derived follow-up work.
+        if is_sync:
+            await self._redis_client.push_result(
+                execution_id=execution_id,
+                status=status.value,
+                error=error,
+                error_type=error_type,
+                duration_ms=duration_ms,
+            )
+
+            await asyncio.sleep(_SYNC_DERIVED_WORK_GRACE_SECONDS)
+
+        if log_receipt is not None:
+            from bifrost._logging import acknowledge_staged_logs, recover_terminal_execution_logs
+
+            await acknowledge_staged_logs(log_receipt)
+            try:
+                await recover_terminal_execution_logs([execution_id], limit=1)
+            except Exception as e:
+                logger.warning(f"Failed terminal log recovery for {execution_id[:8]}...: {e}")
+
+        failure_metrics = result.get("metrics") or {}
+        await self._record_completion_metrics(
+            workflow_id=workflow_id,
+            org_id=org_id,
+            status=status.value,
+            duration_ms=duration_ms,
+            peak_memory_bytes=failure_metrics.get("peak_memory_bytes"),
+            cpu_total_seconds=failure_metrics.get("cpu_total_seconds"),
+        )
 
         # Pub/sub — no DB connection held
         await publish_execution_update(
@@ -394,17 +652,6 @@ class WorkflowExecutionConsumer(BaseConsumer):
         except Exception as e:
             logger.warning(f"Failed to cleanup cache for {execution_id[:8]}...: {e}")
 
-        await self._redis_client.delete_pending_execution(execution_id)
-
-        if is_sync:
-            await self._redis_client.push_result(
-                execution_id=execution_id,
-                status=status.value,
-                error=error,
-                error_type=error_type,
-                duration_ms=duration_ms,
-            )
-
         logger.warning(
             f"Execution failed: {execution_id[:8]}... status={status.value} error={error_type}",
             extra={
@@ -430,41 +677,64 @@ class WorkflowExecutionConsumer(BaseConsumer):
             error_type=error_type,
             error_message=error,
             status=status.value,
-            trigger_event=pending.get("event"),
+            trigger_event=metadata.get("event"),
         )
 
-    async def process_message(self, message_data: dict[str, Any]) -> None:
-        """Process a workflow execution message."""
-        from src.core.database import get_db_context
-        from src.services.execution.queue_tracker import remove_from_queue
+    async def process_message(
+        self,
+        message_data: dict[str, Any],
+        claimed: PendingExecution | None,
+    ) -> None:
+        """Run a claimed workflow dispatch.
 
+        ``claimed`` is the context of the run the executor claimed (PENDING ->
+        RUNNING) in its claim transaction, or None when the run had already
+        moved on (cancelled): the dispatch is then discarded.
+        """
+        from src.services.execution.queue_tracker import publish_queue_positions
+
+        dispatch_started = time.perf_counter()
         execution_id = message_data.get("execution_id", "")
         workflow_id = message_data.get("workflow_id")
         code_base64 = message_data.get("code")
         script_name = message_data.get("script_name")
         is_sync = message_data.get("sync", False)
+        dispatch_metadata = message_data.get("dispatch_metadata")
         file_path: str | None = None  # Will be set from workflow metadata lookup
         start_time = datetime.now(timezone.utc)
 
-        # Remove from queue tracking (execution is now being processed)
-        await remove_from_queue(execution_id)
-
-        # Read execution context from Redis
-        pending = await self._redis_client.get_pending_execution(execution_id)
-
-        if pending is None:
-            logger.error(f"No pending execution found in Redis: {execution_id}")
-            if is_sync:
-                await self._redis_client.push_result(
-                    execution_id=execution_id,
-                    status="Failed",
-                    error="Pending execution not found in Redis",
-                    error_type="PendingNotFound",
-                    duration_ms=0,
+        # Sync executions never enter the UI queue tracker: their HTTP caller
+        # waits on a private Redis result list while pool admission remains
+        # fully enforced.
+        if not is_sync:
+            # PostgreSQL already owns this claim. Queue notifications must not
+            # strand it before a child starts when publication is unavailable.
+            try:
+                await publish_queue_positions()
+            except Exception:
+                logger.warning(
+                    "Could not update execution queue tracking",
+                    extra={"execution_id": execution_id},
+                    exc_info=True,
                 )
-            return
 
-        # Extract context from Redis pending record
+        if claimed is None:
+            logger.info(
+                "Discarding dispatch whose run was not pending",
+                extra={"execution_id": execution_id},
+            )
+            if is_sync:
+                from src.services.execution.workflow_dispatch import (
+                    notify_discarded_sync_run,
+                )
+
+                async with get_db_context() as db:
+                    await notify_discarded_sync_run(db, UUID(execution_id))
+            return
+        pending = claimed
+        pending_ready_ms = (time.perf_counter() - dispatch_started) * 1000
+
+        # Extract context from the claimed run.
         parameters = pending["parameters"]
         org_id = pending["org_id"]
         user_id = pending["user_id"]
@@ -477,6 +747,8 @@ class WorkflowExecutionConsumer(BaseConsumer):
         embed = pending.get("embed", {})
         event_data = pending.get("event")  # EventContext dict if event-triggered
         artifact_workspace_id = pending.get("artifact_workspace_id")
+        lineage = pending.get("lineage")
+        impersonation_provenance = pending.get("impersonation_provenance")
 
         # Determine if this is a code or workflow execution
         is_script = bool(code_base64)
@@ -492,53 +764,6 @@ class WorkflowExecutionConsumer(BaseConsumer):
                     "execution_model": "process",
                 },
             )
-
-            from src.models.enums import ExecutionStatus
-            from src.repositories.executions import (
-                create_execution,
-                update_execution,
-            )
-
-            # Check if execution was cancelled in Redis before we started
-            if pending.get("cancelled", False):
-                logger.info(f"Execution {execution_id} was cancelled before starting")
-                await create_execution(
-                    execution_id=execution_id,
-                    workflow_name=script_name or "workflow",
-                    parameters=parameters,
-                    org_id=org_id,
-                    user_id=user_id,
-                    user_name=user_name,
-                    form_id=form_id,
-                    api_key_id=api_key_id,
-                    status=ExecutionStatus.CANCELLED,
-                    execution_model="process",
-                    workflow_id=workflow_id,
-                )
-                await update_execution(
-                    execution_id=execution_id,
-                    status=ExecutionStatus.CANCELLED,
-                    error_message="Execution was cancelled before it could start",
-                    duration_ms=0,
-                )
-                await publish_execution_update(execution_id, "Cancelled")
-                await publish_history_update(
-                    execution_id=execution_id,
-                    status="Cancelled",
-                    executed_by=user_id,
-                    executed_by_name=user_name,
-                    workflow_name=script_name or "workflow",
-                    org_id=org_id,
-                )
-                await self._redis_client.delete_pending_execution(execution_id)
-                if is_sync:
-                    await self._redis_client.push_result(
-                        execution_id=execution_id,
-                        status="Cancelled",
-                        error="Execution was cancelled before it could start",
-                        duration_ms=0,
-                    )
-                return
 
             # Get workflow metadata from database if this is a workflow execution
             workflow_name = script_name or "inline_script"
@@ -556,10 +781,18 @@ class WorkflowExecutionConsumer(BaseConsumer):
                 from src.services.execution.service import get_workflow_for_execution, WorkflowNotFoundError
 
                 try:
-                    # Get workflow metadata (no code — worker loads via Redis→S3)
-                    # Brief DB session for metadata read
-                    async with get_db_context() as db:
-                        workflow_data = await get_workflow_for_execution(workflow_id, db=db)
+                    if dispatch_metadata is None:
+                        # Non-HTTP producers may only carry an ID. Preserve the
+                        # hardened active-Solution lookup for those paths.
+                        async with get_db_context() as db:
+                            workflow_data = await get_workflow_for_execution(
+                                workflow_id,
+                                db=db,
+                            )
+                    else:
+                        # The HTTP route already performed this same hardened
+                        # lookup after authorization and before enqueueing.
+                        workflow_data = dispatch_metadata
                     workflow_name = workflow_data["name"]
                     workflow_function_name = workflow_data["function_name"]
                     file_path = workflow_data["path"]  # Used for __file__ injection and Redis/S3 loading
@@ -610,6 +843,9 @@ class WorkflowExecutionConsumer(BaseConsumer):
                         status=ExecutionStatus.FAILED,
                         execution_model="process",
                         workflow_id=workflow_id,
+                        check_existing=True,
+                        lineage=lineage,
+                        impersonation_provenance=impersonation_provenance,
                     )
                     await update_execution(
                         execution_id=execution_id,
@@ -627,7 +863,6 @@ class WorkflowExecutionConsumer(BaseConsumer):
                         org_id=org_id,
                         duration_ms=duration_ms,
                     )
-                    await self._redis_client.delete_pending_execution(execution_id)
                     if is_sync:
                         await self._redis_client.push_result(
                             execution_id=execution_id,
@@ -637,17 +872,7 @@ class WorkflowExecutionConsumer(BaseConsumer):
                             duration_ms=duration_ms,
                         )
                     return
-
-            # Store additional context in pending record for result handler
-            # (needed when pool reports results asynchronously)
-            await self._redis_client.update_pending_execution(
-                execution_id=execution_id,
-                updates={
-                    "workflow_name": workflow_name,
-                    "workflow_id": workflow_id,
-                    "org_id": org_id,  # Resolved scope for result handlers
-                },
-            )
+            metadata_ready_ms = (time.perf_counter() - dispatch_started) * 1000
 
             # Create PostgreSQL record with RUNNING status
             await create_execution(
@@ -662,17 +887,23 @@ class WorkflowExecutionConsumer(BaseConsumer):
                 status=ExecutionStatus.RUNNING,
                 execution_model="process",
                 workflow_id=workflow_id,
+                check_existing=True,
+                lineage=lineage,
+                impersonation_provenance=impersonation_provenance,
             )
-            await publish_execution_update(execution_id, "Running")
-            await publish_history_update(
-                execution_id=execution_id,
-                status="Running",
-                executed_by=user_id,
-                executed_by_name=user_name,
-                workflow_name=workflow_name,
-                org_id=org_id,
-                started_at=start_time,
-            )
+            execution_created_ms = (time.perf_counter() - dispatch_started) * 1000
+            if not is_sync:
+                await publish_execution_update(execution_id, "Running")
+                await publish_history_update(
+                    execution_id=execution_id,
+                    status="Running",
+                    executed_by=user_id,
+                    executed_by_name=user_name,
+                    workflow_name=workflow_name,
+                    org_id=org_id,
+                    started_at=start_time,
+                )
+            running_published_ms = (time.perf_counter() - dispatch_started) * 1000
 
             # Rehydrate the org from org_id (the enqueue boundary only carried
             # the scalar org_id, not the Organization object built API-side).
@@ -696,10 +927,14 @@ class WorkflowExecutionConsumer(BaseConsumer):
                     }
 
             # Mint engine token parent-side (consumer holds SECRET_KEY legitimately).
-            # The child receives the token via context_data and writes it to the
-            # credentials file directly — no SECRET_KEY needed in the child.
+            # The child receives it through context_data and installs it only in
+            # its one-shot process environment — no SECRET_KEY or persistent
+            # credential write is needed in the child.
             from src.core.security import mint_engine_token
-            engine_token, engine_token_expires_at = mint_engine_token()
+            engine_token, _ = mint_engine_token(
+                execution_id=execution_id,
+                timeout_seconds=timeout_seconds,
+            )
 
             # Build context for worker process
             context_data = {
@@ -733,10 +968,9 @@ class WorkflowExecutionConsumer(BaseConsumer):
                 "solution_id": solution_id,  # Install id if solution-managed (else None)
                 "solution_global_repo_access": solution_global_repo_access,
                 "artifact_workspace_id": artifact_workspace_id,
-                # Pre-minted engine token: child writes directly to credentials file,
-                # no SECRET_KEY required in child env.
+                # Pre-minted engine token: child uses process-scoped SDK
+                # credentials, with no SECRET_KEY in its environment.
                 "engine_token": engine_token,
-                "engine_token_expires_at": engine_token_expires_at,
             }
 
             # Route to process pool
@@ -744,24 +978,44 @@ class WorkflowExecutionConsumer(BaseConsumer):
             await self._pool.route_execution(
                 execution_id=execution_id,
                 context=context_data,
+                active_execution=ActiveExecution(
+                    execution_id=execution_id,
+                    workflow_id=str(workflow_id) if workflow_id else None,
+                    workflow_name=workflow_name,
+                    org_id=str(org_id) if org_id else None,
+                    user_id=str(user_id) if user_id else None,
+                    user_name=user_name,
+                    user_email=user_email,
+                    sync=is_sync,
+                    event=(
+                        {
+                            "id": event_data.get("id"),
+                            "type": event_data.get("type"),
+                        }
+                        if event_data
+                        else None
+                    ),
+                ),
+            )
+            logger.debug(
+                "Dispatch timing %s: pending=%.1fms metadata=%.1fms "
+                "execution_row=%.1fms running_events=%.1fms routed=%.1fms",
+                execution_id[:8],
+                pending_ready_ms,
+                metadata_ready_ms,
+                execution_created_ms,
+                running_published_ms,
+                (time.perf_counter() - dispatch_started) * 1000,
             )
             # Don't wait for result - pool will call back
 
         except asyncio.CancelledError:
             logger.info(f"Execution task {execution_id} was cancelled")
-            await self._redis_client.delete_pending_execution(execution_id)
             raise
 
-        except MemoryError as e:
-            # Admission rejected due to memory pressure — requeue for retry
-            logger.warning(
-                f"Admission rejected for {execution_id[:8]}: {e}. "
-                "Will requeue for retry."
-            )
-            # Don't mark as failed — the execution hasn't started yet.
-            # Clean up pending state so it can be re-routed.
-            await self._redis_client.delete_pending_execution(execution_id)
-            # Re-raise so the consumer framework NACKs with requeue=True
+        except MemoryError:
+            # The fork was refused before the run started; the executor hands
+            # the run back (pool_main) instead of failing it.
             raise
 
         except Exception as e:
@@ -770,9 +1024,6 @@ class WorkflowExecutionConsumer(BaseConsumer):
             completed_at = datetime.now(timezone.utc)
             error_msg = str(e)
             error_type = type(e).__name__
-
-            from src.models.enums import ExecutionStatus
-            from src.repositories.executions import update_execution
 
             await update_execution(
                 execution_id=execution_id,
@@ -799,8 +1050,6 @@ class WorkflowExecutionConsumer(BaseConsumer):
                 duration_ms=duration_ms,
             )
 
-            await self._redis_client.delete_pending_execution(execution_id)
-
             if is_sync:
                 await self._redis_client.push_result(
                     execution_id=execution_id,
@@ -821,4 +1070,3 @@ class WorkflowExecutionConsumer(BaseConsumer):
                 },
                 exc_info=True,
             )
-            raise

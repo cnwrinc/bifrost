@@ -253,9 +253,13 @@ def test_denied_read_emits_policy_deny_audit_row(
     assert entry["action"] == "policy.deny"
     assert entry["resource_type"] == "file"
     assert entry["outcome"] == "failure"
-    assert entry["details"]["policy_action"] == "read"
-    assert entry["details"]["location"] == location
-    assert entry["details"]["path"] == path
+    assert entry["details"] == {
+        "policy_action": "read",
+        "location": location,
+        "path": path,
+        "scope": scope,
+        "solution_id": None,
+    }
 
 
 @pytest.mark.e2e
@@ -286,9 +290,13 @@ def test_denied_write_emits_exactly_one_policy_deny_audit_row(
     assert entry["action"] == "policy.deny"
     assert entry["resource_type"] == "file"
     assert entry["outcome"] == "failure"
-    assert entry["details"]["policy_action"] == "write"
-    assert entry["details"]["location"] == location
-    assert entry["details"]["path"] == path
+    assert entry["details"] == {
+        "policy_action": "write",
+        "location": location,
+        "path": path,
+        "scope": scope,
+        "solution_id": None,
+    }
 
 
 @pytest.mark.e2e
@@ -480,13 +488,14 @@ async def test_everyone_read_role_write_creator_cross_org_and_nested_prefix_matr
     assert exists_allowed.status_code == 200
     assert exists_allowed.json()["exists"] is True
 
+    # An explicit foreign scope is rejected before the policy probe. The caller
+    # cannot use exists as a cross-organization discovery oracle.
     exists_denied = e2e_client.post(
         "/api/files/exists",
         headers=org2_user.headers,
         json=_read_body(role_path, location="temp", scope=org1["id"]),
     )
-    assert exists_denied.status_code == 200
-    assert exists_denied.json()["exists"] is False
+    assert exists_denied.status_code == 403
 
     delete_denied = e2e_client.post(
         "/api/files/delete",

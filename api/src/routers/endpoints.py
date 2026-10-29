@@ -12,8 +12,8 @@ Authentication:
 
 Architecture:
     - API never executes workflow code directly
-    - Sync execution: Queue to RabbitMQ, wait on Redis BLPOP for result
-    - Async execution: Queue to RabbitMQ, return immediately
+    - Sync execution: accept the run, wait on Redis BLPOP for the result
+    - Async execution: accept the run, return immediately
 """
 
 import logging
@@ -23,7 +23,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
-from src.core.constants import SYSTEM_USER_ID, SYSTEM_USER_EMAIL
+from shared.run_lineage import RunLineage, unattended_lineage
 from src.core.log_safety import log_safe
 from src.sdk.context import ExecutionContext
 from src.core.database import get_db_context
@@ -85,7 +85,8 @@ async def execute_endpoint(
     This is the main entry point for external integrations to trigger workflows.
     Uses X-Bifrost-Key header for authentication instead of user JWT.
 
-    The workflow must have `endpoint_enabled=True` in its decorator.
+    The persisted workflow record must have endpoint access enabled. Endpoint
+    settings are managed through the workflow UI/API, not the decorator.
 
     Args:
         workflow_id: UUID of the workflow to execute
@@ -133,6 +134,9 @@ async def execute_endpoint(
 
         logger.debug(f"API key validated for workflow: {log_safe(workflow_id)} (key_id: {key_id})")
 
+        # No person started this run: it is for the workflow's identity.
+        lineage = await unattended_lineage(db, wf_uuid)
+
         # If no cache hit, load from DB and module
         if workflow_metadata is None:
             logger.debug(f"Cache miss for endpoint workflow: {log_safe(workflow_id)}")
@@ -172,6 +176,14 @@ async def execute_endpoint(
                 allowed_methods=workflow_metadata.allowed_methods,
             )
 
+    from shared.unattended_execution import create_unattended_context
+
+    async with get_db_context() as db:
+        context = await create_unattended_context(
+            db, lineage=lineage, execution_id=str(uuid4()),
+            workflow_name=workflow_id, is_function_key=True,
+        )
+
     # Check HTTP method
     http_method = request.method
     if http_method not in workflow_metadata.allowed_methods:
@@ -192,22 +204,6 @@ async def execute_endpoint(
     except Exception:
         pass  # No JSON body or invalid JSON
 
-    # Create execution context using system user (API key executions)
-    from src.config import get_settings
-
-    context = ExecutionContext(
-        user_id=SYSTEM_USER_ID,
-        name="API Key",
-        email=SYSTEM_USER_EMAIL,
-        scope="GLOBAL",
-        organization=None,
-        is_platform_admin=False,
-        is_function_key=True,
-        execution_id=str(uuid4()),
-        workflow_name=workflow_id,  # Workflow ID for context
-        public_url=get_settings().public_url,
-    )
-
     # Check execution mode
     if workflow_metadata.execution_mode == "async":
         return await _execute_async(
@@ -217,6 +213,7 @@ async def execute_endpoint(
             input_data=input_data,
             api_key_id=workflow_metadata.workflow_id,
             file_path=workflow_metadata.file_path,
+            lineage=lineage,
         )
 
     # Execute synchronously
@@ -228,6 +225,7 @@ async def execute_endpoint(
         timeout_seconds=workflow_metadata.timeout_seconds,
         api_key_id=workflow_metadata.workflow_id,
         file_path=workflow_metadata.file_path,
+        lineage=lineage,
     )
 
 
@@ -250,17 +248,21 @@ async def _execute_async(
     input_data: dict[str, Any],
     api_key_id: str | None = None,
     file_path: str | None = None,
+    *,
+    lineage: RunLineage,
 ) -> EndpointExecuteResponse:
     """Execute workflow asynchronously via queue."""
     from src.services.execution.async_executor import enqueue_workflow_execution
 
     execution_id = await enqueue_workflow_execution(
         context=context,
+        execution_id=context.execution_id,
         workflow_id=workflow_id,
         parameters=input_data,
         form_id=None,
         api_key_id=api_key_id,
         file_path=file_path,
+        lineage=lineage,
     )
 
     logger.info(f"Queued async workflow execution: {log_safe(workflow_name)} ({execution_id})")
@@ -280,39 +282,23 @@ async def _execute_sync(
     timeout_seconds: int,
     api_key_id: str | None = None,
     file_path: str | None = None,
+    *,
+    lineage: RunLineage,
 ) -> EndpointExecuteResponse:
     """
     Execute workflow synchronously via queue.
 
     Instead of executing workflow directly (which would block and require
     filesystem access), we:
-    1. Store pending execution in Redis
-    2. Queue to RabbitMQ with sync=True
-    3. Wait for result via Redis BLPOP
-    4. Return result to caller
+    1. Accept the run durably and queue it with sync=True
+    2. Wait for result via Redis BLPOP
+    3. Return result to caller
 
     This allows the API to stay lightweight without filesystem access.
-    Worker will write to PostgreSQL when it starts execution.
     """
     from src.services.execution.async_executor import enqueue_workflow_execution
 
-    execution_id = str(uuid4())
-
-    # Store pending execution in Redis
-    redis_client = get_redis_client()
-    await redis_client.set_pending_execution(
-        execution_id=execution_id,
-        workflow_id=workflow_id,
-        parameters=input_data,
-        org_id=context.org_id,
-        user_id=context.user_id,
-        user_name=context.name or "API Key",
-        user_email=context.email or "",
-        form_id=None,
-        api_key_id=api_key_id,
-        sync=True,
-        is_platform_admin=context.is_platform_admin,
-    )
+    execution_id = context.execution_id
 
     # Queue execution with sync=True
     await enqueue_workflow_execution(
@@ -324,14 +310,17 @@ async def _execute_sync(
         sync=True,
         api_key_id=api_key_id,
         file_path=file_path,
+        lineage=lineage,
     )
 
     logger.info(f"Queued sync workflow execution: {log_safe(workflow_name)} ({execution_id})")
 
     # Wait for result from Redis
-    result = await redis_client.wait_for_result(
+    from src.services.execution.service import sync_wait_seconds
+
+    result = await get_redis_client().wait_for_result(
         execution_id=execution_id,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=sync_wait_seconds(timeout_seconds),
     )
 
     if result is None:

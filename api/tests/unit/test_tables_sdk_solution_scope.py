@@ -22,10 +22,13 @@ def _reset_execution_context():
     clear_execution_context()
 
 
-def _make_context(solution_id: str | None) -> ExecutionContext:
+def _make_context(
+    solution_id: str | None, *, is_provider: bool = False
+) -> ExecutionContext:
     org = Organization(
         id="00000000-0000-0000-0000-000000000000",
         name="Test Org",
+        is_provider=is_provider,
     )
     return ExecutionContext(
         user_id="00000000-0000-0000-0000-000000000999",
@@ -75,7 +78,13 @@ class FakeClient:
     def __init__(self) -> None:
         self.urls: list[str] = []
 
-    async def post(self, url: str, json: dict[str, Any] | None = None) -> FakeResponse:
+    async def engine_request(
+        self,
+        method: str,
+        url: str,
+        json: dict[str, Any] | None = None,
+        retry_transient: bool = False,
+    ) -> FakeResponse:
         self.urls.append(url)
         if url.startswith("/api/tables/") and len(self.urls) == 1:
             return FakeResponse(404, {"detail": "Table not found"}, url)
@@ -115,6 +124,7 @@ class FakeClient:
         ("upsert", ("customers", "doc-id", {"name": "Acme"}), {}),
         ("insert_batch", ("customers", [{"name": "Acme"}]), {}),
         ("upsert_batch", ("customers", [{"id": "doc-id", "data": {"name": "Acme"}}]), {}),
+        ("bulk_upsert", ("customers", [{"id": "doc-id", "data": {"name": "Acme"}}]), {}),
     ],
 )
 @pytest.mark.asyncio
@@ -143,6 +153,7 @@ async def test_solution_context_does_not_auto_create_after_404(
         ("upsert", ("customers", "doc-id", {"name": "Acme"}), {}),
         ("insert_batch", ("customers", [{"name": "Acme"}]), {}),
         ("upsert_batch", ("customers", [{"id": "doc-id", "data": {"name": "Acme"}}]), {}),
+        ("bulk_upsert", ("customers", [{"id": "doc-id", "data": {"name": "Acme"}}]), {}),
     ],
 )
 @pytest.mark.asyncio
@@ -175,3 +186,70 @@ async def test_solution_context_create_table_fails_before_sdk_create_endpoint(
         await tables_sdk.tables.create("customers")
 
     assert client.urls == []
+
+
+class BatchClient:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def engine_request(
+        self,
+        method: str,
+        url: str,
+        json: dict[str, Any] | None = None,
+        retry_transient: bool = False,
+    ) -> FakeResponse:
+        self.urls.append(url)
+        payload = (
+            {"deleted": 1, "deleted_ids": ["doc-id"]}
+            if "/batch-delete" in url
+            else {"inserted": 1, "documents": []}
+        )
+        return FakeResponse(200, payload, url)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("insert_batch", ("customers", [{"id": "doc-id", "data": {"name": "Acme"}}])),
+        ("upsert_batch", ("customers", [{"id": "doc-id", "data": {"name": "Acme"}}])),
+        ("bulk_upsert", ("customers", [{"id": "doc-id", "data": {"name": "Acme"}}])),
+        ("delete_batch", ("customers", ["doc-id"])),
+    ],
+)
+@pytest.mark.asyncio
+async def test_solution_batch_write_omits_inherited_organization_scope(
+    method_name: str,
+    args: tuple[Any, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Solution-owned global table must not receive its caller org as an explicit scope."""
+    client = BatchClient()
+    monkeypatch.setattr(tables_sdk, "get_client", lambda: client)
+    set_execution_context(_make_context(solution_id=SOLUTION_ID))
+
+    await getattr(tables_sdk.tables, method_name)(*args)
+
+    endpoint = "batch-delete" if method_name == "delete_batch" else "batch"
+    assert client.urls == [
+        f"/api/tables/customers/documents/{endpoint}?solution={SOLUTION_ID}&caller_solution={SOLUTION_ID}"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_solution_batch_write_preserves_explicit_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller-requested scope remains visible to the router for authorization."""
+    client = BatchClient()
+    monkeypatch.setattr(tables_sdk, "get_client", lambda: client)
+    set_execution_context(_make_context(solution_id=SOLUTION_ID, is_provider=True))
+    explicit_scope = "22222222-2222-2222-2222-222222222222"
+
+    await tables_sdk.tables.upsert_batch(
+        "customers", [{"id": "doc-id", "data": {"name": "Acme"}}], scope=explicit_scope
+    )
+
+    assert client.urls == [
+        f"/api/tables/customers/documents/batch?scope={explicit_scope}&solution={SOLUTION_ID}&caller_solution={SOLUTION_ID}"
+    ]

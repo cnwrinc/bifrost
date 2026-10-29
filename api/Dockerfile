@@ -2,11 +2,14 @@
 # Used by all services: API, Discovery, Scheduler, Worker
 # Multi-stage build for efficient image size
 
+# Use the same supported Node runtime for every App build surface.
+FROM node:26.12.1-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe AS node-toolchain
+
 # =============================================================================
 # Stage 1: Builder
 # =============================================================================
 # python:3.14-slim
-FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS builder
+FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS builder
 
 WORKDIR /app
 
@@ -32,7 +35,7 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 # Stage 2: Runtime
 # =============================================================================
 # python:3.14-slim
-FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6
+FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 
 WORKDIR /app
 ARG BIFROST_VERSION=unknown
@@ -45,12 +48,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     git \
     awscli \
-    nodejs npm \
+    libjemalloc2 \
+    libatomic1 \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
+
+# npm 10 also crashes in peer-set resolution on valid retained App sources.
+# Vendor a supported Node runtime, then install the verified npm resolver.
+COPY --from=node-toolchain /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-toolchain /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+COPY api/scripts/install-npm.sh /usr/local/bin/install-npm.sh
+RUN sh /usr/local/bin/install-npm.sh && rm /usr/local/bin/install-npm.sh
 
 # Copy installed packages from builder
 COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
+RUN mv /usr/local/bin/uvicorn /usr/local/bin/uvicorn-real
 
 # Install `bifrost` CLI shim. The bifrost Python package is mounted at
 # /app/bifrost/ via PYTHONPATH=/app, so `python -m bifrost` works. The shim
@@ -64,6 +79,7 @@ RUN printf '#!/bin/sh\nexec python -m bifrost "$@"\n' > /usr/local/bin/bifrost \
 # Copy application code (paths relative to root context)
 COPY api/src/ /app/src/
 COPY api/shared/ /app/shared/
+COPY api/product-updates.bundle.json /app/product-updates.bundle.json
 COPY api/alembic/ /app/alembic/
 COPY api/alembic.ini /app/
 COPY api/bifrost/ /app/bifrost/
@@ -107,6 +123,12 @@ COPY client/src/lib/app-sdk/provider.tsx \
      client/src/lib/app-sdk/use-workflow-hooks.ts \
      client/src/lib/app-sdk/files.ts \
      client/src/lib/app-sdk/use-files.ts \
+     client/src/lib/app-sdk/use-user.tsx \
+     client/src/lib/app-sdk/use-api-query.ts \
+     client/src/lib/app-sdk/use-branding.ts \
+     client/src/lib/app-sdk/use-organizations.ts \
+     client/src/lib/app-sdk/branding-theme.ts \
+     client/src/lib/app-sdk/brand-palette.ts \
      client/src/lib/app-sdk/bifrost-header.tsx \
      /app/src/services/sdk_package/sdk_src/
 COPY client/src/lib/app-sdk/index.v2.ts /app/src/services/sdk_package/sdk_src/index.ts
@@ -122,9 +144,12 @@ RUN useradd -m -u 1000 bifrost && \
 RUN mkdir -p /workspace /tmp/bifrost && \
     chown -R bifrost:bifrost /workspace /tmp/bifrost
 
-# Copy entrypoint script
+# Copy shared API startup scripts. The Uvicorn shim keeps Kubernetes command
+# overrides on the API allocator path without invoking the root entrypoint.
 COPY api/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY api/scripts/api-allocator.sh /usr/local/bin/api-allocator.sh
+COPY api/scripts/uvicorn-shim.sh /usr/local/bin/uvicorn
+RUN chmod 755 /entrypoint.sh /usr/local/bin/api-allocator.sh /usr/local/bin/uvicorn
 
 # Don't switch to bifrost here - entrypoint handles user switching
 # This allows the entrypoint to fix volume permissions when needed

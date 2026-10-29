@@ -1,12 +1,8 @@
-"""
-Worker process entry point for isolated execution.
+"""Shared execution core for isolated worker processes.
 
-This module runs in a separate process and:
-1. Reads execution context from Redis
-2. Runs the workflow/script
-3. Writes logs to Redis Stream (already handled by engine)
-4. Writes result to Redis (including resource metrics)
-5. Exits cleanly (or gets killed on timeout)
+The forked worker adapter supplies an execution context to ``run_execution``,
+which loads and runs the workflow or script and returns its result with
+resource metrics. Logs are written to Redis Stream by the execution engine.
 
 The worker imports minimal dependencies to keep memory footprint low.
 
@@ -17,11 +13,9 @@ modules from Redis cache instead of the filesystem.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
+import hashlib
 import resource
-import signal
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,10 +25,32 @@ from typing import Any
 # This must happen before any workspace imports (e.g., from shared import ...)
 # The hook intercepts imports and loads modules from Redis cache.
 from src.services.execution.virtual_import import install_virtual_import_hook
+from src.services.execution.workspace_modules import (
+    clear_workspace_modules as _clear_workspace_modules,
+)
 
 install_virtual_import_hook()
 
 logger = logging.getLogger(__name__)
+
+
+def _set_process_engine_credentials(context_data: dict[str, Any]) -> bool:
+    """Install the handed-down engine token for this one-shot process."""
+    engine_token = context_data.get("engine_token")
+    if not engine_token:
+        return False
+
+    import os
+
+    api_url = os.getenv("BIFROST_API_URL", "http://api:8000")
+    # The SDK's process backend takes precedence over keyring or JSON
+    # persistence and supports refresh-on-401 by updating this tuple. Avoiding
+    # persistence also prevents headless keyring probes from importing optional
+    # DBus/desktop modules through the virtual importer on every execution.
+    os.environ["BIFROST_API_URL"] = api_url
+    os.environ["BIFROST_ACCESS_TOKEN"] = engine_token
+    os.environ["BIFROST_REFRESH_TOKEN"] = engine_token
+    return True
 
 
 @dataclass
@@ -42,6 +58,7 @@ class ResourceMetrics:
     """Resource usage metrics captured during execution."""
     # Memory metrics (bytes)
     peak_memory_bytes: int  # Maximum RSS during execution
+    peak_process_rss_bytes: int  # One-shot child process high-water RSS
     # CPU metrics (seconds)
     cpu_user_seconds: float  # User-mode CPU time
     cpu_system_seconds: float  # Kernel-mode CPU time
@@ -83,39 +100,14 @@ def _capture_metrics(start_rss: int, start_utime: float, start_stime: float) -> 
 
     return ResourceMetrics(
         peak_memory_bytes=end_rss,  # Peak is cumulative from process start
+        peak_process_rss_bytes=end_rss,
         cpu_user_seconds=round(cpu_user, 4),
         cpu_system_seconds=round(cpu_system, 4),
         cpu_total_seconds=round(cpu_user + cpu_system, 4),
     )
 
 
-def _setup_signal_handlers():
-    """Set up signal handlers for graceful shutdown."""
-    def handle_sigterm(signum, frame):
-        logger.info("Worker received SIGTERM, initiating graceful shutdown")
-        # Raise SystemExit to trigger cleanup
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, handle_sigterm)
-
-
-async def _read_execution_context(redis_client, execution_id: str) -> dict[str, Any] | None:
-    """Read execution context from Redis."""
-    key = f"bifrost:exec:{execution_id}:context"
-    data = await redis_client.get(key)
-    if data:
-        return json.loads(data)
-    return None
-
-
-async def _write_execution_result(redis_client, execution_id: str, result: dict[str, Any]):
-    """Write execution result to Redis."""
-    key = f"bifrost:exec:{execution_id}:result"
-    # Set with 1 hour TTL (parent should read quickly, but safety margin)
-    await redis_client.setex(key, 3600, json.dumps(result, default=str))
-
-
-async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dict[str, Any]:
+async def run_execution(execution_id: str, context_data: dict[str, Any]) -> dict[str, Any]:
     """
     Run the actual execution.
 
@@ -124,32 +116,22 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
     from src.sdk.context import Caller, Organization
     from src.services.execution.engine import ExecutionRequest, execute
     from src.models.enums import ExecutionStatus
-    from bifrost.credentials import is_token_expired, save_credentials
 
-    # Engine credentials: prefer the pre-minted token handed down from the
-    # consumer via context_data["engine_token"].  This keeps SECRET_KEY out of
-    # the child process entirely.
-    # Fall back to authenticate_engine() only for callers (e.g. direct engine
-    # tests) that bypass the consumer and do not supply a pre-minted token.
-    engine_token = context_data.get("engine_token")
-    if engine_token:
-        import os
-        api_url = os.getenv("BIFROST_API_URL", "http://api:8000")
-        expires_at = context_data.get("engine_token_expires_at", "")
-        save_credentials(
-            api_url=api_url,
-            access_token=engine_token,
-            refresh_token=engine_token,  # Not used but required by schema
-            expires_at=expires_at,
-        )
-    elif is_token_expired(buffer_seconds=3600):
-        from src.core.security import authenticate_engine
-        authenticate_engine()
+    service_cfg = context_data.get("service")
+    if service_cfg:
+        return await run_service(service_cfg, context_data)
+
+    # Every SDK-capable execution must receive a pre-minted, typed runtime
+    # credential from its parent. There is no process-wide engine fallback.
+    if not _set_process_engine_credentials(context_data):
+        raise RuntimeError("Missing pre-minted runtime credential for execution")
 
     start_time = datetime.now(timezone.utc)
 
     # Capture starting resource usage
     start_rss, start_utime, start_stime = _get_resource_usage()
+    # The loaded workflow's code version; its memory is learned per version.
+    code_hash: str | None = None
 
     # Activate the per-execution Solution import root BEFORE any workspace code
     # loads. With no solution_id this is a no-op (plain _repo/ behavior). The
@@ -165,6 +147,12 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
         )
 
     try:
+        # The shared execution boundary owns cache freshness so direct callers
+        # and alternate worker paths cannot inherit stale workspace imports.
+        # This must run after Solution context activation because resolution is
+        # scoped to the active install.
+        _clear_workspace_modules()
+
         # Reconstruct Organization
         org = None
         org_data = context_data.get("organization")
@@ -208,6 +196,7 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
                     cached = get_module_sync(file_path)
                     if cached:
                         loaded_code = cached["content"]
+                        code_hash = hashlib.sha256(loaded_code.encode("utf-8")).hexdigest()
                         workflow_func, metadata, load_error = load_workflow_from_db(
                             code=loaded_code,
                             path=file_path,
@@ -235,8 +224,6 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
             # Validate content hash if pinned at dispatch time
             content_hash = context_data.get("content_hash")
             if content_hash and loaded_code:
-                import hashlib
-
                 actual_hash = hashlib.sha256(
                     loaded_code.encode("utf-8")
                 ).hexdigest()
@@ -262,9 +249,11 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
                     "variables": None,
                     "metrics": {
                         "peak_memory_bytes": metrics.peak_memory_bytes,
+                        "peak_process_rss_bytes": metrics.peak_process_rss_bytes,
                         "cpu_user_seconds": metrics.cpu_user_seconds,
                         "cpu_system_seconds": metrics.cpu_system_seconds,
                         "cpu_total_seconds": metrics.cpu_total_seconds,
+                        "code_hash": code_hash,
                     },
                 }
 
@@ -285,6 +274,10 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
             name=context_data.get("name"),
             tags=context_data.get("tags", []),
             timeout_seconds=context_data.get("timeout_seconds", 1800),
+            workflow_deadline=(
+                datetime.fromisoformat(context_data["workflow_deadline"])
+                if context_data.get("workflow_deadline") else None
+            ),
             cache_ttl_seconds=context_data.get("cache_ttl_seconds", 300),
             parameters=context_data.get("parameters", {}),
             startup=context_data.get("startup"),  # Launch workflow results
@@ -298,6 +291,10 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
             event=event_ctx,
             solution_id=context_data.get("solution_id"),  # install scope for SDK
             artifact_workspace_id=context_data.get("artifact_workspace_id"),
+            # The token this process just installed as its SDK credentials
+            # (see _set_process_engine_credentials above) - registered as a
+            # secret so it is redacted from this execution's output.
+            engine_token=context_data.get("engine_token"),
         )
 
         # Execute
@@ -322,9 +319,11 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
             "execution_context": exec_result.execution_context,
             "metrics": {
                 "peak_memory_bytes": metrics.peak_memory_bytes,
+                "peak_process_rss_bytes": metrics.peak_process_rss_bytes,
                 "cpu_user_seconds": metrics.cpu_user_seconds,
                 "cpu_system_seconds": metrics.cpu_system_seconds,
                 "cpu_total_seconds": metrics.cpu_total_seconds,
+                "code_hash": code_hash,
             },
         }
 
@@ -347,103 +346,208 @@ async def _run_execution(execution_id: str, context_data: dict[str, Any]) -> dic
             "traceback": traceback.format_exc(),
             "metrics": {
                 "peak_memory_bytes": metrics.peak_memory_bytes,
+                "peak_process_rss_bytes": metrics.peak_process_rss_bytes,
                 "cpu_user_seconds": metrics.cpu_user_seconds,
                 "cpu_system_seconds": metrics.cpu_system_seconds,
                 "cpu_total_seconds": metrics.cpu_total_seconds,
+                "code_hash": code_hash,
             },
         }
 
     finally:
-        # Always clear the solution import root — a forked worker is reused for
-        # later executions and must not inherit this one's root.
+        # Always clear the solution import root before any final cleanup in this
+        # execution process. Current pool children are one-shot.
         clear_solution_context()
 
 
-async def worker_main(execution_id: str):
+async def run_service(
+    service_cfg: dict[str, Any], context_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Run one supervised @service attempt in this child process.
+
+    Mirrors ``run_execution`` loading (Solution scope, module cache, content
+    hash) but invokes the engine in service mode: the coroutine runs until it
+    returns, raises, or a stop is requested. The returned envelope carries
+    the service identity so the parent routes it to attempt completion
+    instead of the one-shot execution callback.
     """
-    Main entry point for worker process.
+    from datetime import datetime, timezone
 
-    Called by the pool manager when spawning a new worker.
-    """
-    import redis.asyncio as redis
-    from src.config import get_settings
-
-    settings = get_settings()
-
-    # Set up signal handlers
-    _setup_signal_handlers()
-
-    logger.info(f"Worker starting for execution: {execution_id}")
-
-    # Note: No workspace directory needed - modules are loaded from Redis via virtual imports
-    # The virtual import hook is installed below before any workspace imports
-
-    # Connect to Redis
-    redis_client = redis.from_url(
-        settings.redis_url,
-        decode_responses=True,
-        socket_timeout=5.0,
+    from src.sdk.context import Caller, Organization
+    from src.services.execution.engine import (
+        ExecutionRequest,
+        ServiceRunConfig,
+        execute,
     )
+    from src.models.enums import ExecutionStatus
+
+    start_time = datetime.now(timezone.utc)
+    attempt_id = str(service_cfg.get("attempt_id", context_data.get("execution_id")))
+
+    from src.core.module_cache_sync import clear_solution_context, set_solution_context
+
+    _exec_solution_id = context_data.get("solution_id")
+    if _exec_solution_id:
+        set_solution_context(
+            _exec_solution_id,
+            global_repo_access=bool(context_data.get("solution_global_repo_access", False)),
+        )
 
     try:
-        # Read context from Redis
-        context_data = await _read_execution_context(redis_client, execution_id)
-        if not context_data:
-            logger.error(f"No context found for execution: {execution_id}")
-            await _write_execution_result(redis_client, execution_id, {
-                "status": "Failed",
-                "error_message": "Execution context not found in Redis",
-                "error_type": "ContextNotFound",
-                "duration_ms": 0,
-                "metrics": None,
-            })
-            return
+        _clear_workspace_modules()
 
-        # Run the execution
-        result = await _run_execution(execution_id, context_data)
-
-        # Write result to Redis
-        await _write_execution_result(redis_client, execution_id, result)
-
-        # Log metrics
-        metrics = result.get("metrics")
-        if metrics:
-            logger.info(
-                f"Worker completed execution: {execution_id}, "
-                f"status: {result.get('status')}, "
-                f"memory: {metrics['peak_memory_bytes'] / 1024 / 1024:.1f}MB, "
-                f"cpu: {metrics['cpu_total_seconds']:.3f}s"
+        org = None
+        org_data = context_data.get("organization")
+        if org_data:
+            org = Organization(
+                id=org_data["id"],
+                name=org_data["name"],
+                is_active=org_data.get("is_active", True),
+                is_provider=org_data.get("is_provider", False),
             )
+
+        caller_data = context_data["caller"]
+        caller = Caller(
+            user_id=caller_data["user_id"],
+            email=caller_data["email"],
+            name=caller_data["name"],
+        )
+
+        # Renewable service credential handed down at dispatch (no SECRET_KEY
+        # in the child). The engine supervisor refreshes it from the parent's
+        # Redis handoff for the life of the attempt.
+        from bifrost._service_runtime import install_service_credentials
+
+        install_service_credentials(service_cfg.get("token", ""))
+
+        # Load the @service function (same DB-first loader as workflows).
+        service_func = None
+        load_error: str | None = None
+        loaded_code: str | None = None
+        function_name = context_data.get("function_name")
+        file_path = context_data.get("file_path")
+        if function_name and file_path:
+            try:
+                from src.core.module_cache_sync import get_module_sync
+                from src.services.execution.module_loader import load_workflow_from_db
+
+                cached = get_module_sync(file_path)
+                if cached:
+                    loaded_code = cached["content"]
+                    service_func, _, load_error = load_workflow_from_db(
+                        code=loaded_code,
+                        path=file_path,
+                        function_name=function_name,
+                    )
+                else:
+                    load_error = (
+                        f"Service code not found in cache or S3: "
+                        f"function_name={function_name}, file_path={file_path}"
+                    )
+            except Exception as e:
+                load_error = f"Cache load failed: {e}"
         else:
-            logger.info(f"Worker completed execution: {execution_id}, status: {result.get('status')}")
+            load_error = (
+                f"Missing required fields for service execution: "
+                f"function_name={function_name}, file_path={file_path}"
+            )
 
+        content_hash = context_data.get("content_hash")
+        if content_hash and loaded_code:
+            actual_hash = hashlib.sha256(loaded_code.encode("utf-8")).hexdigest()
+            if actual_hash != content_hash:
+                logger.warning(
+                    "Content hash mismatch for %s: expected=%s... actual=%s...",
+                    file_path,
+                    content_hash[:12],
+                    actual_hash[:12],
+                )
+
+        if service_func is None:
+            return _service_result(
+                service_cfg, start_time, ExecutionStatus.FAILED.value,
+                result=None,
+                error_message=load_error or "Service function not found",
+                error_type="WorkflowLoadError" if load_error else "ExecutableNotFound",
+            )
+
+        request = ExecutionRequest(
+            execution_id=attempt_id,
+            caller=caller,
+            organization=org,
+            func=service_func,
+            name=context_data.get("name"),
+            tags=["service"],
+            timeout_seconds=0,
+            parameters={},
+            is_platform_admin=context_data.get("is_platform_admin", False),
+            broadcaster=None,
+            solution_id=context_data.get("solution_id"),
+            artifact_workspace_id=context_data.get("artifact_workspace_id"),
+            service=ServiceRunConfig(
+                service_id=str(service_cfg.get("service_id")),
+                attempt_id=attempt_id,
+                lease_token=str(service_cfg.get("lease_token", "")),
+                revision=service_cfg.get("revision"),
+                graceful_shutdown_seconds=int(
+                    service_cfg.get("graceful_shutdown_seconds", 30)
+                ),
+                startup_grace_seconds=int(
+                    service_cfg.get("startup_grace_seconds", 60)
+                ),
+                token=service_cfg.get("token", ""),
+                token_expires_at=service_cfg.get("token_expires_at", ""),
+            ),
+        )
+
+        exec_result = await execute(request)
+        return _service_result(
+            service_cfg, start_time, exec_result.status.value,
+            result=exec_result.result,
+            error_message=exec_result.error_message,
+            error_type=exec_result.error_type,
+        )
     except Exception as e:
-        logger.exception(f"Worker failed for execution {execution_id}: {e}")
-        try:
-            await _write_execution_result(redis_client, execution_id, {
-                "status": "Failed",
-                "error_message": str(e),
-                "error_type": type(e).__name__,
-                "duration_ms": 0,
-                "metrics": None,
-            })
-        except Exception:
-            pass  # Best effort
+        logger.exception("Service execution failed: %s", e)
+        e.__traceback__ = None
+        return _service_result(
+            service_cfg, start_time, ExecutionStatus.FAILED.value,
+            result=None,
+            error_message=str(e),
+            error_type=type(e).__name__,
+        )
     finally:
-        await redis_client.aclose()
+        clear_solution_context()
 
 
-def run_in_worker(execution_id: str):
+def _service_result(
+    service_cfg: dict[str, Any],
+    start_time: Any,
+    status: str,
+    result: Any,
+    error_message: str | None,
+    error_type: str | None,
+) -> dict[str, Any]:
+    """Internal result shape (mirrors run_execution) plus service identity.
+
+    ``_execute_async`` maps this onto the transport envelope and passes the
+    ``service`` block through so the pool routes it to attempt completion.
     """
-    Synchronous entry point for multiprocessing.
+    from datetime import datetime, timezone
 
-    This is called when the process is spawned.
-    """
-    # Configure logging for worker process
-    logging.basicConfig(
-        level=logging.INFO,
-        format=f"[Worker:{execution_id[:8]}] %(levelname)s - %(message)s"
-    )
-
-    # Run the async worker
-    asyncio.run(worker_main(execution_id))
+    return {
+        "status": status,
+        "result": result,
+        "duration_ms": int(
+            (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        ),
+        "logs": [],
+        "variables": None,
+        "error_message": error_message,
+        "error_type": error_type,
+        "service": {
+            "service_id": str(service_cfg.get("service_id")),
+            "attempt_id": str(service_cfg.get("attempt_id")),
+            "lease_token": str(service_cfg.get("lease_token", "")),
+        },
+    }

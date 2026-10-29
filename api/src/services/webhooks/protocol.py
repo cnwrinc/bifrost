@@ -8,9 +8,12 @@ Adapters handle provider-specific subscription management and request validation
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
-from starlette.requests import Request
+if TYPE_CHECKING:
+    # Type-only: the scheduler imports this module and must not load starlette.
+    from starlette.requests import Request
 
 
 @dataclass
@@ -31,7 +34,7 @@ class WebhookRequest:
     _json_cache: dict[str, Any] | None = field(default=None, repr=False)
 
     @classmethod
-    async def from_starlette(cls, request: Request) -> "WebhookRequest":
+    async def from_starlette(cls, request: "Request") -> "WebhookRequest":
         """Create WebhookRequest from a Starlette/FastAPI request."""
         body = await request.body()
         headers = {k.lower(): v for k, v in request.headers.items()}
@@ -103,6 +106,16 @@ class RenewResult:
     """Updated state (merged with existing)."""
 
 
+@dataclass(frozen=True)
+class WebhookIntegrationAuth:
+    """Resolved, tenant-scoped credentials passed to a webhook adapter."""
+
+    integration_id: UUID
+    organization_id: UUID
+    entity_id: str
+    access_token: str = field(repr=False)
+
+
 @dataclass
 class ValidationResponse:
     """
@@ -133,6 +146,9 @@ class Deliver:
 
     raw_headers: dict[str, str] | None = None
     """Original request headers (for logging)."""
+
+    event_id: UUID | None = None
+    """Persisted event ID, populated by the event processor after ingestion."""
 
 
 @dataclass
@@ -184,6 +200,9 @@ class WebhookAdapter(ABC):
     requires_integration: str | None = None
     """Integration name required for this adapter (e.g., 'Microsoft')."""
 
+    requires_organization: bool = False
+    """Whether the adapter must authenticate in an organization/tenant context."""
+
     config_schema: dict[str, Any] = {}
     """JSON Schema for adapter configuration."""
 
@@ -205,7 +224,7 @@ class WebhookAdapter(ABC):
         Args:
             callback_url: Full URL for the webhook endpoint.
             config: Adapter-specific configuration from user.
-            integration: IntegrationData with OAuth credentials (if requires_integration).
+            integration: Resolved organization-scoped authentication, when required.
 
         Returns:
             SubscribeResult with external_id, state, and optional expires_at.
@@ -228,12 +247,21 @@ class WebhookAdapter(ABC):
         Args:
             external_id: ID from SubscribeResult.external_id.
             state: State dict from SubscribeResult.state.
-            integration: IntegrationData with OAuth credentials (if requires_integration).
+            integration: Resolved organization-scoped authentication, when required.
 
-        Note:
-            Should not raise exceptions - best effort cleanup.
+        Raises:
+            Exception: If the provider cannot confirm the subscription is gone.
+                Providers should treat an already-missing subscription as success.
         """
         pass
+
+    def get_public_metadata(
+        self,
+        config: dict[str, Any],
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return non-secret provider details that are safe to show to operators."""
+        return {}
 
     @abstractmethod
     async def handle_request(
@@ -274,7 +302,7 @@ class WebhookAdapter(ABC):
 
         Args:
             operation: The operation name from x-dynamic-values.operation
-            integration: IntegrationData with OAuth credentials (if requires_integration)
+            integration: Resolved organization-scoped authentication, when required.
             current_config: Config values selected so far (for dependent fields)
 
         Returns:
@@ -290,6 +318,7 @@ class WebhookAdapter(ABC):
         self,
         external_id: str | None,
         state: dict[str, Any],
+        config: dict[str, Any],
         integration: Any | None,
     ) -> RenewResult | None:
         """
@@ -300,7 +329,8 @@ class WebhookAdapter(ABC):
         Args:
             external_id: ID from SubscribeResult.external_id.
             state: State dict from SubscribeResult.state.
-            integration: IntegrationData with OAuth credentials (if requires_integration).
+            config: Persisted adapter configuration for the subscription.
+            integration: Resolved organization-scoped authentication, when required.
 
         Returns:
             RenewResult with new expires_at and optional state updates.
@@ -325,7 +355,7 @@ class WebhookAdapter(ABC):
         prefix: str = "",
     ) -> bool:
         """
-        Verify HMAC-SHA256 signature.
+        Verify a hex- or base64-encoded HMAC-SHA256 signature.
 
         Args:
             body: Request body bytes.
@@ -339,20 +369,29 @@ class WebhookAdapter(ABC):
         if not signature:
             return False
 
+        import base64
         import hashlib
         import hmac
 
-        # Remove prefix if present
+        # Header values may include optional whitespace around the prefix or
+        # encoded digest. Whitespace within the digest remains significant.
+        signature = signature.strip()
         if prefix and signature.startswith(prefix):
-            signature = signature[len(prefix) :]
+            signature = signature[len(prefix) :].strip()
 
-        expected = hmac.new(
+        digest = hmac.new(
             secret.encode("utf-8"),
             body,
             hashlib.sha256,
-        ).hexdigest()
+        ).digest()
 
-        return hmac.compare_digest(signature.lower(), expected.lower())
+        hex_matches = hmac.compare_digest(signature.lower(), digest.hex())
+        base64_matches = hmac.compare_digest(
+            signature,
+            base64.b64encode(digest).decode("ascii"),
+        )
+
+        return hex_matches or base64_matches
 
     @staticmethod
     def expiration_datetime(days: int = 3) -> str:

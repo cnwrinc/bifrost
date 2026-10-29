@@ -3,7 +3,7 @@ Unit tests for Code Editor MCP Tools.
 
 Tests the precision editing tools:
 - list_content: List files, optionally filtered by path prefix
-- search_content: Regex search with context
+- bifrost_file_search: thin wrapper over POST /api/files/search
 - read_content_lines: Line range reading
 - get_content: Full content read
 - patch_content: Surgical edits
@@ -18,10 +18,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from fastmcp.tools import ToolResult
 from mcp.types import TextContent
 
+from src.core.principal import UserPrincipal
+from src.services.authorization.context import AuthorizationContext, Boundary, BoundaryKind, RoleGrant
+from src.services.authorization.enforce import Caller
 from src.services.mcp_server.server import MCPContext
+from src.services.mcp_server.tool_result import ToolResult
 
 
 def get_result_data(result: ToolResult) -> dict:
@@ -33,6 +36,8 @@ def get_result_text(result: ToolResult) -> str:
     """Extract display text from a ToolResult."""
     if not result.content:
         return ""
+    if isinstance(result.content, str):
+        return result.content
     texts = [block.text for block in result.content if isinstance(block, TextContent)]
     return "\n".join(texts)
 
@@ -46,28 +51,76 @@ def is_error_result(result: ToolResult) -> bool:
     return False
 
 
+def _caller(context: MCPContext, permissions: frozenset[str]) -> Caller:
+    principal = UserPrincipal(
+        user_id=context.user_id,
+        email=context.user_email,
+        name=context.user_name,
+        organization_id=context.org_id,
+        # MCP context identity flags remain actor facts. The explicit Global
+        # role grant is the only authority these tests give a caller.
+        is_superuser=context.is_platform_admin,
+        is_provider_org=context.is_provider_org,
+    )
+    return Caller(
+        principal,
+        AuthorizationContext(
+            user_id=principal.user_id,
+            home_organization_id=principal.organization_id,
+            base_role_id=uuid4(),
+            is_external=False,
+            base_permissions=frozenset(),
+            role_grants=(
+                RoleGrant(
+                    role_id=uuid4(),
+                    permissions=permissions,
+                    boundaries=(Boundary(BoundaryKind.PLATFORM),),
+                ),
+            ) if permissions else (),
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _load_explicit_mcp_caller(monkeypatch):
+    async def load(_db, context: MCPContext) -> Caller:
+        return context.test_caller
+
+    monkeypatch.setattr("src.services.mcp_server.authorization.load_mcp_caller", load)
+    monkeypatch.setattr(
+        "src.services.mcp_server.tools.code_editor._has_workspace_permission",
+        AsyncMock(return_value=True),
+    )
+
+
 @pytest.fixture
 def platform_admin_context() -> MCPContext:
-    """Create an MCPContext for a platform admin user."""
-    return MCPContext(
+    """Create a caller with explicit Global repository read/write powers."""
+    context = MCPContext(
         user_id=uuid4(),
         org_id=None,
-        is_platform_admin=True,
         user_email="admin@platform.local",
         user_name="Platform Admin",
+        session=AsyncMock(),
     )
+    context.test_caller = _caller(
+        context, frozenset({"repository.read", "repository.readwrite"})
+    )
+    return context
 
 
 @pytest.fixture
 def org_user_context() -> MCPContext:
-    """Create an MCPContext for a regular org user."""
-    return MCPContext(
+    """Create a caller with no Global repository permission."""
+    context = MCPContext(
         user_id=uuid4(),
         org_id=uuid4(),
-        is_platform_admin=False,
         user_email="user@org.local",
         user_name="Org User",
+        session=AsyncMock(),
     )
+    context.test_caller = _caller(context, frozenset())
+    return context
 
 
 class TestListContent:
@@ -194,99 +247,92 @@ class TestListContent:
             mock_repo.list.assert_called_once_with("")
 
     @pytest.mark.asyncio
-    async def test_list_workflows_org_scoped(self, org_user_context):
-        """Should list files filtered by path_prefix for org users."""
+    async def test_list_content_denied_for_org_user(self, org_user_context, monkeypatch):
+        """Workspace listing requires the Global repository read grant."""
         from src.services.mcp_server.tools.code_editor import list_content
 
-        with patch("src.services.mcp_server.tools.code_editor.RepoStorage") as mock_repo_cls:
-            mock_repo = MagicMock()
-            mock_repo.list = AsyncMock(return_value=[
-                "workflows/sync_tickets.py",
-            ])
-            mock_repo_cls.return_value = mock_repo
+        monkeypatch.setattr(
+            "src.services.mcp_server.tools.code_editor._has_workspace_permission",
+            AsyncMock(return_value=False),
+        )
 
-            result = await list_content(
-                context=org_user_context,
-                path_prefix="workflows/",
-            )
-
-            assert isinstance(result, ToolResult)
-            data = get_result_data(result)
-            assert "files" in data
-            assert len(data["files"]) == 1
-            assert data["files"][0]["path"] == "workflows/sync_tickets.py"
-
-
-class TestSearchContent:
-    """Tests for the search_content MCP tool."""
-
-    @pytest.mark.asyncio
-    async def test_search_workflow_content(self, platform_admin_context):
-        """Should find matches in file content with context."""
-        from src.services.mcp_server.tools.code_editor import search_content
-
-        code = '''from bifrost import workflow
-
-@workflow(name="Sync Tickets")
-async def sync_tickets(client_id: str) -> dict:
-    """Sync tickets from HaloPSA."""
-    return {"synced": True}
-'''
-
-        with patch("src.services.mcp_server.tools.code_editor.get_tool_db") as mock_db:
-            mock_session = AsyncMock()
-            mock_db.return_value.__aenter__.return_value = mock_session
-
-            # search_content does: select(FileIndex.path, FileIndex.content) -> result.all()
-            mock_fi_result = MagicMock()
-            mock_fi_row = MagicMock()
-            mock_fi_row.path = "workflows/sync_tickets.py"
-            mock_fi_row.content = code
-            mock_fi_result.all.return_value = [mock_fi_row]
-            mock_session.execute.return_value = mock_fi_result
-
-            result = await search_content(
-                context=platform_admin_context,
-                pattern="async def",
-            )
-
-            assert isinstance(result, ToolResult)
-            data = get_result_data(result)
-            assert "matches" in data
-            assert len(data["matches"]) == 1
-            assert data["matches"][0]["line_number"] == 4
-            assert "sync_tickets" in data["matches"][0]["match"]
-
-    @pytest.mark.asyncio
-    async def test_search_invalid_regex(self, platform_admin_context):
-        """Should return error for invalid regex pattern."""
-        from src.services.mcp_server.tools.code_editor import search_content
-
-        result = await search_content(
-            context=platform_admin_context,
-            pattern="[invalid",
+        result = await list_content(
+            context=org_user_context,
+            path_prefix="workflows/",
         )
 
         assert isinstance(result, ToolResult)
         assert is_error_result(result)
-        data = get_result_data(result)
-        assert "error" in data
-        assert "Invalid regex" in data["error"]
+
+
+_PAGE = {
+    "query": "x", "output_mode": "content", "returned": 2, "has_more_matches": True,
+    "response_complete": False, "next_cursor": "c", "search_time_ms": 1, "files": [],
+    "guidance": 'Showing matches 1-2 across 2 files; more results exist. ... cursor="c" ...',
+    "matches": [
+        {"file_path": "a.py", "line": 3, "column": 0, "text": "x = 1",
+         "context_before": [], "context_after": [], "source": {"kind": "workspace", "editable": True}},
+        {"file_path": "functions/f.py", "line": 9, "column": 4, "text": "    x()",
+         "context_before": [], "context_after": [],
+         "source": {"kind": "solution", "solution_slug": "covi-psa", "editable": False}},
+    ],
+}
+
+
+class TestBifrostFileSearch:
+    """bifrost_file_search is a thin wrapper over POST /api/files/search."""
 
     @pytest.mark.asyncio
-    async def test_search_empty_pattern(self, platform_admin_context):
-        """Should return error for empty pattern."""
-        from src.services.mcp_server.tools.code_editor import search_content
+    async def test_posts_the_documented_body_and_renders_grep_lines(self, platform_admin_context, monkeypatch):
+        from src.services.mcp_server.tools import code_editor
 
-        result = await search_content(
-            context=platform_admin_context,
-            pattern="",
-        )
+        calls = []
 
-        assert isinstance(result, ToolResult)
+        async def fake_call_rest(ctx, method, path, *, json_body=None, params=None):
+            calls.append((method, path, json_body))
+            return 200, _PAGE
+
+        monkeypatch.setattr(code_editor, "call_rest", fake_call_rest)
+        result = await code_editor.bifrost_file_search(platform_admin_context, query="x", limit=2)
+
+        assert calls == [("POST", "/api/files/search", {
+            "query": "x", "is_regex": False, "case_sensitive": False, "source": "all",
+            "output_mode": "content", "context_lines": 1, "limit": 2,
+        })]
+        text = get_result_text(result)
+        assert "a.py:3: x = 1" in text
+        assert "covi-psa:functions/f.py:9:     x()  (read-only)" in text
+        assert f"(read-only)\n\n{_PAGE['guidance']}" in text
+        assert get_result_data(result)["next_cursor"] == "c"
+
+    @pytest.mark.asyncio
+    async def test_files_mode_lists_one_line_per_file(self, platform_admin_context, monkeypatch):
+        from src.services.mcp_server.tools import code_editor
+
+        page = {**_PAGE, "output_mode": "files", "matches": [], "files": [
+            {"file_path": "a.py", "match_count": 4, "first_line": 2, "source": {"kind": "workspace", "editable": True}},
+            {"file_path": "b.py", "match_count": 1, "first_line": 9, "source": {"kind": "workspace", "editable": True}},
+        ]}
+
+        async def fake_call_rest(ctx, method, path, *, json_body=None, params=None):
+            return 200, page
+
+        monkeypatch.setattr(code_editor, "call_rest", fake_call_rest)
+        result = await code_editor.bifrost_file_search(platform_admin_context, query="x", output_mode="files")
+        assert "a.py (4 matches, first at line 2)" in get_result_text(result)
+        assert "b.py (1 match, first at line 9)" in get_result_text(result)
+
+    @pytest.mark.asyncio
+    async def test_rest_rejection_is_a_tool_error(self, platform_admin_context, monkeypatch):
+        from src.services.mcp_server.tools import code_editor
+
+        async def fake_call_rest(ctx, method, path, *, json_body=None, params=None):
+            return 400, {"detail": "cursor does not belong to this search"}
+
+        monkeypatch.setattr(code_editor, "call_rest", fake_call_rest)
+        result = await code_editor.bifrost_file_search(platform_admin_context, query="x", cursor="bad")
         assert is_error_result(result)
-        data = get_result_data(result)
-        assert "error" in data
+        assert "cursor does not belong" in get_result_text(result)
 
 
 class TestReadContentLines:
@@ -747,9 +793,11 @@ class TestDeleteContent:
         assert "path" in data["error"]
 
     @pytest.mark.asyncio
-    async def test_delete_workflow_with_org_filter(self, org_user_context):
-        """Should delete a file for org-scoped users."""
+    async def test_delete_denied_for_org_user(self, org_user_context, monkeypatch):
+        """Deleting a `_repo/` file requires Global repository write."""
         from src.services.mcp_server.tools.code_editor import delete_content
+
+        monkeypatch.setattr("src.services.mcp_server.tools.code_editor._has_workspace_permission", AsyncMock(return_value=False))
 
         with patch("src.services.mcp_server.tools.code_editor.RepoStorage") as mock_repo_cls:
             mock_repo = MagicMock()
@@ -773,8 +821,8 @@ class TestDeleteContent:
                     )
 
                     assert isinstance(result, ToolResult)
-                    data = get_result_data(result)
-                    assert data["success"] is True
+                    assert is_error_result(result)
+                    mock_fs_instance.delete_file.assert_not_called()
 
 
 class TestMultiFunctionWorkflows:
@@ -844,44 +892,6 @@ async def get_ticket(ticket_id: str):
                     assert data["success"] is True
                     assert data["path"] == "workflows/multi.py"
                     mock_fs_instance.delete_file.assert_called_once_with("workflows/multi.py")
-
-    @pytest.mark.asyncio
-    async def test_search_deduplicates_multi_function_results(self, platform_admin_context):
-        """Should not produce duplicate search results from multi-function files."""
-        from src.services.mcp_server.tools.code_editor import search_content
-
-        code = '''from bifrost import workflow
-
-@workflow(name="Sync")
-async def sync():
-    return {"done": True}
-
-@workflow(name="Cleanup")
-async def cleanup():
-    return {"done": True}
-'''
-
-        with patch("src.services.mcp_server.tools.code_editor.get_tool_db") as mock_db:
-            mock_session = AsyncMock()
-            mock_db.return_value.__aenter__.return_value = mock_session
-
-            # search_content queries FileIndex directly, one row per file
-            mock_fi_result = MagicMock()
-            mock_fi_row = MagicMock()
-            mock_fi_row.path = "workflows/multi.py"
-            mock_fi_row.content = code
-            mock_fi_result.all.return_value = [mock_fi_row]
-            mock_session.execute.return_value = mock_fi_result
-
-            result = await search_content(
-                context=platform_admin_context,
-                pattern="return",
-            )
-
-            assert isinstance(result, ToolResult)
-            data = get_result_data(result)
-            # Should have exactly 2 matches (one per "return" line), NOT 4
-            assert data["total_matches"] == 2
 
 
 class TestFormatDeactivationResult:

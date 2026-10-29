@@ -1,5 +1,7 @@
+import { useBifrostMonacoTheme } from "@/hooks/useBifrostMonacoTheme";
 import { useRef, useState } from "react";
 import Editor, { OnMount } from "@monaco-editor/react";
+import { typescript } from "monaco-editor";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { AlertCircle } from "lucide-react";
@@ -30,6 +32,7 @@ export function ExpressionEditor({
 	onValidationChange,
 }: ExpressionEditorProps) {
 	const editorRef = useRef<unknown>(null);
+	const monacoAppearance = useBifrostMonacoTheme();
 	const [validationError, setValidationError] = useState<string | null>(null);
 
 	// Calculate height based on content (minimum 120px for autocomplete visibility, then grows)
@@ -65,6 +68,7 @@ export function ExpressionEditor({
 
 	const handleEditorDidMount: OnMount = (editor, monaco) => {
 		editorRef.current = editor;
+		monacoAppearance.onMount(editor, monaco);
 
 		// Add blur event listener
 		editor.onDidBlurEditorText(() => {
@@ -72,18 +76,18 @@ export function ExpressionEditor({
 		});
 
 		// Configure JavaScript language features
-		monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
+		typescript.javascriptDefaults.setDiagnosticsOptions({
 			noSemanticValidation: false,
 			noSyntaxValidation: false,
 		});
 
-		monaco.languages.typescript.javascriptDefaults.setCompilerOptions({
-			target: monaco.languages.typescript.ScriptTarget.ES2020,
+		typescript.javascriptDefaults.setCompilerOptions({
+			target: typescript.ScriptTarget.ES2020,
 			allowNonTsExtensions: true,
 		});
 
 		// Add type definitions for form context
-		monaco.languages.typescript.javascriptDefaults.addExtraLib(
+		typescript.javascriptDefaults.addExtraLib(
 			`
       declare const context: {
         workflow: Record<string, any>;
@@ -119,7 +123,8 @@ export function ExpressionEditor({
 							}
 						}}
 						onMount={handleEditorDidMount}
-						theme="vs-dark"
+						theme={monacoAppearance.theme}
+						beforeMount={monacoAppearance.beforeMount}
 						options={{
 							minimap: { enabled: false },
 							lineNumbers: "off",
@@ -130,9 +135,9 @@ export function ExpressionEditor({
 							scrollBeyondLastLine: false,
 							wordWrap: "on",
 							wrappingStrategy: "advanced",
-							fontSize: 13,
-							fontFamily:
-								"ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+							...monacoAppearance.options,
+							ariaLabel: label || "Expression",
+
 							padding: { top: 8, bottom: 8 },
 							suggest: {
 								showWords: false,

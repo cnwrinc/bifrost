@@ -24,6 +24,7 @@ from src.models import WorkflowExecutionResponse
 from src.models.enums import ExecutionStatus
 
 if TYPE_CHECKING:
+    from shared.run_lineage import RunLineage
     from src.sdk.context import ExecutionContext
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,7 @@ async def get_workflow_metadata_only(
             time_saved=cached.get("time_saved", 0),
             value=cached.get("value", 0.0),
             execution_mode=cached.get("execution_mode", "sync"),
+            type=cached.get("type", "workflow"),
         )
         metadata.id = cached["id"]
         metadata.source_file_path = cached["file_path"]
@@ -104,6 +106,7 @@ async def get_workflow_metadata_only(
         time_saved=workflow_record.time_saved or 0,
         value=float(workflow_record.value) if workflow_record.value else 0.0,
         execution_mode=workflow_record.execution_mode or "sync",
+        type=workflow_record.type or "workflow",
     )
     metadata.id = str(workflow_record.id)
     metadata.source_file_path = workflow_record.path
@@ -117,6 +120,7 @@ async def get_workflow_metadata_only(
         time_saved=workflow_record.time_saved or 0,
         value=float(workflow_record.value) if workflow_record.value else 0.0,
         execution_mode=workflow_record.execution_mode or "sync",
+        type=workflow_record.type or "workflow",
     )
 
     logger.debug(f"Loaded workflow metadata from DB: {workflow_id} -> {workflow_record.name}")
@@ -167,7 +171,7 @@ async def get_workflow_for_execution(
         from src.models.orm.solutions import Solution as SolutionORM
 
         stmt = (
-            select(WorkflowORM, SolutionORM.global_repo_access)
+            select(WorkflowORM, SolutionORM.allow_outbound_access)
             .outerjoin(SolutionORM, WorkflowORM.solution_id == SolutionORM.id)
             .where(
                 WorkflowORM.id == workflow_id,
@@ -187,7 +191,7 @@ async def get_workflow_for_execution(
         if row is None:
             raise WorkflowNotFoundError(f"Workflow with ID '{workflow_id}' not found")
 
-        workflow_record, global_repo_access = row
+        workflow_record, allow_outbound_access = row
         logger.debug(f"Loaded workflow for execution: {workflow_id} -> {workflow_record.name}")
 
         return {
@@ -200,7 +204,8 @@ async def get_workflow_for_execution(
             "execution_mode": workflow_record.execution_mode or "async",
             "organization_id": str(workflow_record.organization_id) if workflow_record.organization_id else None,
             "solution_id": str(workflow_record.solution_id) if workflow_record.solution_id else None,
-            "can_access_global_repo": bool(global_repo_access),
+            # Wire key kept stable for in-flight workflow_data across deploys.
+            "can_access_global_repo": bool(allow_outbound_access),
             "type": workflow_record.type or "workflow",
             "cache_ttl_seconds": workflow_record.cache_ttl_seconds or 0,
         }
@@ -348,11 +353,14 @@ async def run_workflow(
     form_id: str | None = None,
     transient: bool = False,
     sync: bool = False,
+    dispatch_metadata: dict[str, Any] | None = None,
+    *,
+    lineage: RunLineage | None,
 ) -> WorkflowExecutionResponse:
     """
     Execute a workflow by ID.
 
-    All workflows are executed via the worker queue (RabbitMQ). The `sync` parameter
+    All workflows are executed by the executors. The `sync` parameter
     controls whether we wait for the result or return immediately with PENDING status.
 
     Args:
@@ -372,29 +380,52 @@ async def run_workflow(
     """
     parameters = input_data or {}
 
-    # Validate workflow exists using metadata-only lookup (Redis-first, no module loading)
-    try:
-        workflow_metadata = await get_workflow_metadata_only(workflow_id)
-        logger.debug(
-            f"Validated workflow by ID: {workflow_id} -> {workflow_metadata.name}"
-        )
-    except WorkflowNotFoundError:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to validate workflow {workflow_id}: {e}", exc_info=True)
-        raise WorkflowNotFoundError(
-            f"Failed to validate workflow '{workflow_id}': {str(e)}"
-        )
+    if dispatch_metadata is None:
+        # Callers that did not already resolve the workflow still use the
+        # metadata cache for validation. The main HTTP execution route passes
+        # its authorization-time metadata through instead of reading it again.
+        try:
+            workflow_metadata = await get_workflow_metadata_only(workflow_id)
+            workflow_name = workflow_metadata.name
+            timeout_seconds = workflow_metadata.timeout_seconds
+            logger.debug(
+                f"Validated workflow by ID: {workflow_id} -> {workflow_name}"
+            )
+        except WorkflowNotFoundError:
+            raise
+        except Exception as e:
+            logger.error(f"Failed to validate workflow {workflow_id}: {e}", exc_info=True)
+            raise WorkflowNotFoundError(
+                f"Failed to validate workflow '{workflow_id}': {str(e)}"
+            )
+        if workflow_metadata.type == "service":
+            raise ValueError(
+                f"Workflow '{workflow_name}' is a long-lived service "
+                "(type='service'). One-shot execution is not supported; "
+                "manage it through the services lifecycle (start/stop/restart)."
+            )
+    else:
+        workflow_name = dispatch_metadata["name"]
+        timeout_seconds = dispatch_metadata["timeout_seconds"]
+        if dispatch_metadata.get("type") == "service":
+            raise ValueError(
+                f"Workflow '{workflow_name}' is a long-lived service "
+                "(type='service'). One-shot execution is not supported; "
+                "manage it through the services lifecycle (start/stop/restart)."
+            )
 
     # Enqueue for execution via worker
     # sync is only True when explicitly passed by the caller (e.g. endpoints.py)
     return await _enqueue_workflow_async(
         context=context,
         workflow_id=workflow_id,
-        workflow_name=workflow_metadata.name,
+        workflow_name=workflow_name,
         parameters=parameters,
         form_id=form_id,
         sync=sync,
+        timeout_seconds=timeout_seconds,
+        dispatch_metadata=dispatch_metadata,
+        lineage=lineage,
     )
 
 
@@ -404,6 +435,8 @@ async def run_code(
     script_name: str = "inline_script",
     input_data: dict[str, Any] | None = None,
     transient: bool = False,
+    *,
+    lineage: RunLineage | None,
 ) -> WorkflowExecutionResponse:
     """
     Execute inline Python code.
@@ -427,7 +460,21 @@ async def run_code(
         script_name=script_name,
         code_base64=code_base64,
         parameters=parameters,
+        lineage=lineage,
     )
+
+
+# Result-delivery margin past a workflow's own timeout, and the ceiling for
+# workflows without one, so a sync caller never waits forever.
+SYNC_RESULT_MARGIN_SECONDS = 60
+SYNC_WAIT_CEILING_SECONDS = 86400
+
+
+def sync_wait_seconds(workflow_timeout_seconds: int) -> int:
+    """How long a sync caller waits for a run's result."""
+    if workflow_timeout_seconds > 0:
+        return workflow_timeout_seconds + SYNC_RESULT_MARGIN_SECONDS
+    return SYNC_WAIT_CEILING_SECONDS
 
 
 async def _enqueue_workflow_async(
@@ -437,9 +484,13 @@ async def _enqueue_workflow_async(
     parameters: dict[str, Any],
     form_id: str | None = None,
     sync: bool = False,
+    timeout_seconds: int | None = None,
+    dispatch_metadata: dict[str, Any] | None = None,
+    *,
+    lineage: RunLineage | None,
 ) -> WorkflowExecutionResponse:
     """
-    Enqueue workflow for execution via RabbitMQ.
+    Accept a workflow run for the executors.
 
     If sync=True, waits for result via Redis BLPOP.
     If sync=False, returns immediately with PENDING status.
@@ -454,6 +505,8 @@ async def _enqueue_workflow_async(
         form_id=form_id,
         execution_id=context.execution_id,  # Pass through for log streaming
         sync=sync,
+        dispatch_metadata=dispatch_metadata,
+        lineage=lineage,
     )
 
     if not sync:
@@ -465,15 +518,12 @@ async def _enqueue_workflow_async(
             status=ExecutionStatus.PENDING,
         )
 
-    # Wait for result via Redis BLPOP — use actual workflow timeout (+ 60s buffer)
-    # 0 = no timeout: cap at 86400 (24h) to prevent infinite BLPOP hang
     redis_client = get_redis_client()
-    workflow_meta = await get_workflow_metadata_only(workflow_id)
-    if workflow_meta.timeout_seconds > 0:
-        wait_timeout = workflow_meta.timeout_seconds + 60
-    else:
-        wait_timeout = 86400
-    result = await redis_client.wait_for_result(execution_id, timeout_seconds=wait_timeout)
+    if timeout_seconds is None:
+        timeout_seconds = (await get_workflow_metadata_only(workflow_id)).timeout_seconds
+    result = await redis_client.wait_for_result(
+        execution_id, timeout_seconds=sync_wait_seconds(timeout_seconds)
+    )
 
     if result is None:
         return WorkflowExecutionResponse(
@@ -510,8 +560,10 @@ async def _enqueue_code_async(
     script_name: str,
     code_base64: str,
     parameters: dict[str, Any],
+    *,
+    lineage: RunLineage | None,
 ) -> WorkflowExecutionResponse:
-    """Enqueue inline code for async execution via RabbitMQ."""
+    """Accept an inline-code run for async execution by the executors."""
     from src.services.execution.async_executor import enqueue_code_execution
 
     execution_id = await enqueue_code_execution(
@@ -519,6 +571,7 @@ async def _enqueue_code_async(
         script_name=script_name,
         code_base64=code_base64,
         parameters=parameters,
+        lineage=lineage,
     )
 
     return WorkflowExecutionResponse(
@@ -542,6 +595,8 @@ async def execute_tool(
     execution_id: str | None = None,
     artifact_workspace_id: str | None = None,
     sync: bool = True,
+    *,
+    lineage: RunLineage | None,
 ) -> WorkflowExecutionResponse:
     """
     Execute a workflow as a tool (for AI agent tool calls).
@@ -561,6 +616,7 @@ async def execute_tool(
         is_platform_admin: Whether user is platform admin
         execution_id: Optional pre-generated execution ID (for streaming)
         sync: Whether to wait for the result instead of returning Pending
+        lineage: The agent run's run user (shared.run_lineage)
 
     Returns:
         WorkflowExecutionResponse with execution results
@@ -609,4 +665,5 @@ async def execute_tool(
         workflow_name=workflow_name,
         parameters=parameters,
         sync=sync,
+        lineage=lineage,
     )

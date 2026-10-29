@@ -15,17 +15,24 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 from pydantic_ai_harness.compaction import (
     ClampOversizedMessages,
     ClearToolResults,
-    LimitWarner,
-    SlidingWindow,
+    SlidingWindowCompaction,
     TieredCompaction,
+    WarnNearLimits,
 )
-from pydantic_ai_harness.cache_stability import CacheStabilityMonitor
+from pydantic_ai_harness.warn_on_cache_busts import WarnOnCacheBusts
 
-DEFAULT_CONTEXT_TARGET_TOKENS = 24_000
-"""Keep the active request well below typical provider context windows.
+COMPACTION_TARGET_FRACTION = 0.5
+"""Compact once the active request passes half of the model's real context window.
 
-This is a cost-control target, not a claim about a model's maximum context size.
+The window is resolved per request from the model, so agents with large fixed
+prompts and tool catalogs are not compacted, or told to stop, before they start.
 """
+
+MAX_MESSAGE_PART_TOKENS = 12_000
+"""Clamp any single message part above this size before it reaches the model."""
+
+FINAL_CONTEXT_RESERVE_TOKENS = 24_000
+"""Estimated input size of the final tool-free request under a total-token budget."""
 
 FINAL_RESPONSE_RESERVE_TOKENS = 4_000
 """Output allowance reserved after the active context for a graceful handoff."""
@@ -40,7 +47,6 @@ class AgentRunBudget:
 
     max_requests: int | None = None
     max_total_tokens: int | None = None
-    context_target_tokens: int = DEFAULT_CONTEXT_TARGET_TOKENS
     warning_threshold: float = 0.7
     initial_requests: int = 0
     initial_total_tokens: int = 0
@@ -61,7 +67,7 @@ class AgentRunBudget:
             return None
 
         allowance = max(1, self.max_total_tokens - self.initial_total_tokens)
-        desired_reserve = self.context_target_tokens + FINAL_RESPONSE_RESERVE_TOKENS
+        desired_reserve = FINAL_CONTEXT_RESERVE_TOKENS + FINAL_RESPONSE_RESERVE_TOKENS
         maximum_reserve = int(allowance * (1 - MIN_WIND_DOWN_FRACTION))
         reserve = min(desired_reserve, maximum_reserve)
         configured_threshold = self.initial_total_tokens + int(
@@ -72,7 +78,7 @@ class AgentRunBudget:
 
     @property
     def wind_down_warning_threshold(self) -> float:
-        """LimitWarner threshold aligned with the absolute finalization boundary."""
+        """WarnNearLimits threshold aligned with the finalization boundary."""
 
         if self.max_total_tokens is None:
             return self.warning_threshold
@@ -148,7 +154,6 @@ class AgentRunBudget:
                 current_total_tokens,
                 child_max_total_tokens,
             ),
-            context_target_tokens=self.context_target_tokens,
             warning_threshold=self.warning_threshold,
             initial_requests=current_requests,
             initial_total_tokens=current_total_tokens,
@@ -218,7 +223,14 @@ class BudgetWindDown(AbstractCapability[object]):
         request_context: ModelRequestContext,
         response: ModelResponse,
     ) -> ModelResponse:
-        if not self.budget.should_wind_down(ctx.usage):
+        # Pydantic AI invokes this hook before it commits the response to
+        # ``ctx.usage``. Account for the request that produced ``response`` so
+        # its tool calls become the final handoff at the configured limit.
+        final_allowed_request = (
+            self.budget.max_requests is not None
+            and ctx.usage.requests + 1 >= self.budget.max_requests
+        )
+        if not final_allowed_request and not self.budget.should_wind_down(ctx.usage):
             return response
 
         pending_calls = [
@@ -239,25 +251,30 @@ class BudgetWindDown(AbstractCapability[object]):
         return replace(response, parts=parts, finish_reason="stop")
 
 
-def build_runtime_capabilities(budget: AgentRunBudget) -> list[AgentCapability[object]]:
+def build_runtime_capabilities(
+    budget: AgentRunBudget,
+    *,
+    context_window: int | None,
+) -> list[AgentCapability[object]]:
     """Build the standard context and wind-down policy.
+
+    ``context_window`` is the model chain's real window from the model catalog.
+    When the catalog does not know it, the harness resolves it from the model.
 
     Cheap, deterministic compaction runs before lossy sliding-window trimming.
     Tool output is bounded at the Bifrost tool boundary, before it enters model
-    history. LimitWarner gives the model time to finish notes and communicate
+    history. WarnNearLimits gives the model time to finish notes and communicate
     partial progress before the hard guard rejects a request. BudgetWindDown
     then removes every function tool for the reserved final request and
     normalizes any stale provider tool call into a final response.
     """
 
-    target = budget.context_target_tokens
-    retained_tail = max(4_000, int(target * 0.75))
     return [
-        CacheStabilityMonitor(min_prefix_tokens=1_024),
+        WarnOnCacheBusts[object](min_prefix_tokens=1_024),
         TieredCompaction(
             tiers=[
                 ClampOversizedMessages(
-                    max_part_tokens=max(4_000, target // 2),
+                    max_part_tokens=MAX_MESSAGE_PART_TOKENS,
                     keep_head_chars=2_000,
                     keep_tail_chars=2_000,
                 ),
@@ -266,17 +283,18 @@ def build_runtime_capabilities(budget: AgentRunBudget) -> list[AgentCapability[o
                     keep_pairs=3,
                     min_clear_tokens=1_000,
                 ),
-                SlidingWindow(
+                SlidingWindowCompaction(
                     max_tokens=1,
-                    keep_tokens=retained_tail,
                     preserve_first_user_message=True,
                 ),
             ],
-            target_tokens=target,
+            target_fraction=COMPACTION_TARGET_FRACTION,
+            context_window=context_window,
         ),
-        LimitWarner(
+        WarnNearLimits[object](
             max_iterations=budget.max_requests,
-            max_context_tokens=target,
+            max_context_fraction=1.0,
+            context_window=context_window,
             max_total_tokens=budget.max_total_tokens,
             warning_threshold=budget.wind_down_warning_threshold,
             critical_remaining_iterations=2,

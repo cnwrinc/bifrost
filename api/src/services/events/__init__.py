@@ -6,6 +6,7 @@ from uuid import UUID
 
 from src.services.events.processor import (
     EventProcessor,
+    QueuedDeliveries,
     resolve_webhook_source,
     update_delivery_from_execution,
 )
@@ -37,13 +38,19 @@ async def emit_event(
             solution_id=solution_id,
             triggered_by=triggered_by,
         )
+        queued = QueuedDeliveries()
         if count > 0:
-            # Queue deliveries in the same transaction as emit so that
-            # delivery.execution_id is persisted; otherwise the subsequent
-            # update_delivery_from_execution lookup fails and a sweeper
-            # eventually marks the delivery FAILED with a phantom timeout.
-            await processor.queue_event_deliveries(event_id)
+            # Each delivery's run commits with the event and the delivery's
+            # record of it. If queueing fails outright, the event is still
+            # recorded with pending deliveries before the error surfaces.
+            try:
+                async with db.begin_nested():
+                    queued = await processor.queue_event_deliveries(event_id)
+            except Exception:
+                await db.commit()
+                raise
         await db.commit()
+        await queued.hand_off()
         return event_id, count
 
 

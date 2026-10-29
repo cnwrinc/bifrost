@@ -6,97 +6,110 @@ Main entry point for the FastAPI application.
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError
+from fastapi import FastAPI
 
 from src.config import get_settings
-from src.models.contracts.common import ErrorResponse
+from src.core.cache.redis_client import close_shared_redis, initialize_shared_redis
 from src.core.csrf import CSRFMiddleware
 from src.core.embed_middleware import EmbedScopeMiddleware
+from src.core.request_body_limit import RouteBodyLimitMiddleware
 from src.core.database import close_db, get_session_factory, init_db
 from src.core.pubsub import manager as pubsub_manager
+from src.routers.agent_runs import router as agent_runs_router
+from src.routers.agent_tuning import router as agent_tuning_router
+from src.routers.agents import router as agents_router
+from src.routers.ai_models import router as ai_models_router
+from src.routers.ai_pricing import router as ai_pricing_router
+from src.routers.app_code_files import router as app_code_files_router
+from src.routers.app_code_files import render_router as app_render_router
+from src.routers.app_embed_secrets import router as app_embed_secrets_router
+from src.routers.applications import router as applications_router
+from src.routers.audit import router as audit_router
+from src.routers.auth import router as auth_router
+from src.routers.authorization import router as authorization_router
+from src.routers.branding import router as branding_router
+from src.routers.chat import router as chat_router
+from src.routers.claims import router as claims_router
+from src.routers.cli import install_router as cli_install_router
+from src.routers.cli import router as cli_router
+from src.routers.config import router as config_router
+from src.routers.decorator_properties import router as decorator_properties_router
+from src.routers.dependencies import router as dependencies_router
+from src.routers.docs import router as docs_router
+from src.routers.embed import router as embed_router
+from src.routers.endpoints import router as endpoints_router
+from src.routers.events import router as events_router
+from src.routers.executions import router as executions_router
+from src.routers.export_import import router as export_import_router
+from src.routers.files import router as files_router
+from src.routers.form_embed_secrets import router as form_embed_secrets_router
+from src.routers.forms import router as forms_router
+from src.routers.github import router as github_router
 from src.routers.health import close_health_check_clients
-from src.routers import (
-    auth_router,
-    mfa_router,
-    oauth_router,
-    passkeys_router,
-    health_router,
-    organizations_router,
-    users_router,
-    roles_router,
-    executions_router,
-    workflows_router,
-    forms_router,
-    config_router,
-    websocket_router,
-    branding_router,
-    files_router,
-    schedules_router,
-    workflow_keys_router,
-    audit_router,
-    metrics_router,
-    packages_router,
-    github_router,
-    jobs_router,
-    platform_jobs_router,
-    scheduler_diagnostics_router,
-    oauth_connections_router,
-    endpoints_router,
-    cli_router,
-    cli_install_router,
-    notifications_router,
-    profile_router,
-    memory_router,
-    memory_admin_router,
-    required_instructions_admin_router,
-    required_instructions_router,
-    agent_runs_router,
-    agent_tuning_router,
-    agents_router,
-    chat_router,
-    llm_config_router,
-    integrations_router,
-    decorator_properties_router,
-    maintenance_router,
-    roi_settings_router,
-    roi_reports_router,
-    usage_reports_router,
-    ai_pricing_router,
-    oauth_config_router,
-    tools_router,
-    mcp_router,
-    events_router,
-    hooks_router,
-    tables_router,
-    claims_router,
-    solutions_router,
-    knowledge_sources_router,
-    app_embed_secrets_router,
-    applications_router,
-    app_code_files_router,
-    app_render_router,
-    dependencies_router,
-    embed_router,
-    form_embed_secrets_router,
-    export_import_router,
-    docs_router,
-    platform_workers_router,
-    platform_queue_router,
-    platform_stuck_router,
-    version_router,
-    mcp_servers_router,
-    mcp_connections_router,
-    mcp_me_connections_router,
-    mcp_oauth_callback_router,
-    sdk_modules_router,
-    policy_rules_router,
+from src.routers.health import router as health_router
+from src.routers.hooks import router as hooks_router
+from src.routers.identities import router as identities_router
+from src.routers.integrations import router as integrations_router
+from src.routers.jobs import router as jobs_router
+from src.routers.knowledge_sources import router as knowledge_sources_router
+from src.routers.kubernetes import admin_router as kubernetes_admin_router
+from src.routers.llm_config import router as llm_config_router
+from src.routers.maintenance import router as maintenance_router
+from src.routers.mcp import router as mcp_router
+from src.routers.mcp_connections import me_router as mcp_me_connections_router
+from src.routers.mcp_connections import router as mcp_connections_router
+from src.routers.mcp_oauth_callback import router as mcp_oauth_callback_router
+from src.routers.mcp_servers import router as mcp_servers_router
+from src.routers.memory import admin_router as memory_admin_router
+from src.routers.memory import router as memory_router
+from src.routers.metrics import router as metrics_router
+from src.routers.mfa import router as mfa_router
+from src.routers.model_catalog import router as model_catalog_router
+from src.routers.notifications import router as notifications_router
+from src.routers.oauth_config import router as oauth_config_router
+from src.routers.oauth_connections import router as oauth_connections_router
+from src.routers.oauth_sso import router as oauth_router
+from src.routers.organizations import router as organizations_router
+from src.routers.packages import router as packages_router
+from src.routers.passkeys import router as passkeys_router
+from src.routers.permissions import router as permissions_router
+from src.routers.platform import queue_router as platform_queue_router
+from src.routers.platform import stuck_router as platform_stuck_router
+from src.routers.platform import workers_router as platform_workers_router
+from src.routers.platform_jobs import router as platform_jobs_router
+from src.routers.policy_rules import router as policy_rules_router
+from src.routers.product_updates import router as product_updates_router
+from src.routers.profile import router as profile_router
+from src.routers.required_instructions import (
+    admin_router as required_instructions_admin_router,
+)
+from src.routers.required_instructions import router as required_instructions_router
+from src.routers.roi_reports import router as roi_reports_router
+from src.routers.roi_settings import router as roi_settings_router
+from src.routers.roles import router as roles_router
+from src.routers.run_retention import router as run_retention_router
+from src.routers.scheduler_diagnostics import router as scheduler_diagnostics_router
+from src.routers.schedules import router as schedules_router
+from src.routers.sdk_modules import router as sdk_modules_router
+from src.routers.sdk_runtime import router as sdk_runtime_router
+from src.routers.services import router as services_router
+from src.routers.solutions import router as solutions_router
+from src.routers.tables import router as tables_router
+from src.routers.tools import router as tools_router
+from src.routers.usage_reports import router as usage_reports_router
+from src.routers.users import router as users_router
+from src.routers.version import router as version_router
+from src.routers.websocket import router as websocket_router
+from src.routers.workflow_keys import router as workflow_keys_router
+from src.routers.workflows import router as workflows_router
+from src.worker.remote.host import (
+    router as remote_control_router,
+    start_remote_control_host,
+    stop_remote_control_host,
 )
 
 # Configure logging
@@ -106,10 +119,7 @@ logging.basicConfig(
 )
 
 # Suppress noisy third-party loggers
-logging.getLogger("aiormq").setLevel(logging.WARNING)
-logging.getLogger("aio_pika").setLevel(logging.WARNING)
-logging.getLogger("botocore").setLevel(logging.WARNING)
-logging.getLogger("aiobotocore").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logging.getLogger("s3transfer").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
@@ -136,9 +146,8 @@ async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_db()
     logger.info("Database connection established")
 
-    # Register entity change hooks for real-time manifest sync
-    from src.core.entity_change_hook import register_entity_change_hooks
-    register_entity_change_hooks()
+    await initialize_shared_redis()
+    logger.info("Redis cache connection established")
 
     # Register dynamic workflow endpoints for OpenAPI documentation
     logger.info("Registering workflow endpoints...")
@@ -161,6 +170,44 @@ async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.warning(f"Built-in policy rule seeding failed: {e}")
 
+    # Settings -> Kubernetes takes its deployment variables before this
+    # replica serves: platform control (which also imports) joins only in
+    # the background, and a build enqueued before then would read the
+    # defaults. Idempotent; never fails startup.
+    try:
+        from src.services.kubernetes_execution import import_kubernetes_policy_from_env
+
+        async with get_session_factory()() as db:
+            await import_kubernetes_policy_from_env(db, os.environ)
+    except Exception as e:
+        logger.warning(f"Kubernetes settings import failed: {e}")
+
+    # Name deployment variables this release no longer reads, or reads under
+    # a new name (API only: worker Jobs copy this pod's environment). Never
+    # fails startup.
+    try:
+        from src.services.deployment_environment import warn_about_environment
+        from src.services.legacy_broker_drain import legacy_broker_drained
+
+        async with get_session_factory()() as db:
+            broker_drained = await legacy_broker_drained(db)
+        warn_about_environment(os.environ, broker_drained=broker_drained)
+    except Exception as e:
+        logger.warning(f"Environment variable check failed: {e}")
+
+    from src.scheduler.api_host import ApiControlHost
+
+    control_host = ApiControlHost()
+    await control_host.start()
+    logger.info("Platform control hosted by this API replica")
+
+    await start_remote_control_host(app)
+    logger.info("Remote execution control hosted by this API replica")
+
+    from src.services.legacy_broker_drain import drain_legacy_broker
+
+    legacy_drain = asyncio.create_task(drain_legacy_broker(), name="legacy-broker-drain")
+
     logger.info(f"Bifrost API started in {settings.environment} mode")
 
     yield
@@ -168,7 +215,24 @@ async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Shutdown
     logger.info("Shutting down Bifrost API...")
 
+    # Stop accepting launchers and drain the API-owned consumers while the
+    # database and transport clients are still available.
+    await stop_remote_control_host()
+
+    # An unfinished drain leaves its unacknowledged message queued.
+    legacy_drain.cancel()
+    await asyncio.gather(legacy_drain, return_exceptions=True)
+
+    # Surrender the trigger lease while the database is still open.
+    await control_host.stop()
+
+    from src.services.agent_runtime.retry_transport import (
+        close_ai_retry_http_client,
+    )
+
+    await close_ai_retry_http_client()
     await pubsub_manager.close()
+    await close_shared_redis()
     await close_health_check_clients()
     await close_db()
     logger.info("Bifrost API shutdown complete")
@@ -308,138 +372,11 @@ def create_app() -> FastAPI:
     # ==========================================================================
     # Global Exception Handlers
     # ==========================================================================
-    # These provide consistent error responses using the ErrorResponse model.
-    # Handlers are registered in order of specificity (most specific first).
+    # Shared with the worker-local engine SDK app so SDK calls over the
+    # worker's Unix socket map errors exactly like HTTP.
+    from src.core.app_wiring import register_exception_handlers
 
-    @app.exception_handler(RequestValidationError)
-    async def request_validation_handler(
-        request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
-        """Request validation errors (bad input) → 422 with concise messages."""
-        messages = []
-        for err in exc.errors():
-            field = ".".join(str(p) for p in err["loc"] if p != "body")
-            messages.append(f"{field}: {err['msg']}")
-        return JSONResponse(
-            status_code=422,
-            content=ErrorResponse(
-                error="validation_error",
-                message="; ".join(messages),
-            ).model_dump(),
-        )
-
-    @app.exception_handler(PydanticValidationError)
-    async def pydantic_validation_handler(
-        request: Request, exc: PydanticValidationError
-    ) -> JSONResponse:
-        """Pydantic model validation errors → 422."""
-        errors = exc.errors()
-        # Extract field names and messages for user-friendly output
-        field_errors = {
-            ".".join(str(loc) for loc in e["loc"]): e["msg"] for e in errors
-        }
-        return JSONResponse(
-            status_code=422,
-            content=ErrorResponse(
-                error="validation_error",
-                message="Validation failed",
-                details={"fields": field_errors},
-            ).model_dump(),
-        )
-
-    @app.exception_handler(IntegrityError)
-    async def integrity_error_handler(
-        request: Request, exc: IntegrityError
-    ) -> JSONResponse:
-        """Database constraint violations → 409."""
-        detail = str(exc.orig) if exc.orig else str(exc)
-
-        if "unique" in detail.lower() or "duplicate" in detail.lower():
-            message = "Resource already exists"
-        elif "foreign key" in detail.lower():
-            message = "Referenced resource not found"
-        else:
-            message = "Database constraint violation"
-
-        logger.warning(f"IntegrityError: {detail}")
-        return JSONResponse(
-            status_code=409,
-            content=ErrorResponse(
-                error="conflict",
-                message=message,
-            ).model_dump(),
-        )
-
-    @app.exception_handler(NoResultFound)
-    async def no_result_handler(
-        request: Request, exc: NoResultFound
-    ) -> JSONResponse:
-        """Query returned no results → 404."""
-        return JSONResponse(
-            status_code=404,
-            content=ErrorResponse(
-                error="not_found",
-                message="Resource not found",
-            ).model_dump(),
-        )
-
-    @app.exception_handler(ValueError)
-    async def value_error_handler(
-        request: Request, exc: ValueError
-    ) -> JSONResponse:
-        """ValueError from validation → 422."""
-        return JSONResponse(
-            status_code=422,
-            content=ErrorResponse(
-                error="validation_error",
-                message=str(exc),
-            ).model_dump(),
-        )
-
-    @app.exception_handler(asyncio.TimeoutError)
-    async def timeout_handler(
-        request: Request, exc: asyncio.TimeoutError
-    ) -> JSONResponse:
-        """Timeout errors → 504."""
-        logger.warning(f"Timeout error on {request.method} {request.url.path}")
-        return JSONResponse(
-            status_code=504,
-            content=ErrorResponse(
-                error="timeout",
-                message="Operation timed out",
-            ).model_dump(),
-        )
-
-    @app.exception_handler(OperationalError)
-    async def operational_error_handler(
-        request: Request, exc: OperationalError
-    ) -> JSONResponse:
-        """Database connection issues → 503."""
-        logger.error(f"Database operational error: {exc}", exc_info=True)
-        return JSONResponse(
-            status_code=503,
-            content=ErrorResponse(
-                error="service_unavailable",
-                message="Service temporarily unavailable",
-            ).model_dump(),
-        )
-
-    @app.exception_handler(Exception)
-    async def generic_exception_handler(
-        request: Request, exc: Exception
-    ) -> JSONResponse:
-        """Catch-all for unhandled exceptions → 500 with safe message."""
-        logger.error(
-            f"Unhandled exception on {request.method} {request.url.path}: {exc}",
-            exc_info=True,
-        )
-        return JSONResponse(
-            status_code=500,
-            content=ErrorResponse(
-                error="internal_error",
-                message="An unexpected error occurred",
-            ).model_dump(),
-        )
+    register_exception_handlers(app)
 
     # ==========================================================================
     # Middleware
@@ -457,6 +394,21 @@ def create_app() -> FastAPI:
         expose_headers=["Mcp-Session-Id"],
     )
 
+    # This route accepts multipart uploads.  The cap must run before
+    # Starlette constructs UploadFile and spills a body to disk.
+    from src.services.solutions.zip_install import (
+        MAX_SOLUTION_ARCHIVE_BYTES,
+        MAX_SOLUTION_BACKUP_ARCHIVE_BYTES,
+    )
+    app.add_middleware(
+        RouteBodyLimitMiddleware,
+        limits={
+            ("POST", "/api/solutions/import-workspace/preview"): MAX_SOLUTION_ARCHIVE_BYTES,
+            ("POST", "/api/solutions/install/preview"): MAX_SOLUTION_BACKUP_ARCHIVE_BYTES,
+            ("POST", "/api/solutions/install"): MAX_SOLUTION_BACKUP_ARCHIVE_BYTES,
+        },
+    )
+
     # Add CSRF protection middleware
     # Only enforces for cookie-based auth with unsafe methods (POST, PUT, DELETE, PATCH)
     # Bearer token auth is exempt since browsers don't automatically include it
@@ -465,89 +417,26 @@ def create_app() -> FastAPI:
     # Restrict embed tokens to app-rendering endpoints only
     app.add_middleware(EmbedScopeMiddleware)
 
-    # Set request-scoped ContextVars for user attribution and session tracking
-    from src.core.request_context import RequestUser, set_request_user, set_request_session_id
-    from src.core.rate_limit import get_client_ip
-    from src.services.audit_context import ActorContext, set_actor, clear_actor
+    # Set request-scoped ContextVars for user attribution, session tracking,
+    # and the audit actor. Shared with the worker-local engine SDK app.
+    from src.core.app_wiring import install_request_context_middleware
 
-    @app.middleware("http")
-    async def request_context_middleware(request: Request, call_next):
-        # Set watch session ID from header
-        session_id = request.headers.get("x-bifrost-watch-session")
-        set_request_session_id(session_id)
-
-        # Parse token once; use for both request_user and audit actor contexts.
-        audit_user_id = None
-        audit_org_id = None
-        audit_email = None
-        audit_name = None
-        try:
-            from uuid import UUID as _UUID
-            from src.core.security import decode_token
-            token = None
-            auth_header = request.headers.get("authorization", "")
-            if auth_header.startswith("Bearer "):
-                token = auth_header[7:]
-            elif "access_token" in request.cookies:
-                token = request.cookies["access_token"]
-            if token:
-                payload = decode_token(token, expected_type="access")
-                if payload:
-                    user_id = payload.get("sub", "")
-                    user_name = payload.get("name") or payload.get("email") or user_id
-                    set_request_user(RequestUser(user_id=user_id, user_name=user_name))
-                    # Populate audit actor fields
-                    try:
-                        audit_user_id = _UUID(user_id) if user_id else None
-                    except ValueError:
-                        audit_user_id = None
-                    org_id_raw = payload.get("org_id")
-                    if org_id_raw:
-                        try:
-                            audit_org_id = _UUID(org_id_raw)
-                        except ValueError:
-                            audit_org_id = None
-                    audit_email = payload.get("email")
-                    audit_name = payload.get("name")
-            else:
-                set_request_user(None)
-        except Exception:
-            set_request_user(None)
-
-        # Always set audit actor context — for unauthenticated requests,
-        # user_id is None but IP/UA are still captured (so failed logins
-        # are recorded with network metadata).
-        actor_token = set_actor(
-            ActorContext(
-                user_id=audit_user_id,
-                organization_id=audit_org_id,
-                email=audit_email,
-                name=audit_name,
-                ip_address=get_client_ip(request),
-                user_agent=request.headers.get("user-agent"),
-                source="http",
-            )
-        )
-
-        try:
-            response = await call_next(request)
-        finally:
-            # Reset context after request
-            set_request_user(None)
-            set_request_session_id(None)
-            clear_actor(actor_token)
-        return response
+    install_request_context_middleware(app)
 
     # Register routers
+    from src.routers.home import router as home_router
+    app.include_router(home_router)
     app.include_router(health_router)
     app.include_router(version_router)
     app.include_router(auth_router)
+    app.include_router(authorization_router)
     app.include_router(mfa_router)
     app.include_router(oauth_router)
     app.include_router(passkeys_router)
     app.include_router(organizations_router)
     app.include_router(users_router)
     app.include_router(roles_router)
+    app.include_router(permissions_router)
     app.include_router(executions_router)
     app.include_router(workflows_router)
     app.include_router(forms_router)
@@ -572,6 +461,7 @@ def create_app() -> FastAPI:
     app.include_router(profile_router)
     app.include_router(memory_router)
     app.include_router(memory_admin_router)
+    app.include_router(kubernetes_admin_router)
     app.include_router(required_instructions_router)
     app.include_router(required_instructions_admin_router)
     app.include_router(agents_router)
@@ -579,9 +469,13 @@ def create_app() -> FastAPI:
     app.include_router(agent_tuning_router)
     app.include_router(chat_router)
     app.include_router(llm_config_router)
+    app.include_router(ai_models_router)
+    app.include_router(model_catalog_router)
     app.include_router(integrations_router)
     app.include_router(decorator_properties_router)
     app.include_router(maintenance_router)
+    app.include_router(run_retention_router)
+    app.include_router(identities_router)
     app.include_router(roi_settings_router)
     app.include_router(roi_reports_router)
     app.include_router(usage_reports_router)
@@ -590,6 +484,7 @@ def create_app() -> FastAPI:
     app.include_router(tools_router)
     app.include_router(mcp_router)
     app.include_router(events_router)
+    app.include_router(services_router)
     app.include_router(hooks_router)
     app.include_router(tables_router)
     app.include_router(claims_router)
@@ -612,7 +507,12 @@ def create_app() -> FastAPI:
     app.include_router(mcp_me_connections_router)
     app.include_router(mcp_oauth_callback_router)
     app.include_router(sdk_modules_router)
+    app.include_router(sdk_runtime_router)
     app.include_router(policy_rules_router)
+    app.include_router(product_updates_router)
+    # The FastMCP application below mounts at the root and catches unmatched
+    # paths, so this WebSocket route must precede it.
+    app.include_router(remote_control_router)
 
     # Mount MCP OAuth routes at root level (required by RFC 8414/9728)
     # These must be registered BEFORE the FastMCP ASGI mount

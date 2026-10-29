@@ -26,7 +26,10 @@ const USER_FIELDS: RefRow[] = [
 	{ term: "user_id", def: "UUID of the calling user." },
 	{ term: "email", def: "Email address of the calling user." },
 	{ term: "organization_id", def: "Org UUID the user belongs to." },
-	{ term: "is_platform_admin", def: "Boolean. True for platform admins." },
+	{
+		term: "is_platform_admin",
+		def: "Boolean. True when the user holds the Platform Admin role.",
+	},
 	{
 		term: "is_provider_org",
 		def: "Boolean. True when the user belongs to the provider organization (platform staff). Together with is_platform_admin, grants cross-org / global scope.",
@@ -37,6 +40,13 @@ const USER_FIELDS: RefRow[] = [
 	},
 	{ term: "role_ids", def: "List of role UUIDs the user holds." },
 	{ term: "role_names", def: "List of role names the user holds." },
+];
+
+const AUTHORITIES: RefRow[] = [
+	{
+		term: "Platform Admin Access",
+		def: 'Expression `{ authority: "platform_admin" }`. True for Platform Admin role holders and Full workflow executions. Full adds powers within the run user’s existing reach.',
+	},
 ];
 
 const ROW_FIELDS: RefRow[] = [
@@ -94,7 +104,8 @@ interface WorkedExample {
 const EXAMPLES: WorkedExample[] = [
 	{
 		heading: "admin_bypass",
-		description: "Platform admins can do anything.",
+		description:
+			"Allows Platform Admin role holders and Full workflow executions within their existing reach.",
 		policy: { policies: [POLICY_TEMPLATES.admin_bypass!] },
 	},
 	{
@@ -388,13 +399,13 @@ function RefSection({ title, rows }: { title: string; rows: RefRow[] }) {
 	return (
 		<section className="space-y-2">
 			<h4 className="text-sm font-semibold">{title}</h4>
-			<dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-sm">
+			<dl className="grid grid-cols-1 gap-x-3 gap-y-1 sm:grid-cols-[max-content_minmax(0,1fr)] text-sm">
 				{rows.map((r) => (
 					<div key={r.term} className="contents">
 						<dt className="font-mono text-xs pt-0.5 text-muted-foreground">
 							{r.term}
 						</dt>
-						<dd>{r.def}</dd>
+						<dd className="mb-3 min-w-0 [overflow-wrap:anywhere] sm:mb-0">{r.def}</dd>
 					</div>
 				))}
 			</dl>
@@ -450,6 +461,7 @@ export function PolicyReferencePanel() {
 				action is allowed.
 			</p>
 			<RefSection title="USER fields" rows={USER_FIELDS} />
+			<RefSection title="Authorities" rows={AUTHORITIES} />
 			<RefSection title="ROW fields" rows={ROW_FIELDS} />
 			<RefSection title="Functions" rows={FUNCTIONS} />
 			<RefSection title="Operators" rows={OPERATORS} />

@@ -14,7 +14,6 @@ to avoid dependencies on src.* modules that only exist in the Docker environment
 import asyncio
 import base64
 import hashlib
-import inspect
 import json
 import logging
 import os
@@ -28,6 +27,7 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 from uuid import uuid4
 
 import httpx
+
+from bifrost._device_auth import device_login_prompt
 from packaging.version import InvalidVersion, Version
 
 # Import credentials module directly (it's standalone)
@@ -58,6 +60,25 @@ logger = logging.getLogger(__name__)
 # Solution capture/export so both surfaces skip the same files. The matcher is
 # built from this list at _build_file_filter.
 _DEFAULT_IGNORE_PATTERNS = _CANONICAL_IGNORE_PATTERNS
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Return a non-negative Retry-After delay in seconds, when supplied."""
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        return None
+
+    try:
+        return max(0.0, float(retry_after))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(retry_after)
+        except (TypeError, ValueError):
+            return None
+
+        if retry_at.tzinfo is None:
+            return None
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
 
 
 def _ensure_utf8_stdio() -> None:
@@ -349,11 +370,10 @@ async def login_flow(api_url: str | None = None, auto_open: bool = True) -> bool
             user_code = data["user_code"]
             verification_url = data["verification_url"]
             interval = data.get("interval", 5)
+            deadline = time.monotonic() + data["expires_in"]
 
             # Step 2: Display instructions
-            full_url = f"{api_url}{verification_url}"
-            print(f"\nOpening browser to {full_url}")
-            print(f"Enter this code: {user_code}\n")
+            full_url = device_login_prompt(api_url, verification_url, user_code)
 
             # Step 3: Open browser
             if auto_open:
@@ -364,20 +384,25 @@ async def login_flow(api_url: str | None = None, auto_open: bool = True) -> bool
 
             # Step 4: Poll for authorization
             print("Waiting for authorization", end="", flush=True)
-            max_attempts = 60  # 5 minutes max (60 * 5 seconds)
-            attempts = 0
-
-            while attempts < max_attempts:
-                await asyncio.sleep(interval)
+            while time.monotonic() < deadline:
+                await asyncio.sleep(min(interval, deadline - time.monotonic()))
+                if time.monotonic() >= deadline:
+                    break
                 print(".", end="", flush=True)
-                attempts += 1
 
                 poll_response = await client.post(
                     "/auth/device/token",
                     json={"device_code": device_code}
                 )
 
-                if poll_response.status_code != 200:
+                if poll_response.status_code == 429:
+                    interval += 5
+                    retry_after = _retry_after_seconds(poll_response)
+                    if retry_after is not None:
+                        interval = max(interval, retry_after)
+                    continue
+
+                if poll_response.status_code not in {200, 400}:
                     print(f"\nError polling for token: {poll_response.status_code}", file=sys.stderr)
                     return False
 
@@ -388,6 +413,9 @@ async def login_flow(api_url: str | None = None, auto_open: bool = True) -> bool
                     error = poll_data["error"]
                     if error == "authorization_pending":
                         continue  # Keep polling
+                    elif error == "slow_down":
+                        interval += 5
+                        continue
                     elif error == "expired_token":
                         print("\nDevice code expired. Please try again.", file=sys.stderr)
                         return False
@@ -427,7 +455,7 @@ async def login_flow(api_url: str | None = None, auto_open: bool = True) -> bool
 
                     return True
 
-            print("\nTimeout waiting for authorization.", file=sys.stderr)
+            print("\nDevice code expired. Please try again.", file=sys.stderr)
             return False
 
     except Exception as e:
@@ -709,6 +737,10 @@ def main(args: list[str] | None = None) -> int:
             from bifrost.commands.solution import handle_solution
             return handle_solution(args[1:])
 
+        if command == "app":
+            from bifrost.commands.app import handle_app
+            return handle_app(args[1:])
+
         if command == "deploy":
             from bifrost.commands.solution import handle_deploy
             return handle_deploy(args[1:])
@@ -738,11 +770,12 @@ Usage:
 
 Commands:
   sync        Bidirectional sync between local files and Bifrost platform
-  run         Run a workflow directly (silent JSON output) or interactively via browser
+  run         Run a workflow directly (silent JSON output)
   git         Git source control operations (fetch, status, commit, push, resolve, diff, discard)
   push        Push local files to Bifrost platform (alias for sync)
   pull        Pull files from Bifrost platform to local directory (alias for sync)
   solution    Manage Solution installs (create, bind, scaffold-app, start, deploy, install)
+  app         Create, bind, start, and deploy an App project
   deploy      Deploy the current Solution workspace (alias for 'solution deploy')
   watch       Watch for file changes and auto-push
   api         Generic authenticated API request
@@ -760,6 +793,7 @@ Flags:
 Entity mutation commands (see 'bifrost <entity> --help'):
   orgs         Manage organizations
   roles        Manage roles
+  permissions  Inspect the permission catalog
   workflows    Manage workflow lifecycle and role assignments
   forms        Manage forms
   agents       Manage AI agents
@@ -770,8 +804,12 @@ Entity mutation commands (see 'bifrost <entity> --help'):
   tables       Manage tables
   files        Read/write _repo files, Solution runtime files, and file policies
   events       Manage event sources and subscriptions
-  policy-rule  Manage reusable table/file policy rules
-  requirements Manage workspace Python requirements.txt (install/list/remove)
+   policy-rule  Manage reusable table/file policy rules
+   requirements Manage workspace Python requirements.txt (install/list/remove)
+   services     Manage supervised services
+   audit        Read the audit log and explain access decisions
+   users        Ask what a user's access would be (users access check)
+   retention    Show and change run, event, and audit retention
 
 Workspace/file targets:
   _repo source files:
@@ -801,7 +839,6 @@ Examples:
   bifrost run workflow.py -w greet
   bifrost run workflow.py -w greet -p '{"name": "World"}'
   bifrost run workflow.py -w greet | jq .
-  bifrost run workflow.py --interactive
   bifrost git fetch
   bifrost git status
   bifrost git commit -m "sync clients"
@@ -1281,40 +1318,6 @@ Examples:
     return 1
 
 
-def _extract_workflow_parameters(func: Any) -> list[dict[str, Any]]:
-    """Extract parameter info from a workflow function signature."""
-    params = []
-    sig = inspect.signature(func)
-
-    for name, param in sig.parameters.items():
-        # Skip *args and **kwargs
-        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-            continue
-
-        param_info: dict[str, Any] = {
-            "name": name,
-            "type": "string",  # default
-            "required": param.default is inspect.Parameter.empty,
-            "label": name.replace("_", " ").title(),
-            "default_value": None if param.default is inspect.Parameter.empty else param.default,
-        }
-
-        # Try to determine type from annotation
-        if param.annotation is not inspect.Parameter.empty:
-            annotation = param.annotation
-            type_name = getattr(annotation, "__name__", str(annotation))
-            if type_name in ("int", "float", "bool", "str"):
-                param_info["type"] = type_name
-            elif "list" in type_name.lower():
-                param_info["type"] = "list"
-            elif "dict" in type_name.lower():
-                param_info["type"] = "dict"
-
-        params.append(param_info)
-
-    return params
-
-
 def _run_direct(
     selected_workflow: str,
     workflows: dict[str, Any],
@@ -1440,8 +1443,7 @@ def handle_run(args: list[str]) -> int:
     """
     Handle 'bifrost run <file>' command.
 
-    Default behavior: direct execution (silent, pipeable output).
-    Use --interactive for browser-based session.
+    Runs a workflow directly (silent, pipeable output).
 
     Args:
         args: Command arguments [file, --workflow, etc.]
@@ -1457,8 +1459,6 @@ def handle_run(args: list[str]) -> int:
 
     workflow_file = args[0]
     selected_workflow: str | None = None
-    no_browser = False
-    interactive = False
     verbose = False
     inline_params: dict[str, Any] | None = None
     organization_id: str | None = None
@@ -1482,9 +1482,6 @@ def handle_run(args: list[str]) -> int:
                 print(f"Error: Invalid JSON for --params: {e}", file=sys.stderr)
                 return 1
             i += 2
-        elif args[i] in ("--interactive", "-i"):
-            interactive = True
-            i += 1
         elif args[i] in ("--verbose", "-v"):
             verbose = True
             i += 1
@@ -1494,9 +1491,6 @@ def handle_run(args: list[str]) -> int:
                 return 1
             organization_id = args[i + 1]
             i += 2
-        elif args[i] in ("--no-browser", "-n"):
-            no_browser = True
-            i += 1
         elif args[i] in ("--help", "-h"):
             print_run_help()
             return 0
@@ -1533,8 +1527,8 @@ def handle_run(args: list[str]) -> int:
         if verbose:
             print(f"Detected Solution workspace root: {root_str}")
 
-    # In non-verbose direct mode, suppress decorator warnings before loading the module
-    if not interactive and not verbose:
+    # In non-verbose mode, suppress decorator warnings before loading the module
+    if not verbose:
         logging.getLogger("bifrost.decorators").setLevel(logging.ERROR)
 
     # Load the workflow file
@@ -1569,213 +1563,27 @@ def handle_run(args: list[str]) -> int:
         )
         return 1
 
-    # Direct execution mode (default) — requires --workflow
-    if not interactive:
-        if not selected_workflow:
-            print(
-                f"Error: --workflow is required. Available workflows: {list(workflows.keys())}. "
-                "Use --interactive for browser UI.",
-                file=sys.stderr,
-            )
-            return 1
-
-        params = inline_params if inline_params is not None else {}
-        return _run_direct(
-            selected_workflow, workflows, params,
-            verbose=verbose, organization_id=organization_id,
-            solution_root=solution_root,
+    if not selected_workflow:
+        print(
+            f"Error: --workflow is required. Available workflows: {list(workflows.keys())}.",
+            file=sys.stderr,
         )
-
-    # Interactive mode (--interactive) — browser-based session
-    # Ensure user is authenticated (only needed for API-based flow)
-    try:
-        client = BifrostClient.get_instance(require_auth=True)
-    except RuntimeError as e:
-        print(f"Authentication required: {e}", file=sys.stderr)
         return 1
 
-    # Build workflow info for session registration
-    workflow_infos = []
-    for name, func in workflows.items():
-        metadata = getattr(func, "_executable_metadata", None)
-        description = ""
-        if metadata is not None:
-            # WorkflowMetadata is a dataclass, access attributes directly
-            description = getattr(metadata, "description", "") or ""
-        workflow_infos.append({
-            "name": name,
-            "description": description,
-            "parameters": _extract_workflow_parameters(func),
-        })
-
-    # Generate session ID
-    session_id = str(uuid4())
-
-    # Run the session flow
-    return asyncio.run(_run_session_flow(
-        client=client,
-        session_id=session_id,
-        file_path=abs_file_path,
-        workflow_infos=workflow_infos,
-        workflows=workflows,
-        selected_workflow=selected_workflow,
-        no_browser=no_browser,
-    ))
-
-
-async def _run_session_flow(
-    client: BifrostClient,
-    session_id: str,
-    file_path: str,
-    workflow_infos: list[dict[str, Any]],
-    workflows: dict[str, Any],
-    selected_workflow: str | None,
-    no_browser: bool,
-) -> int:
-    """
-    Run the session-based workflow execution flow.
-
-    1. Register session with API
-    2. Open browser to DevRun page
-    3. Poll for pending execution
-    4. Execute workflow locally
-    5. Post results back to API
-    """
-    api_url = client.api_url
-
-    # Step 1: Register session
-    print(f"Registering session with {len(workflow_infos)} workflow(s)...")
-    try:
-        response = await client.post(
-            "/api/sdk/sessions",
-            json={
-                "session_id": session_id,
-                "file_path": file_path,
-                "workflows": workflow_infos,
-                "selected_workflow": selected_workflow,
-            },
-        )
-        if response.status_code not in (200, 201):
-            print(f"Error registering session: {response.status_code} - {response.text}", file=sys.stderr)
-            return 1
-    except Exception as e:
-        print(f"Error registering session: {e}", file=sys.stderr)
-        return 1
-
-    # Step 2: Open browser to CLI session page
-    session_url = f"{api_url}/cli/{session_id}"
-    print(f"\nOpening browser to {session_url}")
-    print("Select a workflow and enter parameters in the browser, then click 'Continue'.\n")
-
-    if not no_browser:
-        try:
-            webbrowser.open(session_url)
-        except Exception:
-            pass  # Ignore browser open failures
-
-    # Step 3: Poll for pending execution
-    print("Waiting for execution", end="", flush=True)
-    poll_interval = 2  # seconds
-    heartbeat_interval = 5  # seconds
-    last_heartbeat = time.time()
-
-    while True:
-        await asyncio.sleep(poll_interval)
-        print(".", end="", flush=True)
-
-        # Send heartbeat periodically
-        if time.time() - last_heartbeat > heartbeat_interval:
-            try:
-                await client.post(f"/api/sdk/sessions/{session_id}/heartbeat")
-                last_heartbeat = time.time()
-            except Exception:
-                pass  # Ignore heartbeat failures
-
-        # Poll for pending execution
-        try:
-            response = await client.get(f"/api/sdk/sessions/{session_id}/pending")
-
-            if response.status_code == 204:
-                # No pending execution yet
-                continue
-            elif response.status_code == 200:
-                # Execution is pending!
-                pending_data = response.json()
-                execution_id = pending_data["execution_id"]
-                workflow_name = pending_data["workflow_name"]
-                params = pending_data["params"]
-                print(f" OK\n\nExecuting workflow: {workflow_name}")
-                break
-            elif response.status_code == 404:
-                print("\n\nSession expired or deleted.", file=sys.stderr)
-                return 1
-            else:
-                print(f"\n\nError polling: {response.status_code}", file=sys.stderr)
-                return 1
-        except Exception as e:
-            print(f"\n\nError polling: {e}", file=sys.stderr)
-            return 1
-
-    # Step 4: Execute workflow locally
-    workflow_fn = workflows.get(workflow_name)
-    if not workflow_fn:
-        error_msg = f"Workflow '{workflow_name}' not found in loaded module"
-        print(f"Error: {error_msg}", file=sys.stderr)
-        await _post_result(client, session_id, execution_id, "Failed", None, error_msg, 0)
-        return 1
-
-    start_time = time.time()
-    result = None
-    error_message = None
-    status = "Success"
-
-    try:
-        result = await workflow_fn(**params)
-        print(f"\nResult: {json.dumps(result, indent=2, default=str)}")
-    except Exception as e:
-        status = "Failed"
-        error_message = str(e)
-        print(f"\nError: {error_message}", file=sys.stderr)
-
-    duration_ms = int((time.time() - start_time) * 1000)
-
-    # Step 5: Post results back to API
-    await _post_result(client, session_id, execution_id, status, result, error_message, duration_ms)
-
-    return 0 if status == "Success" else 1
-
-
-async def _post_result(
-    client: BifrostClient,
-    session_id: str,
-    execution_id: str,
-    status: str,
-    result: Any,
-    error_message: str | None,
-    duration_ms: int,
-) -> None:
-    """Post execution result back to API."""
-    try:
-        await client.post(
-            f"/api/sdk/sessions/{session_id}/executions/{execution_id}/result",
-            json={
-                "status": status,
-                "result": result,
-                "error_message": error_message,
-                "duration_ms": duration_ms,
-                "logs": [],  # Could collect logs during execution
-            },
-        )
-        print(f"\nExecution completed ({status})")
-    except Exception as e:  # noqa: BLE001 — best-effort result post; the local run already finished, so a failed callback only loses server-side bookkeeping and must not crash the CLI.
-        print(f"\nWarning: Failed to post result: {e}", file=sys.stderr)
+    params = inline_params if inline_params is not None else {}
+    return _run_direct(
+        selected_workflow, workflows, params,
+        verbose=verbose, organization_id=organization_id,
+        solution_root=solution_root,
+    )
 
 
 def handle_git(args: list[str]) -> int:
     """
     Handle 'bifrost git <subcommand>' command.
 
-    Dispatches to git subcommands: fetch, status, commit, push, resolve, diff, discard.
+    Dispatches to git subcommands: fetch, status, commit, sync, connect,
+    abort-merge, push, resolve, diff, discard.
 
     Args:
         args: Subcommand and its arguments
@@ -1788,12 +1596,14 @@ def handle_git(args: list[str]) -> int:
         EXIT_ERROR,
         RESOLUTION_MAP,
         run_git_commit,
+        run_git_connect,
         run_git_diff,
         run_git_discard,
         run_git_fetch,
         run_git_push,
         run_git_resolve,
         run_git_status,
+        run_git_sync,
     )
 
     if not args or args[0] in ("--help", "-h"):
@@ -1834,8 +1644,69 @@ def handle_git(args: list[str]) -> int:
             return EXIT_ERROR
         return run_git_commit(client, message)
 
+    if subcmd == "sync":
+        if any(arg != "--confirm-deletes" for arg in sub_args):
+            print("Error: sync accepts only --confirm-deletes", file=sys.stderr)
+            return EXIT_ERROR
+        return run_git_sync(client, confirm_deletes="--confirm-deletes" in sub_args)
+
     if subcmd == "push":
         return run_git_push(client)
+
+    if subcmd == "abort-merge":
+        if sub_args:
+            print("Error: abort-merge does not accept arguments", file=sys.stderr)
+            return EXIT_ERROR
+        from .git_commands import run_git_abort_merge
+
+        return run_git_abort_merge(client)
+
+    if subcmd == "connect":
+        if not sub_args or sub_args[0].startswith("-"):
+            print("Error: connect requires a repository URL", file=sys.stderr)
+            return EXIT_ERROR
+        repository_url = sub_args[0]
+        branch = "main"
+        strategy = None
+        decisions: dict[str, str] = {}
+        confirm_destructive = False
+        index = 1
+        while index < len(sub_args):
+            option = sub_args[index]
+            if option == "--confirm-destructive":
+                confirm_destructive = True
+                index += 1
+                continue
+            if option in {"--branch", "--strategy", "--decision"}:
+                if index + 1 >= len(sub_args):
+                    print(f"Error: {option} requires a value", file=sys.stderr)
+                    return EXIT_ERROR
+                value = sub_args[index + 1]
+                if option == "--branch":
+                    branch = value
+                elif option == "--strategy":
+                    if value not in {"publish-local", "start-from-remote", "reconcile"}:
+                        print("Error: --strategy must be publish-local, start-from-remote, or reconcile", file=sys.stderr)
+                        return EXIT_ERROR
+                    strategy = value
+                else:
+                    path, separator, choice = value.partition("=")
+                    if not separator or not path or choice not in {"local", "remote"}:
+                        print("Error: --decision must be PATH=local or PATH=remote", file=sys.stderr)
+                        return EXIT_ERROR
+                    decisions[path] = choice
+                index += 2
+            else:
+                print(f"Unknown option: {option}", file=sys.stderr)
+                return EXIT_ERROR
+        return run_git_connect(
+            client,
+            repository_url,
+            branch=branch,
+            strategy=strategy,
+            decisions=decisions,
+            confirm_destructive=confirm_destructive,
+        )
 
     if subcmd == "resolve":
         # Parse path=strategy pairs
@@ -1883,7 +1754,10 @@ Subcommands:
   fetch                          Regenerate manifest from DB, fetch remote, show status
   status                         Show changed files and commits ahead/behind
   commit -m "message"            Regenerate manifest, stage, preflight, commit
-  push                           Pull remote + push local + import entities (deploy)
+  sync [--confirm-deletes]       Fetch, reconcile, publish, and import workspace changes
+  connect URL [options]          Preview and connect a workspace repository safely
+  abort-merge                    Restore the working tree before the current merge
+  push                           Deprecated alias for sync
   resolve path=strategy [...]    Resolve merge conflicts (keep_local or keep_remote)
   diff <path>                    Show file diff
   discard <path> [...]           Discard working tree changes
@@ -1891,13 +1765,17 @@ Subcommands:
 Typical workflow:
   bifrost git fetch                     # regenerate manifest, see what's changed
   bifrost git commit -m "sync clients"  # commit DB changes to manifest
-  bifrost git push                      # pull + push + import to deploy
+  bifrost git sync                      # pull + push + import to deploy
 
 Examples:
   bifrost git fetch
   bifrost git status
   bifrost git commit -m "add onboarding workflow"
-  bifrost git push
+  bifrost git sync
+  bifrost git connect https://github.com/example/workspace.git --strategy publish-local
+  bifrost git connect https://github.com/example/workspace.git --strategy start-from-remote --confirm-destructive
+  bifrost git connect https://github.com/example/workspace.git --strategy reconcile --decision workflows/billing.py=local
+  bifrost git abort-merge
   bifrost git resolve workflows/billing.py=keep_remote
   bifrost git diff .bifrost/workflows.yaml
   bifrost git discard workflows/old.py
@@ -2597,10 +2475,6 @@ async def _process_watch_batch(
     watch_app: "WatchApp | None" = None,
 ) -> None:
     """Process a batch of file changes and deletions."""
-    deleted_count, deleted_rels = await _process_watch_deletes(
-        client, deletes, base_path, repo_prefix, state,
-    )
-
     # Build files dict from changed paths. Observer events fire for our own
     # pull writes, too — gate each file on the known-server-hash cache so we
     # don't round-trip content the server already has.
@@ -2627,6 +2501,18 @@ async def _process_watch_batch(
                 push_hashes[repo_path] = file_hash
             except OSError:
                 continue
+
+    validation_error = _validate_python_push_files(push_files)
+    if validation_error:
+        if watch_app:
+            watch_app.log_error(validation_error)
+        else:
+            print(f"Error: {validation_error}", file=sys.stderr, flush=True)
+        return
+
+    deleted_count, deleted_rels = await _process_watch_deletes(
+        client, deletes, base_path, repo_prefix, state,
+    )
 
     ts = datetime.now().strftime('%H:%M:%S')
     if not watch_app:
@@ -3293,6 +3179,24 @@ def _collect_push_files(
     return files, skipped
 
 
+def _validate_python_push_files(files: dict[str, str]) -> str | None:
+    """Validate every selected Python source before this client writes any file."""
+    from bifrost.decorator_validation import validate_python_decorators
+    from bifrost.definition_validation import DefinitionValidationError
+
+    for path, encoded in sorted(files.items()):
+        if not path.endswith(".py"):
+            continue
+        try:
+            source = base64.b64decode(encoded).decode("utf-8")
+            validate_python_decorators(source, path=path)
+        except UnicodeDecodeError:
+            return f"{path}: Python source must be valid UTF-8."
+        except DefinitionValidationError as error:
+            return str(error)
+    return None
+
+
 async def _sync_files(
     local_path: str,
     repo_prefix: str = "",
@@ -3575,6 +3479,16 @@ async def _sync_files(
     if not (result.push or result.pull or result.delete):
         print("Nothing selected.")
         return 0
+
+    selected_sources = {
+        item["repo_path"]: item["_content"]
+        for item in result.push
+        if item["repo_path"].endswith(".py")
+    }
+    validation_error = _validate_python_push_files(selected_sources)
+    if validation_error:
+        print(f"Error: {validation_error}", file=sys.stderr)
+        return 1
 
     progress_items: list[tuple[str, dict[str, Any]]] = []
     for item in result.push:
@@ -3965,18 +3879,16 @@ def print_run_help() -> None:
     print("""
 Usage: bifrost run <file> -w <workflow> [options]
 
-Run a workflow directly. Output is raw JSON (pipeable). Use --interactive for browser UI.
+Run a workflow directly. Output is raw JSON (pipeable).
 
 Arguments:
   file                  Python file containing @workflow decorated functions
 
 Options:
-  --workflow, -w NAME          Workflow to run (required in direct mode)
+  --workflow, -w NAME          Workflow to run (required)
   --params, -p JSON            JSON parameters to pass to the workflow (default: {})
   --organization-id, --org ID  Run as a specific organization (superusers only)
   --verbose, -v                Show status messages (e.g., "Running...", "Result:")
-  --interactive, -i            Open browser-based session instead of direct execution
-  --no-browser, -n             Don't auto-open browser (only with --interactive)
   --help, -h                   Show this help message
 
 Examples:
@@ -3984,7 +3896,6 @@ Examples:
   bifrost run workflow.py -w greet -p '{"name": "World"}'                  # With parameters
   bifrost run workflow.py -w greet -v                                      # Verbose output
   bifrost run workflow.py -w greet | jq .                                  # Pipe to jq
-  bifrost run workflow.py --interactive                                    # Browser-based session
 """.strip())
 
 

@@ -7,24 +7,38 @@ copy-on-write (COW), drastically reducing per-worker memory overhead.
 
 The template process NEVER:
 - Starts an asyncio event loop
-- Opens Redis/DB/RabbitMQ connections
+- Opens Redis/DB connections
 - Spawns background threads
 - Initializes thread-based logging handlers
 
 This ensures clean fork behavior (no inherited locked mutexes).
+
+Two profiles share the fork protocol:
+- ``workflow`` preloads the execution engine and scrubs platform credentials
+  before forking one-shot workflow children.
+- ``agent`` preloads the agent runtime, keeps platform credentials (the agent
+  consumer opens database sessions and decrypts model keys), freezes the
+  collector before accepting forks, and forks one child per ``agent.run``.
 """
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import logging
 import multiprocessing
 import os
 import signal
+import subprocess
 import sys
+from contextlib import suppress
 from multiprocessing.connection import Connection
-from typing import Any
+from typing import Any, Literal, get_args
 
 logger = logging.getLogger(__name__)
+
+# How long a template may take to import and warm before it reports ready.
+TEMPLATE_START_TIMEOUT_SECONDS = 120
 
 
 class _SendQueue:
@@ -78,6 +92,10 @@ class _RecvQueue:
         """Receive an item without blocking."""
         return self.get(block=False)
 
+    def fileno(self) -> int:
+        """Return the result pipe descriptor for event-loop readiness watches."""
+        return self._conn.fileno()
+
     def close(self) -> None:
         try:
             self._conn.close()
@@ -85,10 +103,20 @@ class _RecvQueue:
             # Connection already closed or broken — close is idempotent
             logger.debug(f"_RecvQueue.close ignoring: {e}")
 
+TemplateProfile = Literal["workflow", "agent"]
+
 # Commands sent from consumer to template via pipe
 CMD_FORK = "fork"
 CMD_GET_EXIT_STATUSES = "get_exit_statuses"
 CMD_SHUTDOWN = "shutdown"
+
+
+def _clear_pre_fork_source_clients() -> None:
+    """Drop parent source-loader clients before a child inherits template memory."""
+    from src.core.module_cache_sync import _close_http_client, reset_sync_redis
+
+    _close_http_client()
+    reset_sync_redis()
 
 
 def _reap_children(exit_statuses: dict[int, int]) -> None:
@@ -109,16 +137,19 @@ def _reap_children(exit_statuses: dict[int, int]) -> None:
 
 def _template_main(
     pipe: Connection,
+    profile: TemplateProfile = "workflow",
 ) -> None:
     """
     Entry point for the template process.
 
-    Loads all heavy dependencies, installs import hooks, then waits
-    for fork commands on the pipe. This function runs in the template
-    process (spawned via multiprocessing.spawn).
+    Loads the profile's heavy dependencies, then waits for fork commands on
+    the pipe. This function runs in the template subprocess after the
+    entrypoint restores multiprocessing spawn semantics.
 
     Args:
         pipe: Connection to receive commands from and send responses to consumer.
+        profile: ``workflow`` (scrubbed execution engine) or ``agent``
+            (agent runtime with platform credentials).
     """
     # Configure logging (no thread-based handlers)
     logging.basicConfig(
@@ -126,142 +157,32 @@ def _template_main(
         format="[template] %(levelname)s - %(message)s",
     )
 
-    logger.info(f"Template process starting (PID={os.getpid()})")
+    logger.info(f"Template process starting (PID={os.getpid()}, profile={profile})")
 
-    # ----- Load heavy dependencies -----
-    # These imports pull in the full transitive closure of each library.
-    # After fork, children share these pages via COW.
-    try:
-        # Core bifrost SDK and execution engine
-        try:
-            import bifrost  # noqa: F401
-        except ImportError:
-            logger.warning("bifrost SDK not available — skipping preload")
-
-        try:
-            import httpx  # noqa: F401
-        except ImportError:
-            logger.warning("httpx not available — skipping preload")
-
-        try:
-            import pydantic  # noqa: F401
-        except ImportError:
-            logger.warning("pydantic not available — skipping preload")
-
-        try:
-            import redis  # noqa: F401
-        except ImportError:
-            logger.warning("redis not available — skipping preload")
-
-        try:
-            import sqlalchemy  # noqa: F401
-        except ImportError:
-            logger.warning("sqlalchemy not available — skipping preload")
-
-        # Execution infrastructure
-        try:
-            from src.services.execution.virtual_import import install_virtual_import_hook
-            from src.services.execution.simple_worker import install_requirements
-
-            # Install user packages (pip install from requirements.txt)
-            install_requirements()
-
-            # Ensure user site-packages is in sys.path
-            import site
-            user_site = site.getusersitepackages()
-            if site.ENABLE_USER_SITE and os.path.exists(user_site) and user_site not in sys.path:
-                sys.path.insert(0, user_site)
-                logger.info(f"Added user site-packages to sys.path: {user_site}")
-
-            # Install virtual import hook for workspace modules
-            install_virtual_import_hook()
-        except ImportError as e:
-            logger.warning(f"Execution infrastructure not available: {e} — continuing without it")
-
-    except Exception as e:
-        logger.exception(f"Template process failed to load dependencies: {e}")
-        pipe.send({"status": "error", "error": str(e)})
-        pipe.close()
+    if profile == "agent":
+        ready_fields = _load_agent_runtime(pipe)
+    else:
+        ready_fields = _load_workflow_runtime(pipe)
+    if ready_fields is None:
         return
 
-    # ----- Env scrub (Phase 2, M1) -----
-    # Scrub credentials that the template loaded during startup but that
-    # forked children must NOT inherit.  This point is chosen deliberately:
-    # - AFTER install_requirements() which needs BIFROST_S3_* for cold-cache
-    #   requirements fetch (legacy path) — safe to remove now.
-    # - BEFORE pipe.send({"status": "ready"}) — all forks inherit this scrubbed env.
-    #
-    # Assertion: get_settings() must NOT have been called by this point.
-    # If it were, the lru_cache would hold a Settings object with the secrets;
-    # we log loudly and the cache_clear() below evicts it before priming.
-    from src.config import get_settings
-    try:
-        cache_info = get_settings.cache_info()
-        if cache_info.currsize != 0:
-            logger.error(
-                "SECURITY: get_settings() cache is non-empty at env-scrub point "
-                f"(currsize={cache_info.currsize}). A Settings object holding "
-                "real secrets was constructed during template startup — find and "
-                "remove that call. Evicting it now before the sanitized re-prime."
-            )
-        else:
-            logger.info("get_settings cache_info at scrub: currsize=0 (clean)")
-    except Exception as e:
-        logger.warning(f"Could not check get_settings cache state: {e}")
-
-    _SCRUB_KEYS = [
-        "BIFROST_DATABASE_URL",
-        "BIFROST_DATABASE_URL_SYNC",
-        "BIFROST_RABBITMQ_URL",
-        # S3 credentials: child uses API endpoint fallback (Phase 2 step 2).
-        "BIFROST_S3_ACCESS_KEY",
-        "BIFROST_S3_SECRET_KEY",
-        "BIFROST_S3_ENDPOINT_URL",
-        "BIFROST_S3_BUCKET",
-        "BIFROST_S3_REGION",
-    ]
-    scrubbed = []
-    for key in _SCRUB_KEYS:
-        if key in os.environ:
-            del os.environ[key]
-            scrubbed.append(key)
-    if scrubbed:
-        logger.info(f"Scrubbed {len(scrubbed)} env var(s) from template before fork: {scrubbed}")
-    else:
-        logger.info("Env scrub: no forbidden vars found (already absent — expected in tests)")
-
-    # BIFROST_SECRET_KEY needs more than deletion: Settings.secret_key is
-    # required (min_length=32, no default), and child code calls get_settings()
-    # on every execution (engine.py reads settings.public_url; the SDK redis
-    # helpers read settings.redis_url). Deleting the var outright would crash
-    # Settings construction in every fork; keeping it would hand every child
-    # the JWT-signing key. So: swap in an inert sentinel, prime the
-    # get_settings() cache from the now-scrubbed env, then delete the var.
-    # Forks inherit the cached object via COW: get_settings() keeps working
-    # everywhere in the child, but its secret_key is the sentinel and its
-    # DB/RabbitMQ/S3 fields are localhost defaults. The real key exists in
-    # neither the child's env nor its memory; tokens are pre-minted by the
-    # parent (token hand-down), so nothing in the child signs JWTs.
-    os.environ["BIFROST_SECRET_KEY"] = "scrubbed-execution-children-hold-no-platform-credentials"
-    get_settings.cache_clear()
-    get_settings()
-    del os.environ["BIFROST_SECRET_KEY"]
-    logger.info("SECRET_KEY scrubbed: settings cache primed with inert sentinel, env var removed")
-
-    # Preload the platform execution runtime after credential scrubbing. Every
-    # execution runs in a fresh one-shot fork; leaving this import to the child
-    # makes each request pay the full SDK + engine import cost before the engine
-    # duration timer even starts. Forked children inherit these modules through
-    # copy-on-write, so the pod pays that cost once while workflow code itself
-    # remains freshly loaded per execution.
-    import bifrost.credentials  # noqa: F401
-    import src.models.enums  # noqa: F401
-    import src.sdk.context  # noqa: F401
-    import src.services.execution.engine  # noqa: F401
-    import src.services.execution.worker  # noqa: F401
+    if profile == "agent":
+        # Move everything loaded so far to the permanent generation. A child's
+        # collections then never write to the shared objects' GC headers, so
+        # their pages stay shared with this template instead of being copied
+        # into every run. Collect first so garbage is not frozen with them.
+        gc.collect()
+        gc.freeze()
 
     logger.info("Template process ready — all dependencies loaded")
-    pipe.send({"status": "ready", "pid": os.getpid()})
+    pipe.send({
+        "status": "ready",
+        "pid": os.getpid(),
+        "start_method": multiprocessing.get_start_method(),
+        "process_name": multiprocessing.current_process().name,
+        "frozen_objects": gc.get_freeze_count(),
+        **ready_fields,
+    })
 
     # ----- Fork loop -----
     # Single-threaded, no event loop. Just wait for commands and fork.
@@ -298,9 +219,245 @@ def _template_main(
             persistent = cmd.get("persistent", False)
             work_recv: Connection = cmd["work_recv"]
             result_send: Connection = cmd["result_send"]
-            _handle_fork_request(pipe, worker_id, persistent, work_recv, result_send)
+            sdk_socket_path = cmd.get("sdk_socket_path")
+            _handle_fork_request(
+                pipe, worker_id, persistent, work_recv, result_send,
+                sdk_socket_path, profile,
+            )
 
     logger.info("Template process exiting")
+
+
+def _load_workflow_runtime(pipe: Connection) -> dict[str, Any] | None:
+    """Preload the execution engine and scrub platform credentials.
+
+    Returns extra ``ready`` fields, or None after reporting a startup error.
+    """
+    # ----- Load heavy dependencies -----
+    # These imports pull in the full transitive closure of each library.
+    # After fork, children share these pages via COW.
+    install_virtual_import_hook = None
+    try:
+        # Core bifrost SDK and execution engine
+        try:
+            import bifrost  # noqa: F401
+        except ImportError:
+            logger.warning("bifrost SDK not available — skipping preload")
+
+        try:
+            import httpx  # noqa: F401
+        except ImportError:
+            logger.warning("httpx not available — skipping preload")
+
+        try:
+            import pydantic  # noqa: F401
+        except ImportError:
+            logger.warning("pydantic not available — skipping preload")
+
+        # Execution infrastructure
+        try:
+            from src.services.execution.virtual_import import install_virtual_import_hook
+            # The supervisor installs packages before startup/recycle. Reuse
+            # that filesystem without opening storage clients in this process.
+
+            # Ensure user site-packages is in sys.path
+            import site
+            user_site = site.getusersitepackages()
+            if site.ENABLE_USER_SITE and os.path.exists(user_site) and user_site not in sys.path:
+                sys.path.insert(0, user_site)
+                logger.info(f"Added user site-packages to sys.path: {user_site}")
+
+            # Keep the hook callable loaded, but do not activate it until all
+            # platform modules have been primed below. Once active, intentional
+            # workspace/package-name collisions must be resolved in execution
+            # scope, which the template does not have.
+        except ImportError as e:
+            logger.warning(f"Execution infrastructure not available: {e} — continuing without it")
+
+    except Exception as e:
+        logger.exception(f"Template process failed to load dependencies: {e}")
+        pipe.send({"status": "error", "error": str(e)})
+        pipe.close()
+        return None
+
+    # ----- Env scrub (Phase 2, M1) -----
+    # Scrub credentials that the template loaded during startup but that
+    # forked children must NOT inherit.  This point is chosen deliberately:
+    # - Package installation already finished in the supervisor. This process
+    #   does not need storage credentials or a second requirements fetch.
+    # - BEFORE pipe.send({"status": "ready"}) — all forks inherit this scrubbed env.
+    #
+    # Assertion: get_settings() must NOT have been called by this point.
+    # If it were, the lru_cache would hold a Settings object with the secrets;
+    # we log loudly and the cache_clear() below evicts it before priming.
+    from src.config import get_settings
+    try:
+        cache_info = get_settings.cache_info()
+        if cache_info.currsize != 0:
+            logger.error(
+                "SECURITY: get_settings() cache is non-empty at env-scrub point "
+                f"(currsize={cache_info.currsize}). A Settings object holding "
+                "real secrets was constructed during template startup — find and "
+                "remove that call. Evicting it now before the sanitized re-prime."
+            )
+        else:
+            logger.info("get_settings cache_info at scrub: currsize=0 (clean)")
+    except Exception as e:
+        logger.warning(f"Could not check get_settings cache state: {e}")
+
+    _SCRUB_KEYS = [
+        "BIFROST_DATABASE_URL",
+        "BIFROST_DATABASE_URL_SYNC",
+        # Retired broker; an install upgraded with its old compose file or
+        # manifests still sets this URL, credentials included.
+        "BIFROST_RABBITMQ_URL",
+        "BIFROST_REDIS_URL",
+        "REDIS_URL",
+        "REDIS_HOST",
+        "REDIS_PORT",
+        "REDIS_USERNAME",
+        "REDIS_PASSWORD",
+        "CACHE_REDIS_URL",
+        # S3 credentials: child uses API endpoint fallback (Phase 2 step 2).
+        "BIFROST_S3_ACCESS_KEY",
+        "BIFROST_S3_SECRET_KEY",
+        "BIFROST_S3_ENDPOINT_URL",
+        "BIFROST_S3_BUCKET",
+        "BIFROST_S3_REGION",
+        # Execution children receive a freshly minted process-scoped SDK token
+        # only after fork. Never let ambient API credentials cross the template.
+        "BIFROST_ACCESS_TOKEN",
+        "BIFROST_REFRESH_TOKEN",
+    ]
+    scrubbed = []
+    for key in _SCRUB_KEYS:
+        if key in os.environ:
+            del os.environ[key]
+            scrubbed.append(key)
+    if scrubbed:
+        logger.info(f"Scrubbed {len(scrubbed)} env var(s) from template before fork: {scrubbed}")
+    else:
+        logger.info("Env scrub: no forbidden vars found (already absent — expected in tests)")
+
+    # BIFROST_SECRET_KEY needs more than deletion: Settings.secret_key is
+    # required (min_length=32, no default), and child code calls get_settings()
+    # on every execution (for example engine.py reads settings.public_url).
+    # Deleting the var outright would crash Settings construction in every
+    # fork; keeping it would hand every child the JWT-signing key. Prime the
+    # cache with inert values, then delete them from the environment.
+    # Forks inherit the cached object via COW: get_settings() keeps working
+    # everywhere in the child, but its secret_key is the sentinel and its
+    # DB/S3 fields are localhost defaults and Redis is an unreachable
+    # endpoint. Real platform credentials exist in neither the child's env nor
+    # its memory; tokens are pre-minted by the parent, so nothing in the child
+    # signs JWTs.
+    os.environ["BIFROST_SECRET_KEY"] = "scrubbed-execution-children-hold-no-platform-credentials"
+    os.environ["BIFROST_REDIS_URL"] = "redis://127.0.0.1:0/0"
+    get_settings.cache_clear()
+    get_settings()
+    del os.environ["BIFROST_SECRET_KEY"]
+    del os.environ["BIFROST_REDIS_URL"]
+    logger.info("settings cache primed with inert secret and Redis values, env vars removed")
+
+    # Preload the platform execution runtime after credential scrubbing. Every
+    # execution runs in a fresh one-shot fork; leaving this import to the child
+    # makes each request pay the full SDK + engine import cost before the engine
+    # duration timer even starts. Forked children inherit these modules through
+    # copy-on-write, so the pod pays that cost once while workflow code itself
+    # remains freshly loaded per execution.
+    # SDK calls run under execution tracing; rebuilding models/client code in
+    # every child adds avoidable latency. Share these common runtime modules,
+    # while leaving database and object-storage implementations out entirely.
+    import bifrost.client  # noqa: F401
+    import bifrost.models  # noqa: F401
+    import src.sdk.decorators  # noqa: F401
+    import bifrost.credentials  # noqa: F401
+    import src.models.enums  # noqa: F401
+    import src.sdk.context  # noqa: F401
+    import src.services.execution.engine  # noqa: F401
+    import src.services.execution.worker  # noqa: F401
+
+    # Platform priming must finish before the virtual finder is activated.
+    # Forked children inherit the hook and provide the execution-scoped module
+    # resolver needed for workspace and Solution imports.
+    if install_virtual_import_hook is not None:
+        install_virtual_import_hook()
+
+    return {}
+
+
+def _load_agent_runtime(pipe: Connection) -> dict[str, Any] | None:
+    """Preload the agent runtime with the platform credentials it needs.
+
+    The agent consumer opens database sessions and decrypts the model
+    provider's key, so this profile keeps the environment and settings the
+    workflow profile scrubs. Imports and mapper configuration only: no event
+    loop, thread or connection exists when children fork. The API
+    application (``src.main``) is not loaded; children reach REST over HTTP
+    (see ``src.jobs.agent_run_child``).
+
+    Returns extra ``ready`` fields, or None after reporting a startup error.
+    """
+    try:
+        import asyncpg  # noqa: F401
+        import pydantic_ai.models.openai  # noqa: F401
+        import pydantic_ai.providers.openai  # noqa: F401
+        import sqlalchemy.dialects.postgresql.asyncpg  # noqa: F401
+        from src.jobs.agent_run_child import run_agent_message  # noqa: F401
+        import src.jobs.consumers.agent_run  # noqa: F401
+        import src.services.agent_executor  # noqa: F401
+        import src.services.agent_runtime.tool_policy  # noqa: F401
+        from genai_prices.data_snapshot import get_snapshot
+        from sqlalchemy.orm import configure_mappers
+
+        # SQLAlchemy configures mappers on first use, rewriting every mapper
+        # object. Doing it once here keeps those pages shared instead of
+        # copying them into each child's first query.
+        configure_mappers()
+        # Every run prices its usage and resolves its model from the catalog.
+        # Parsing either per child cost most of a run's CPU and memory; parsed
+        # here, children share them and the catalog's own freshness check
+        # (``get_model_catalog``) still reloads a changed catalog.
+        get_snapshot()
+        asyncio.run(_warm_model_catalog())
+    except Exception as e:
+        logger.exception(f"Agent template failed to load dependencies: {e}")
+        pipe.send({"status": "error", "error": str(e)})
+        pipe.close()
+        return None
+    return {}
+
+
+async def _warm_model_catalog() -> None:
+    """Parse the model catalog once, leaving no connection open for forks."""
+    from src.core.database import close_db, get_db_context, init_db
+    from src.services.model_catalog import get_model_catalog
+
+    await init_db()
+    try:
+        async with get_db_context() as db:
+            await get_model_catalog(db)
+    finally:
+        await close_db()
+
+
+def _template_subprocess_entry(control_fd: int, profile: TemplateProfile) -> None:
+    """
+    Minimal subprocess entrypoint for the template.
+
+    The parent sends the multiprocessing authkey as the first frame on the
+    private inherited control Connection. That happens before any Connection
+    descriptors are received, preserving multiprocessing.resource_sharer
+    authentication without putting the authkey in argv or the environment.
+    """
+    multiprocessing.set_start_method("spawn", force=True)
+    multiprocessing.current_process().name = "template-process"
+    pipe = Connection(control_fd)
+    authkey = pipe.recv_bytes(maxlength=256)
+    if not authkey:
+        raise RuntimeError("template subprocess received an empty authkey")
+    multiprocessing.current_process().authkey = authkey
+    _template_main(pipe, profile)
 
 
 def _handle_fork_request(
@@ -309,6 +466,8 @@ def _handle_fork_request(
     persistent: bool,
     work_recv: Connection,
     result_send: Connection,
+    sdk_socket_path: str | None = None,
+    profile: TemplateProfile = "workflow",
 ) -> None:
     """
     Handle a fork request: fork and wire up pre-created pipe connections.
@@ -321,6 +480,11 @@ def _handle_fork_request(
     We fork, the child inherits them, we close them in the parent and
     reply with just the child_pid.
 
+    Engine SDK access does not travel on an inherited channel: the worker
+    parent serves the ordinary SDK HTTP routes on a private Unix socket and
+    passes its path through ``sdk_socket_path``. The work/result pipes remain
+    the only descriptors handed to the child at fork.
+
     Args:
         pipe: Control pipe to send response back to consumer.
         worker_id: ID to assign to the forked child worker.
@@ -328,22 +492,26 @@ def _handle_fork_request(
                     If False, child runs one execution and exits.
         work_recv: Read end of work pipe (child reads execution IDs from here).
         result_send: Write end of result pipe (child writes results here).
+        sdk_socket_path: Worker-local Unix socket the child should use for
+            engine SDK HTTP calls, or None when no socket is served.
+        profile: The template's profile; selects the child's entry.
     """
+    if profile == "workflow":
+        # The virtual import hook preloads a parent-side HTTP client. Clear
+        # that and any sync Redis source-cache client immediately before fork
+        # so the child reconstructs only its injected worker-UDS transport.
+        _clear_pre_fork_source_clients()
     child_pid = os.fork()
 
     if child_pid > 0:
         # ----- Parent (template) -----
         # Close the child-side connections — the child owns them now
-        try:
-            work_recv.close()
-        except (OSError, BrokenPipeError) as e:
-            # Already closed — ignore
-            logger.debug(f"parent: work_recv.close ignored: {e}")
-        try:
-            result_send.close()
-        except (OSError, BrokenPipeError) as e:
-            # Already closed — ignore
-            logger.debug(f"parent: result_send.close ignored: {e}")
+        for conn in (work_recv, result_send):
+            try:
+                conn.close()
+            except (OSError, BrokenPipeError) as e:
+                # Already closed — ignore
+                logger.debug(f"parent: work/result conn.close ignored: {e}")
 
         # Send child PID back to consumer
         pipe.send({
@@ -353,6 +521,9 @@ def _handle_fork_request(
         })
     else:
         # ----- Child -----
+        from src.services.execution.oom_priority import volunteer_for_oom_kill
+
+        volunteer_for_oom_kill()
         # Close the template's control pipe — child doesn't need it
         try:
             pipe.close()
@@ -361,7 +532,19 @@ def _handle_fork_request(
             logger.debug(f"child: pipe.close ignored: {e}")
 
         # Run the worker function (this blocks until the child exits)
-        _run_forked_child(work_recv, result_send, worker_id, persistent)
+        if profile == "agent":
+            # Never unwind into the template's fork loop or its exit handlers.
+            exit_code = 1
+            try:
+                _run_agent_child(work_recv, result_send, worker_id)
+                exit_code = 0
+            finally:
+                os._exit(exit_code)
+        else:
+            _run_forked_child(
+                work_recv, result_send, worker_id, persistent,
+                sdk_socket_path=sdk_socket_path,
+            )
         os._exit(0)
 
 
@@ -370,30 +553,56 @@ def _run_forked_child(
     result_send: Connection,
     worker_id: str,
     persistent: bool,
+    sdk_socket_path: str | None = None,
 ) -> None:
     """
     Entry point for a forked child process.
 
-    The child inherits all loaded modules from the template via COW.
-    It creates its own event loop and Redis connection fresh.
+    The child inherits all loaded modules from the template via COW and creates
+    its own event loop. Its execution context arrives on the private work pipe.
+    Engine SDK access uses ordinary HTTP over the worker-local Unix socket the
+    parent injects as ``sdk_socket_path``; the child never receives DB, S3, or
+    provider credentials.
 
     Communication uses raw Connection objects (Pipe ends) that were
     inherited via fork — no pickling required.
 
+    When the parent serves a socket (``sdk_socket_path`` is set), the
+    engine socket transport is installed before user code runs and cleared
+    afterwards. This is the explicit injection point: there is no
+    user-controlled flag, and outside this path the SDK uses the network HTTP
+    API.
+
     Args:
-        work_recv: Read end of work pipe; receives execution_ids via .recv().
+        work_recv: Read end of work pipe; receives ``(execution_id, context)``.
         result_send: Write end of result pipe; sends result dicts via .send().
         worker_id: Identifier for logging.
         persistent: If True, loop for multiple executions. If False, run once.
+        sdk_socket_path: Worker-local Unix socket for engine SDK HTTP calls,
+            injected only by the worker parent. When present the child sends
+            the ordinary HTTP request over it instead of the network API.
     """
-    import gc
-
     # Reconfigure logging for this child
     logging.basicConfig(
         level=logging.INFO,
         format=f"[{worker_id}] %(levelname)s - %(message)s",
         force=True,
     )
+
+    # Mark this post-fork child before any user code runs. The scoped SDK
+    # transport uses the worker-local socket when one is injected, otherwise
+    # it uses the ordinary network engine client.
+    from src.core.module_cache_sync import mark_execution_child
+
+    mark_execution_child()
+
+    # Engine start: install the worker-local SDK socket transport before any
+    # user code runs.
+    from bifrost.client import _clear_engine_socket, _install_engine_socket
+
+    if sdk_socket_path is not None:
+        _install_engine_socket(sdk_socket_path)
+        logger.info(f"Forked worker {worker_id} using engine-local SDK socket")
 
     # Setup signal handler for graceful shutdown
     shutdown_requested = False
@@ -416,10 +625,9 @@ def _run_forked_child(
             if not work_recv.poll(timeout=1.0):
                 continue
 
-            execution_id = work_recv.recv()
+            work_item = work_recv.recv()
 
-            if execution_id is None:
-                continue
+            execution_id, context = work_item
 
             logger.info(f"Worker {worker_id} processing execution: {execution_id[:8]}...")
 
@@ -432,7 +640,7 @@ def _run_forked_child(
             # Execute
             try:
                 from src.services.execution.simple_worker import _execute_sync
-                result = _execute_sync(execution_id, worker_id)
+                result = _execute_sync(execution_id, worker_id, context)
             except ImportError:
                 result = {
                     "execution_id": execution_id,
@@ -451,10 +659,10 @@ def _run_forked_child(
                 # bifrost._logging may not be importable; counter cleanup is best-effort
                 logger.debug(f"clear_sequence_counter failed for {execution_id}: {e}")
 
-            # Force GC before measuring RSS
-            gc.collect()
-
-            # Report current RSS
+            # Report current RSS without a full collection. This child is
+            # one-shot and exits immediately after sending the result, so a
+            # stop-the-world collection adds response latency but cannot
+            # reclaim memory for reuse.
             try:
                 from src.services.execution.simple_worker import _get_process_rss
                 process_rss = _get_process_rss()
@@ -507,7 +715,46 @@ def _run_forked_child(
             if not persistent:
                 break
 
+    # Engine teardown: drop the engine socket so a reused (persistent)
+    # child never serves the next execution on a stale socket.
+    _clear_engine_socket()
+
     logger.info(f"Worker {worker_id} exiting")
+
+
+def _run_agent_child(
+    work_recv: Connection,
+    result_send: Connection,
+    worker_id: str,
+) -> None:
+    """Run one ``agent.run`` dispatch in a child forked from the agent template.
+
+    Reads one work item ``{"message": dict}``, runs the agent consumer with
+    connections opened in this child, and replies ``{"ok": True}`` or
+    ``{"ok": False, "error_type": ..., "error": ...}``. A child that dies
+    without replying is reported as a crash by its supervisor.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"[{worker_id}] %(levelname)s - %(message)s",
+        force=True,
+    )
+    try:
+        work_item = work_recv.recv()
+    except (EOFError, OSError):
+        logger.info(f"Agent child {worker_id} work pipe closed before a run arrived")
+        return
+
+    from src.jobs.agent_run_child import run_agent_message
+
+    try:
+        asyncio.run(run_agent_message(work_item["message"]))
+        reply: dict[str, Any] = {"ok": True}
+    # A run that exits or is cancelled still reports how it ended.
+    except (Exception, SystemExit, asyncio.CancelledError) as e:
+        logger.exception(f"Agent child {worker_id} run failed: {e}")
+        reply = {"ok": False, "error_type": type(e).__name__, "error": str(e)}
+    result_send.send(reply)
 
 
 class TemplateProcess:
@@ -516,12 +763,18 @@ class TemplateProcess:
 
     The template process is a long-lived, single-threaded process that
     holds all heavy dependencies in memory and forks children on request.
+    ``profile`` selects what it preloads and what its children run (see the
+    module docstring).
     """
 
-    def __init__(self) -> None:
-        self._process: Any = None  # multiprocessing.Process or SpawnProcess
+    def __init__(self, profile: TemplateProfile = "workflow") -> None:
+        self.profile: TemplateProfile = profile
+        self._process: subprocess.Popen[bytes] | None = None
         self._pipe: Connection | None = None
         self.pid: int | None = None
+        self.start_method: str | None = None
+        self.process_name: str | None = None
+        self.frozen_objects: int | None = None
 
     def start(self) -> None:
         """
@@ -530,36 +783,82 @@ class TemplateProcess:
         Blocks until the template has loaded all dependencies and
         signaled ready, or raises if startup fails.
         """
-        if self._process is not None and self._process.is_alive():
+        if self.is_alive():
             return  # Already running
+        if self._process is not None:
+            self._process.wait(timeout=0)
+            self._process = None
+            self.pid = None
+            self.start_method = None
+            self.process_name = None
+            self.frozen_objects = None
+            if self._pipe is not None:
+                with suppress(OSError, BrokenPipeError):
+                    self._pipe.close()
+                self._pipe = None
 
-        ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = multiprocessing.Pipe()
+        authkey = bytes(multiprocessing.current_process().authkey)
+        argv = [
+            sys.executable,
+            "-m",
+            "src.services.execution.template_process",
+            str(child_conn.fileno()),
+            self.profile,
+        ]
 
-        self._process = ctx.Process(
-            target=_template_main,
-            args=(child_conn,),
-            name="template-process",
-        )
-        self._process.start()
-        self._pipe = parent_conn
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            process = subprocess.Popen(
+                argv,
+                pass_fds=(child_conn.fileno(),),
+                close_fds=True,
+            )
+            child_conn.close()
+            parent_conn.send_bytes(authkey)
 
-        # Wait for ready signal (with timeout)
-        if not parent_conn.poll(timeout=120):
-            self._process.kill()
-            raise RuntimeError("Template process failed to start within 120 seconds")
+            self._process = process
+            self._pipe = parent_conn
 
-        msg = parent_conn.recv()
-        if msg.get("status") == "error":
-            raise RuntimeError(f"Template process startup failed: {msg.get('error')}")
+            # Wait for ready signal (with timeout)
+            if not parent_conn.poll(timeout=TEMPLATE_START_TIMEOUT_SECONDS):
+                process.kill()
+                process.wait(timeout=5)
+                raise RuntimeError(
+                    f"Template process failed to start within {TEMPLATE_START_TIMEOUT_SECONDS} seconds"
+                )
 
-        self.pid = msg.get("pid", self._process.pid)
-        logger.info(f"Template process ready (PID={self.pid})")
+            msg = parent_conn.recv()
+            if msg.get("status") == "error":
+                raise RuntimeError(f"Template process startup failed: {msg.get('error')}")
+
+            self.pid = msg.get("pid", process.pid)
+            self.start_method = msg.get("start_method")
+            self.process_name = msg.get("process_name")
+            self.frozen_objects = msg.get("frozen_objects")
+            logger.info(f"Template process ready (PID={self.pid}, profile={self.profile})")
+        except Exception:
+            with suppress(OSError, BrokenPipeError):
+                child_conn.close()
+            with suppress(OSError, BrokenPipeError):
+                parent_conn.close()
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            self._process = None
+            self._pipe = None
+            self.pid = None
+            self.start_method = None
+            self.process_name = None
+            self.frozen_objects = None
+            raise
 
     def fork(
         self,
         worker_id: str = "worker",
         persistent: bool = False,
+        *,
+        sdk_socket_path: str | None = None,
     ) -> tuple[int, _SendQueue, _RecvQueue]:
         """
         Request the template to fork a new child worker.
@@ -569,13 +868,21 @@ class TemplateProcess:
         process, which passes them to the forked child via fork
         inheritance. The consumer keeps the parent-side ends.
 
+        Engine SDK access does not travel on a dedicated channel. When the
+        worker serves one, the child receives ``sdk_socket_path`` and makes
+        ordinary HTTP requests over that Unix socket instead of the network
+        API.
+
         Args:
             worker_id: Identifier for the new worker (for logging).
             persistent: If True, child loops for multiple executions.
                         If False (default), child runs one execution and exits.
+            sdk_socket_path: Worker-local Unix socket for engine SDK HTTP
+                calls, forwarded to the child at fork. None when the worker
+                serves no socket.
 
         Returns:
-            Tuple of (child_pid, work_queue, result_queue).
+            ``(child_pid, work_queue, result_queue)``.
             work_queue.put(execution_id) sends work to the child.
             result_queue.get() retrieves the result from the child.
 
@@ -591,26 +898,33 @@ class TemplateProcess:
         work_recv, work_send = multiprocessing.Pipe(duplex=False)
         result_recv, result_send = multiprocessing.Pipe(duplex=False)
 
-        # Send fork command with child-side connections (picklable)
-        self._pipe.send({
-            "action": CMD_FORK,
-            "worker_id": worker_id,
-            "persistent": persistent,
-            "work_recv": work_recv,
-            "result_send": result_send,
-        })
+        try:
+            # Send fork command with child-side connections (picklable)
+            self._pipe.send({
+                "action": CMD_FORK,
+                "worker_id": worker_id,
+                "persistent": persistent,
+                "work_recv": work_recv,
+                "result_send": result_send,
+                "sdk_socket_path": sdk_socket_path,
+            })
 
-        # Close child-side connections on our end after sending
-        work_recv.close()
-        result_send.close()
+            # Close child-side connections on our end after sending
+            work_recv.close()
+            result_send.close()
 
-        # Wait for fork response (just child_pid now)
-        if not self._pipe.poll(timeout=30):
-            raise RuntimeError("Template process did not respond to fork request within 30s")
+            # Wait for fork response (just child_pid)
+            if not self._pipe.poll(timeout=30):
+                raise RuntimeError("Template process did not respond to fork request within 30s")
 
-        msg = self._pipe.recv()
-        if msg.get("status") != "forked":
-            raise RuntimeError(f"Unexpected fork response: {msg}")
+            msg = self._pipe.recv()
+            if msg.get("status") != "forked":
+                raise RuntimeError(f"Unexpected fork response: {msg}")
+        except Exception:
+            for conn in (work_recv, work_send, result_recv, result_send):
+                with suppress(OSError, BrokenPipeError):
+                    conn.close()
+            raise
 
         # Return queue-like wrappers around the consumer-side pipe ends.
         # work_queue:   consumer calls .put(execution_id) → sends via work_send
@@ -652,17 +966,35 @@ class TemplateProcess:
                 logger.debug(f"template pipe closed before shutdown send: {e}")
 
         if self._process is not None:
-            self._process.join(timeout=10)
-            if self._process.is_alive():
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
                 self._process.kill()
-                self._process.join(timeout=5)
+                self._process.wait(timeout=5)
+
+        if self._pipe is not None:
+            try:
+                self._pipe.close()
+            except (OSError, BrokenPipeError) as e:
+                logger.debug(f"template pipe close during shutdown ignored: {e}")
 
         self._pipe = None
         self._process = None
         self.pid = None
+        self.start_method = None
+        self.process_name = None
+        self.frozen_objects = None
 
     def is_alive(self) -> bool:
         """Check if the template process is still running."""
         if self._process is None:
             return False
-        return self._process.is_alive()
+        return self._process.poll() is None
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3 or sys.argv[2] not in get_args(TemplateProfile):
+        raise SystemExit(
+            "usage: python -m src.services.execution.template_process <control_fd> <workflow|agent>"
+        )
+    _template_subprocess_entry(int(sys.argv[1]), sys.argv[2])  # pyright: ignore[reportArgumentType]

@@ -8,6 +8,7 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { Bot, MessageSquare } from "lucide-react";
+import { MessageHistoryError } from "./MessageHistoryError";
 import { ChatMessage } from "./ChatMessage";
 import { ChatAttachmentList } from "./ChatAttachmentList";
 import { ChatInput } from "./ChatInput";
@@ -16,26 +17,25 @@ import { ToolExecutionBadge } from "./ToolExecutionBadge";
 import { ToolExecutionGroup } from "./ToolExecutionGroup";
 import { ChatSystemEvent, type SystemEvent } from "./ChatSystemEvent";
 import { ChatRunActivity, getActiveRunLabel } from "./ChatRunActivity";
-import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { NeedsReauthCard, extractNeedsReauth } from "./NeedsReauthCard";
 import { TodoList } from "./TodoList";
 import { useChatStore, useTodos } from "@/stores/chatStore";
 import {
-	useChatModelTiers,
+	useChatModelProfiles,
 	useCreateConversation,
 	useMessages,
 } from "@/hooks/useChat";
 import { useChatStream } from "@/hooks/useChatStream";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { components } from "@/lib/v1";
-import { integrateMessages, type UnifiedMessage } from "@/lib/chat-utils";
+import { generateMessageId } from "@/lib/chat-utils";
+import type { ChatRuntimeMessage } from "@/lib/chat-runtime";
 import {
 	deleteUnboundChatAttachment,
 	uploadChatAttachments,
 	type AttachmentPublic,
 } from "@/services/chatAttachments";
-import type { ChatModelTierId } from "@/services/chatModels";
-import { toast } from "sonner";
+import type { ChatModelProfileId } from "@/services/chatModels";
 
 type MessagePublic = components["schemas"]["MessagePublic"];
 
@@ -58,6 +58,8 @@ interface MessageWithToolCardsProps {
 	message: MessagePublic;
 	/** Map of tool_call_id -> tool result message (for getting execution_id) */
 	toolResultMessages: Map<string, MessagePublic>;
+	/** Map of tool_call_id -> tool call message (its recorded outcome) */
+	toolCallMessages: Map<string, MessagePublic>;
 	/** Conversation ID for retrieving saved tool execution state */
 	conversationId: string;
 	isStreaming?: boolean;
@@ -66,6 +68,7 @@ interface MessageWithToolCardsProps {
 function MessageWithToolCards({
 	message,
 	toolResultMessages,
+	toolCallMessages,
 	conversationId,
 	isStreaming,
 }: MessageWithToolCardsProps) {
@@ -159,6 +162,9 @@ function MessageWithToolCards({
 									toolCall={tc}
 									execution={savedExecution}
 									hasResultMessage={!!resultMsg}
+									toolCallMessage={toolCallMessages.get(
+										tc.id,
+									)}
 								/>
 							),
 						)}
@@ -207,8 +213,12 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 	}, [checkIfAtBottom]);
 
 	// Get messages from API and local cache
-	const { data: apiMessages, isLoading: isLoadingMessages } =
-		useMessages(conversationId);
+	const {
+		isLoading: isLoadingMessages,
+		isError: messagesError,
+		isFetching: fetchingMessages,
+		refetch: refetchMessages,
+	} = useMessages(conversationId);
 	const localMessages = useChatStore(
 		(state) =>
 			(conversationId && state.messagesByConversation[conversationId]) ||
@@ -223,41 +233,55 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 	const streamingMessageId = useChatStore((state) =>
 		conversationId ? state.streamingMessageIds[conversationId] : null,
 	);
+	const contextUsage = useChatStore((state) =>
+		conversationId
+			? (state.projectionsByConversation[conversationId]?.context_usage ?? null)
+			: null,
+	);
 	const todos = useTodos();
 	const setActiveConversation = useChatStore(
 		(state) => state.setActiveConversation,
 	);
 	const setActiveAgent = useChatStore((state) => state.setActiveAgent);
 	const createConversation = useCreateConversation();
-	const { data: modelTierData } = useChatModelTiers();
-	const [selectedModelTier, setSelectedModelTier] =
-		useState<ChatModelTierId>("balanced");
-	const modelTiers = modelTierData?.tiers ?? [
-		{
-			id: "balanced" as const,
-			label: "Balanced",
-			capabilities: {
-				image_input: false,
-				pdf_input: false,
-				tool_calling: false,
-				source: "unknown" as const,
-				fingerprint: "",
-			},
-		},
-	];
-	const effectiveModelTier = modelTiers.some(
-		(tier) => tier.id === selectedModelTier,
+	const { data: modelProfileData } = useChatModelProfiles();
+	const [selectedModelProfileId, setSelectedModelProfileId] =
+		useState<ChatModelProfileId | null>(null);
+	const modelProfiles = modelProfileData?.profiles ?? [];
+	const contextModelProfileId = modelProfiles.some(
+		(profile) => profile.id === contextUsage?.model_profile_id,
 	)
-		? selectedModelTier
-		: (modelTierData?.default_tier ?? "balanced");
+		? (contextUsage?.model_profile_id ?? null)
+		: null;
+	const effectiveModelProfileId = modelProfiles.some(
+		(profile) => profile.id === selectedModelProfileId,
+	)
+		? selectedModelProfileId
+		: (contextModelProfileId ??
+			modelProfileData?.default_profile_id ??
+			modelProfiles[0]?.id ??
+			null);
+
+	const previousConversationIdRef = useRef(conversationId);
+	useEffect(() => {
+		const previousConversationId = previousConversationIdRef.current;
+		if (
+			previousConversationId !== undefined &&
+			previousConversationId !== conversationId
+		) {
+			setSelectedModelProfileId(null);
+		}
+		previousConversationIdRef.current = conversationId;
+	}, [conversationId]);
 
 	// Use WebSocket streaming
 	const {
 		sendMessage,
 		isStreaming,
-		pendingQuestion,
-		answerQuestion,
 		stopStreaming,
+		isRestoring,
+		restoreError,
+		retryRestore,
 	} = useChatStream({
 		conversationId,
 		onError: (error) => {
@@ -265,13 +289,9 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 		},
 	});
 
-	// Merge API and local messages using unified message model
-	const messages = useMemo(() => {
-		const apiMsgs = (apiMessages || []) as UnifiedMessage[];
-		const localMsgs = localMessages as UnifiedMessage[];
-
-		return integrateMessages(apiMsgs, localMsgs);
-	}, [apiMessages, localMessages]);
+	// The normalized projection is the only render source. Server snapshots and
+	// realtime events are reconciled into it before reaching this component.
+	const messages = localMessages;
 
 	// Build a map of tool_call_id -> tool result message for reconstructing state
 	const toolResultMessages = useMemo(() => {
@@ -285,10 +305,30 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 		return map;
 	}, [messages]);
 
+	// Tool call messages keep the tool's outcome after run retention removes
+	// the execution it ran as.
+	const toolCallMessages = useMemo(() => {
+		const map = new Map<string, MessagePublic>();
+		for (const msg of messages) {
+			if (msg.role === "tool_call" && msg.tool_call_id) {
+				map.set(msg.tool_call_id, msg);
+			}
+		}
+		return map;
+	}, [messages]);
+
 	// Create a unified timeline of messages and system events
 	const timeline = useMemo<TimelineItem[]>(() => {
 		const items: TimelineItem[] = [];
 		let currentToolGroup: MessagePublic[] = [];
+		const placedEventIds = new Set<string>();
+		const eventsByTurnId = new Map<string, SystemEvent[]>();
+		for (const event of systemEvents) {
+			if (!event.turnId) continue;
+			const turnEvents = eventsByTurnId.get(event.turnId) ?? [];
+			turnEvents.push(event);
+			eventsByTurnId.set(event.turnId, turnEvents);
+		}
 
 		const flushToolGroup = () => {
 			if (currentToolGroup.length > 0) {
@@ -316,25 +356,46 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 					data: msg,
 					timestamp: msg.created_at,
 				});
+
+				if (msg.role === "user") {
+					const runtimeMessage = msg as ChatRuntimeMessage;
+					const turnIds = [msg.id, runtimeMessage.local_id].filter(
+						(value): value is string => Boolean(value),
+					);
+					for (const turnId of turnIds) {
+						for (const event of eventsByTurnId.get(turnId) ?? []) {
+							if (placedEventIds.has(event.id)) continue;
+							items.push({
+								type: "event",
+								data: event,
+								timestamp: event.timestamp,
+							});
+							placedEventIds.add(event.id);
+						}
+					}
+				}
 			}
 		}
 		flushToolGroup();
 
-		// Add system events
+		// Events created before turn anchoring was available retain their timestamp
+		// position. Anchored events are already placed immediately after the user
+		// message that caused them, independent of browser/server clock skew.
 		for (const event of systemEvents) {
-			items.push({
+			if (placedEventIds.has(event.id)) continue;
+			const eventItem: TimelineItem = {
 				type: "event",
 				data: event,
 				timestamp: event.timestamp,
-			});
+			};
+			const insertionIndex = items.findIndex(
+				(item) =>
+					new Date(item.timestamp).getTime() >
+					new Date(event.timestamp).getTime(),
+			);
+			if (insertionIndex === -1) items.push(eventItem);
+			else items.splice(insertionIndex, 0, eventItem);
 		}
-
-		// Sort by timestamp
-		items.sort(
-			(a, b) =>
-				new Date(a.timestamp).getTime() -
-				new Date(b.timestamp).getTime(),
-		);
 
 		return items;
 	}, [messages, systemEvents]);
@@ -368,25 +429,44 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 				behavior: isStreaming ? "auto" : "smooth",
 			});
 		}
-	}, [messages, systemEvents, pendingQuestion, isAtBottom, isStreaming]);
+	}, [messages, systemEvents, isAtBottom, isStreaming]);
 
 	// Handle send message
 	const handleSendMessage = async (
 		message: string,
 		files: File[],
-		modelTier: ChatModelTierId,
+		modelProfileId: ChatModelProfileId | null,
 	) => {
 		let uploaded: AttachmentPublic[] = [];
 		let targetConversationId = conversationId;
+		let createdConversation: {
+			id: string;
+			agent_id?: string | null;
+		} | null = null;
 		try {
-			if (!targetConversationId) {
-				const data = await createConversation.mutateAsync({
+			if (!targetConversationId && files.length === 0) {
+				targetConversationId = generateMessageId();
+				// Stage the optimistic turn before activating the route. Activating an
+				// empty conversation first gives React one render in which the message
+				// query is loading and briefly flashes the history skeleton.
+				const submission = sendMessage(
+					message,
+					targetConversationId,
+					[],
+					modelProfileId,
+				);
+				setActiveConversation(targetConversationId);
+				setActiveAgent(null);
+				navigate(`/chat/${targetConversationId}`, {
+					state: { preserveChatDraft: true },
+				});
+				await submission;
+				return;
+			} else if (!targetConversationId) {
+				createdConversation = await createConversation.mutateAsync({
 					body: { channel: "chat" },
 				});
-				targetConversationId = data.id;
-				setActiveConversation(data.id);
-				setActiveAgent(data.agent_id ?? null);
-				navigate(`/chat/${data.id}`);
+				targetConversationId = createdConversation.id;
 			}
 
 			if (files.length > 0) {
@@ -394,12 +474,20 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 					await uploadChatAttachments(targetConversationId, files)
 				).attachments;
 			}
-			await sendMessage(
+			const submission = sendMessage(
 				message,
 				targetConversationId,
 				uploaded,
-				modelTier,
+				modelProfileId,
 			);
+			if (createdConversation) {
+				setActiveConversation(createdConversation.id);
+				setActiveAgent(createdConversation.agent_id ?? null);
+				navigate(`/chat/${createdConversation.id}`, {
+					state: { preserveChatDraft: true },
+				});
+			}
+			await submission;
 		} catch (error) {
 			if (targetConversationId && uploaded.length > 0) {
 				const cleanupConversationId = targetConversationId;
@@ -412,11 +500,7 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 					),
 				);
 			}
-			const description =
-				error instanceof Error
-					? error.message
-					: "Could not send this message.";
-			toast.error("Message not sent", { description });
+
 			throw error;
 		}
 	};
@@ -437,22 +521,66 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 					</p>
 				</div>
 				<ChatInput
+					key="composer"
 					onSend={handleSendMessage}
 					disabled={createConversation.isPending}
 					placeholder="Send a message..."
-					modelTiers={modelTiers}
-					modelTier={effectiveModelTier}
-					onModelTierChange={setSelectedModelTier}
+					modelProfiles={modelProfiles}
+					modelProfileId={effectiveModelProfileId}
+					onModelProfileChange={setSelectedModelProfileId}
+					contextUsage={contextUsage}
 				/>
 			</div>
 		);
 	}
 
-	// Loading state
-	if (isLoadingMessages) {
+	const historyError =
+		messagesError || restoreError ? (
+			<MessageHistoryError
+				cached={localMessages.length > 0 || isStreaming}
+				pending={fetchingMessages || isRestoring}
+				onRetry={() => {
+					void refetchMessages();
+					retryRestore();
+				}}
+			/>
+		) : null;
+	if (
+		(messagesError || restoreError) &&
+		localMessages.length === 0 &&
+		!isStreaming &&
+		systemEvents.length === 0
+	) {
+		return (
+			<div className="flex min-h-0 flex-1 flex-col">
+				<div className="flex-1 overflow-y-auto">{historyError}</div>
+				<ChatInput
+					key="composer"
+					onSend={handleSendMessage}
+					disabled
+					modelProfiles={modelProfiles}
+					modelProfileId={effectiveModelProfileId}
+					onModelProfileChange={setSelectedModelProfileId}
+					contextUsage={contextUsage}
+				/>
+			</div>
+		);
+	}
+
+	// Loading state. If the durable runtime already has optimistic or streamed
+	// state, render it immediately instead of flashing skeletons over the turn.
+	if (
+		(isLoadingMessages || isRestoring) &&
+		localMessages.length === 0 &&
+		!isStreaming
+	) {
 		return (
 			<div className="flex-1 min-h-0 flex flex-col">
-				<div className="flex-1 p-4 space-y-4">
+				<div
+					role="status"
+					aria-label="Loading messages"
+					className="flex-1 p-4 space-y-4"
+				>
 					{[1, 2, 3].map((i) => (
 						<div key={i} className="flex gap-3">
 							<Skeleton className="h-8 w-8 rounded-full" />
@@ -464,11 +592,13 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 					))}
 				</div>
 				<ChatInput
+					key="composer"
 					onSend={handleSendMessage}
 					disabled
-					modelTiers={modelTiers}
-					modelTier={effectiveModelTier}
-					onModelTierChange={setSelectedModelTier}
+					modelProfiles={modelProfiles}
+					modelProfileId={effectiveModelProfileId}
+					onModelProfileChange={setSelectedModelProfileId}
+					contextUsage={contextUsage}
 				/>
 			</div>
 		);
@@ -493,11 +623,13 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 					</p>
 				</div>
 				<ChatInput
+					key="composer"
 					onSend={handleSendMessage}
 					placeholder="Send a message..."
-					modelTiers={modelTiers}
-					modelTier={effectiveModelTier}
-					onModelTierChange={setSelectedModelTier}
+					modelProfiles={modelProfiles}
+					modelProfileId={effectiveModelProfileId}
+					onModelProfileChange={setSelectedModelProfileId}
+					contextUsage={contextUsage}
 				/>
 			</div>
 		);
@@ -536,7 +668,8 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 								result={tc.tool_result}
 								error={
 									tc.tool_state === "error"
-										? (tc.tool_result as { error?: string })?.error
+										? (tc.tool_result as { error?: string })
+												?.error
 										: undefined
 								}
 								durationMs={tc.duration_ms || undefined}
@@ -558,7 +691,12 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 					{item.data.map((tc) => {
 						const reauth = extractNeedsReauth(tc.tool_result);
 						if (!reauth) return null;
-						return <NeedsReauthCard key={`reauth-${tc.id}`} metadata={reauth} />;
+						return (
+							<NeedsReauthCard
+								key={`reauth-${tc.id}`}
+								metadata={reauth}
+							/>
+						);
 					})}
 				</div>
 			);
@@ -570,9 +708,11 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 				key={msg.id}
 				message={msg}
 				toolResultMessages={toolResultMessages}
+				toolCallMessages={toolCallMessages}
 				conversationId={conversationId}
 				isStreaming={
-					(msg as UnifiedMessage).isStreaming || msg.id === streamingMessageId
+					(msg as ChatRuntimeMessage).is_streaming ||
+					msg.id === streamingMessageId
 				}
 			/>
 		);
@@ -580,6 +720,7 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 
 	return (
 		<div className="flex-1 min-h-0 flex flex-col h-full overflow-hidden">
+			{historyError}
 			{/* Messages Area */}
 			<div
 				ref={containerRef}
@@ -590,8 +731,6 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 					{/* Unified user turns and their progressive activity */}
 					{preludeItems.map((item) => renderTimelineItem(item))}
 					{turns.map((turn, turnIndex) => {
-						const isActiveTurn =
-							isStreaming && turnIndex === turns.length - 1;
 						const assistantIndexes = turn.activity
 							.map((item, index) =>
 								item.type === "message" &&
@@ -601,35 +740,56 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 									: -1,
 							)
 							.filter((index) => index >= 0);
-						const finalAssistantIndex = assistantIndexes.at(-1) ?? -1;
+						const finalAssistantIndex =
+							assistantIndexes.at(-1) ?? -1;
 						const finalAssistant =
 							finalAssistantIndex >= 0
 								? turn.activity[finalAssistantIndex]
 								: undefined;
+						const isActiveTurn =
+							isStreaming && turnIndex === turns.length - 1;
 						const isFinalResponseStreaming =
 							isActiveTurn &&
 							finalAssistant?.type === "message" &&
-							(Boolean((finalAssistant.data as UnifiedMessage).isStreaming) ||
+							(Boolean(
+								(finalAssistant.data as ChatRuntimeMessage)
+									.is_streaming,
+							) ||
 								finalAssistant.data.id === streamingMessageId);
 						const runSummaryAssistant = turn.activity
 							.filter(
-								(item): item is Extract<TimelineItem, { type: "message" }> =>
+								(
+									item,
+								): item is Extract<
+									TimelineItem,
+									{ type: "message" }
+								> =>
 									item.type === "message" &&
 									item.data.role === "assistant" &&
 									item.data.duration_ms != null,
 							)
 							.at(-1);
+						const hasCompletedRun =
+							Boolean(runSummaryAssistant) ||
+							(finalAssistant?.type === "message" &&
+								Boolean(
+									(finalAssistant.data as ChatRuntimeMessage)
+										.is_final,
+								));
 						const durationMs =
 							runSummaryAssistant?.type === "message"
 								? runSummaryAssistant.data.duration_ms
 								: turn.activity
-									.flatMap((item) =>
-										item.type === "tool_group" ? item.data : [],
-									)
-									.reduce(
-										(total, tool) => total + (tool.duration_ms ?? 0),
-										0,
-									);
+										.flatMap((item) =>
+											item.type === "tool_group"
+												? item.data
+												: [],
+										)
+										.reduce(
+											(total, tool) =>
+												total + (tool.duration_ms ?? 0),
+											0,
+										);
 						const runningTool = turn.activity
 							.flatMap((item) =>
 								item.type === "tool_group" ? item.data : [],
@@ -640,7 +800,10 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 						const detailItems = turn.activity.filter(
 							(item, index) =>
 								index !== finalAssistantIndex &&
-								!(item.type === "event" && item.data.type === "error") &&
+								!(
+									item.type === "event" &&
+									item.data.type === "error"
+								) &&
 								!(
 									item.type === "message" &&
 									item.data.role === "assistant" &&
@@ -650,18 +813,22 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 								),
 						);
 						const errors = turn.activity.filter(
-							(item) => item.type === "event" && item.data.type === "error",
+							(item) =>
+								item.type === "event" &&
+								item.data.type === "error",
 						);
 						const artifacts = turn.activity.flatMap((item) =>
 							item.type === "tool_group"
-								? item.data.flatMap((tool) => tool.attachments ?? [])
+								? item.data.flatMap(
+										(tool) => tool.attachments ?? [],
+									)
 								: [],
 						);
 
 						return (
 							<div key={`turn-${turn.user.timestamp}`}>
 								{renderTimelineItem(turn.user)}
-								{(isActiveTurn || turn.activity.length > 0) && (
+								{(isActiveTurn || hasCompletedRun) && (
 									<ChatRunActivity
 										isActive={isActiveTurn}
 										durationMs={durationMs}
@@ -691,7 +858,8 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 									/>
 								)}
 								{errors.map((item) => renderTimelineItem(item))}
-								{finalAssistant && renderTimelineItem(finalAssistant)}
+								{finalAssistant &&
+									renderTimelineItem(finalAssistant)}
 							</div>
 						);
 					})}
@@ -701,30 +869,23 @@ export function ChatWindow({ conversationId, agentName }: ChatWindowProps) {
 						<TodoList todos={todos} className="my-4" />
 					)}
 
-					{/* AskUserQuestion Card - inline at end of stream */}
-					{pendingQuestion && (
-						<AskUserQuestionCard
-							questions={pendingQuestion.questions}
-							onSubmit={answerQuestion}
-							onCancel={stopStreaming}
-						/>
-					)}
-
 					<div ref={messagesEndRef} />
 				</div>
 			</div>
 
 			{/* Input Area */}
 			<ChatInput
+				key="composer"
 				onSend={handleSendMessage}
 				isLoading={isStreaming}
 				onStop={stopStreaming}
 				placeholder={
 					agentName ? `Message ${agentName}...` : "Send a message..."
 				}
-				modelTiers={modelTiers}
-				modelTier={effectiveModelTier}
-				onModelTierChange={setSelectedModelTier}
+				modelProfiles={modelProfiles}
+				modelProfileId={effectiveModelProfileId}
+				onModelProfileChange={setSelectedModelProfileId}
+				contextUsage={contextUsage}
 			/>
 		</div>
 	);

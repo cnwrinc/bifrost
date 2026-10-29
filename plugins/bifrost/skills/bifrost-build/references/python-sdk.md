@@ -64,9 +64,11 @@ from bifrost import workflows
 
 execution_id = await workflows.execute(
     "functions/notify.py::send",
-    input_data={"recipient": "user@example.com"},
+    input_data={"ticket_id": 4821},
 )
 ```
+
+Never pass the caller's identity (email, user id, org) as input. The child reads it from `context` (`from bifrost import context`); see `best-practices/security.md`.
 
 Use delayed execution for scheduling, then query/cancel through the same namespace. A nested loose workflow resolved by an open Solution executes in its own loose context; it does not inherit Solution ownership.
 
@@ -90,17 +92,18 @@ Treat event payloads as a versioned contract. Topic-triggered execution context 
 
 ### `agents`
 
-Use `agents.run()` when workflow orchestration needs a configured Bifrost agent. The result may be structured data or text according to the agent contract. Set bounded timeouts and do not recursively delegate without a stopping condition.
+Use `agents.run()` when workflow orchestration needs to wait for a configured Bifrost agent. The result may be structured data or text according to the agent contract. Use `agents.enqueue()` to return immediately with a run ID, then call `agents.get_run()` when you need its current status or result. Set bounded timeouts for synchronous runs and do not recursively delegate without a stopping condition.
 
 ### `ai`
 
-Use the configured model provider for completion, structured output, or streaming. Prefer structured output for machine-consumed results and validate it before side effects.
+Use the configured model provider for completion, structured output, or streaming. `ai.complete()` uses the profile marked Default unless `profile=` names another reusable profile. Prefer structured output for machine-consumed results and validate it before side effects.
 
 ```python
 from bifrost import ai
 
 response = await ai.complete(
     prompt="Summarize the incident in three bullets.",
+    profile="Summarization",  # Omit to use the platform default profile.
     max_tokens=250,
 )
 summary = response.content
@@ -127,7 +130,8 @@ These privileged namespaces manage tenant and identity state. Resolve the target
 - Omit explicit scope to use the current execution context.
 - Pass an organization scope only when the SDK method supports it and the caller is authorized.
 - Solution context is carried automatically for tables, files, and workflow resolution.
-- `global_repo_access` changes fallback for modules, workflows, tables, and files—not configs, integrations, or knowledge.
+- Pass `solution=` (install UUID or slug) to reach another install per-call on `workflows.execute`, `tables.query`/`get`/`insert`, `files.read`, and `events.emit`; it resolves inside the resolved org scope and the target's `allow_inbound_access` gate decides. Read `solution-resource-access.md` before targeting cross-install.
+- `allow_outbound_access` changes fallback for modules, workflows, tables, and files—not configs, integrations, or knowledge.
 - SDK access never bypasses policies, roles, org boundaries, or external-user restrictions.
 
 ## Verification

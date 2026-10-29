@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import src.core.module_cache_sync as module_cache_sync
+
 
 class TestModuleCacheAsync:
     """Tests for async module cache functions."""
@@ -18,6 +20,11 @@ class TestModuleCacheAsync:
         """Create a mock async Redis client."""
         mock_client = AsyncMock()
         mock_redis = AsyncMock()
+        pipeline = MagicMock()
+        pipeline.__aenter__ = AsyncMock(return_value=pipeline)
+        pipeline.__aexit__ = AsyncMock()
+        pipeline.execute = AsyncMock()
+        mock_redis.pipeline = MagicMock(return_value=pipeline)
         mock_client._get_redis = AsyncMock(return_value=mock_redis)
         mock_client.get = AsyncMock()
         mock_client.setex = AsyncMock()
@@ -187,31 +194,6 @@ class TestModuleCacheAsync:
             mock_client.delete.assert_called_once_with("bifrost:module:shared/test.py")
             mock_redis.srem.assert_called_once_with("bifrost:module:index", "shared/test.py")
 
-    async def test_get_all_module_paths(self, mock_redis_client):
-        """Test getting all cached module paths."""
-        mock_client, mock_redis = mock_redis_client
-        mock_redis.smembers.return_value = {"shared/a.py", "shared/b.py", "modules/c.py"}
-
-        with patch("src.core.module_cache.get_redis_client", return_value=mock_client):
-            from src.core.module_cache import get_all_module_paths
-
-            result = await get_all_module_paths()
-
-            assert result == {"shared/a.py", "shared/b.py", "modules/c.py"}
-            mock_redis.smembers.assert_called_once_with("bifrost:module:index")
-
-    async def test_get_all_module_paths_empty(self, mock_redis_client):
-        """Test getting module paths when cache is empty."""
-        mock_client, mock_redis = mock_redis_client
-        mock_redis.smembers.return_value = set()
-
-        with patch("src.core.module_cache.get_redis_client", return_value=mock_client):
-            from src.core.module_cache import get_all_module_paths
-
-            result = await get_all_module_paths()
-
-            assert result == set()
-
     async def test_clear_module_cache(self, mock_redis_client):
         """Test clearing all modules from cache."""
         mock_client, mock_redis = mock_redis_client
@@ -255,9 +237,7 @@ class TestModuleCacheSync:
         mock_sync_redis.get.return_value = json.dumps(cached_data)
 
         with patch("src.core.module_cache_sync._get_sync_redis", return_value=mock_sync_redis):
-            from src.core.module_cache_sync import get_module_sync
-
-            result = get_module_sync("shared/test.py")
+            result = module_cache_sync.get_module_sync("shared/test.py")
 
             assert result is not None
             assert result["content"] == "print('hello')"
@@ -268,9 +248,7 @@ class TestModuleCacheSync:
         mock_sync_redis.get.return_value = None
 
         with patch("src.core.module_cache_sync._get_sync_redis", return_value=mock_sync_redis):
-            from src.core.module_cache_sync import get_module_sync
-
-            result = get_module_sync("nonexistent.py")
+            result = module_cache_sync.get_module_sync("nonexistent.py")
 
             assert result is None
 
@@ -281,60 +259,24 @@ class TestModuleCacheSync:
         mock_sync_redis.get.side_effect = redis.RedisError("Connection failed")
 
         with patch("src.core.module_cache_sync._get_sync_redis", return_value=mock_sync_redis):
-            from src.core.module_cache_sync import get_module_sync
-
-            result = get_module_sync("shared/test.py")
+            result = module_cache_sync.get_module_sync("shared/test.py")
 
             assert result is None
 
-    def test_get_module_index_sync(self, mock_sync_redis):
-        """Test getting module index synchronously."""
-        mock_sync_redis.smembers.return_value = {"shared/a.py", "modules/b.py"}
-
-        with patch("src.core.module_cache_sync._get_sync_redis", return_value=mock_sync_redis):
-            from src.core.module_cache_sync import get_module_index_sync
-
-            result = get_module_index_sync()
-
-            assert result == {"shared/a.py", "modules/b.py"}
-            mock_sync_redis.smembers.assert_called_once_with("bifrost:module:index")
-
-    def test_get_module_index_sync_empty(self, mock_sync_redis):
-        """Test getting empty module index.
-
-        When Redis returns an empty set, the function falls back to listing S3.
-        Patch the S3 helper to return empty too, otherwise this test would hit
-        the real S3 client (populated by other tests in the shared test stack).
-        """
-        mock_sync_redis.smembers.return_value = set()
-
-        with patch("src.core.module_cache_sync._get_sync_redis", return_value=mock_sync_redis), \
-             patch("src.core.module_cache_sync._list_s3_modules", return_value=set()):
-            from src.core.module_cache_sync import get_module_index_sync
-
-            result = get_module_index_sync()
-
-            assert result == set()
-
-    def test_get_module_index_sync_handles_redis_error(self, mock_sync_redis):
-        """Test that Redis errors return empty set."""
-        import redis
-
-        mock_sync_redis.smembers.side_effect = redis.RedisError("Connection failed")
-
-        with patch("src.core.module_cache_sync._get_sync_redis", return_value=mock_sync_redis):
-            from src.core.module_cache_sync import get_module_index_sync
-
-            result = get_module_index_sync()
-
-            assert result == set()
-
     def test_reset_sync_redis(self):
         """Test resetting the sync Redis client."""
-        from src.core.module_cache_sync import reset_sync_redis
-
         # Should not raise
-        reset_sync_redis()
+        module_cache_sync.reset_sync_redis()
+
+    def test_reset_sync_redis_closes_cached_client(self):
+        """A cached parent client cannot cross a later execution fork."""
+        client = MagicMock()
+        module_cache_sync._sync_redis_client = client
+        try:
+            module_cache_sync.reset_sync_redis()
+            client.close.assert_called_once_with()
+        finally:
+            module_cache_sync.reset_sync_redis()
 
 
 class TestCachedModuleTypedDict:
@@ -375,9 +317,100 @@ class TestKeyPatterns:
         """Verify async and sync modules use same key patterns."""
         from src.core.module_cache import MODULE_INDEX_KEY as ASYNC_INDEX
         from src.core.module_cache import MODULE_KEY_PREFIX as ASYNC_PREFIX
-        from src.core.module_cache_sync import MODULE_INDEX_KEY as SYNC_INDEX
-        from src.core.module_cache_sync import MODULE_KEY_PREFIX as SYNC_PREFIX
 
         # Both modules should import from module_cache, so these should be identical
-        assert ASYNC_PREFIX == SYNC_PREFIX
-        assert ASYNC_INDEX == SYNC_INDEX
+        assert ASYNC_PREFIX == module_cache_sync.MODULE_KEY_PREFIX
+        assert ASYNC_INDEX == module_cache_sync.MODULE_INDEX_KEY
+
+
+@pytest.mark.asyncio
+async def test_set_module_invalidates_resolution_cache_for_exact_and_ancestors():
+    path = "modules/helpers/tool.py"
+    names = ["modules", "modules.helpers", "modules.helpers.tool"]
+    from src.core.module_cache import set_module
+    from src.core.module_cache_contract import MODULE_RESOLUTION_GENERATION_PREFIX
+
+    pipeline = MagicMock()
+    pipeline.__aenter__ = AsyncMock(return_value=pipeline)
+    pipeline.__aexit__ = AsyncMock()
+    pipeline.execute = AsyncMock()
+    connection = AsyncMock()
+    connection.pipeline = MagicMock(return_value=pipeline)
+    client = AsyncMock()
+    client._get_redis.return_value = connection
+    with patch("src.core.module_cache.get_redis_client", return_value=client):
+        await set_module(path, "VALUE = 1", "hash")
+
+    assert [call.args[0] for call in pipeline.set.call_args_list] == [
+        f"{MODULE_RESOLUTION_GENERATION_PREFIX}{name}" for name in names
+    ]
+    assert all(call.kwargs == {"ex": 86400} for call in pipeline.set.call_args_list)
+    connection.pipeline.assert_called_once_with(transaction=True)
+    connection.scan_iter.assert_not_called()
+    connection.delete.assert_not_awaited()
+    pipeline.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_module_resolution_cache_handles_solution_package_paths():
+    path = "_solutions/solution-a/workflows/triage/__init__.py"
+    names = ["workflows", "workflows.triage"]
+    from src.core.module_cache import invalidate_module_resolution_cache
+    from src.core.module_cache_contract import MODULE_RESOLUTION_GENERATION_PREFIX
+
+    pipeline = MagicMock()
+    pipeline.__aenter__ = AsyncMock(return_value=pipeline)
+    pipeline.__aexit__ = AsyncMock()
+    pipeline.execute = AsyncMock()
+    connection = AsyncMock()
+    connection.pipeline = MagicMock(return_value=pipeline)
+    client = AsyncMock()
+    client._get_redis.return_value = connection
+    with patch("src.core.module_cache.get_redis_client", return_value=client):
+        await invalidate_module_resolution_cache(path)
+
+    assert [call.args[0] for call in pipeline.set.call_args_list] == [
+        f"{MODULE_RESOLUTION_GENERATION_PREFIX}{name}" for name in names
+    ]
+    assert all(call.kwargs == {"ex": 86400} for call in pipeline.set.call_args_list)
+    connection.pipeline.assert_called_once_with(transaction=True)
+    connection.scan_iter.assert_not_called()
+    connection.delete.assert_not_awaited()
+    pipeline.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_module_resolution_cache_skips_delete_when_no_names_match():
+    """Invalidation never enumerates or deletes scoped result keys, even cold."""
+    path = "modules/helpers/tool.py"
+    names = ["modules", "modules.helpers", "modules.helpers.tool"]
+    from src.core.module_cache import invalidate_module_resolution_cache
+    from src.core.module_cache_contract import MODULE_RESOLUTION_GENERATION_PREFIX
+
+    pipeline = MagicMock()
+    pipeline.__aenter__ = AsyncMock(return_value=pipeline)
+    pipeline.__aexit__ = AsyncMock()
+    pipeline.execute = AsyncMock()
+    connection = AsyncMock()
+    connection.pipeline = MagicMock(return_value=pipeline)
+    client = AsyncMock()
+    client._get_redis.return_value = connection
+    with patch("src.core.module_cache.get_redis_client", return_value=client):
+        await invalidate_module_resolution_cache(path)
+
+    assert [call.args[0] for call in pipeline.set.call_args_list] == [
+        f"{MODULE_RESOLUTION_GENERATION_PREFIX}{name}" for name in names
+    ]
+    assert all(call.kwargs == {"ex": 86400} for call in pipeline.set.call_args_list)
+    connection.pipeline.assert_called_once_with(transaction=True)
+    connection.scan_iter.assert_not_called()
+    connection.delete.assert_not_awaited()
+    pipeline.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_module_resolution_cache_skips_empty_names():
+    from src.core.module_cache import invalidate_module_resolution_cache
+    with patch("src.core.module_cache.get_redis_client") as client:
+        await invalidate_module_resolution_cache("")
+    client.assert_not_called()

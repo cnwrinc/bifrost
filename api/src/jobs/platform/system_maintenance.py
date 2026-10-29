@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.database import get_db_context
+from src.core.principal import UserPrincipal
 from src.jobs.platform.base import (
     PlatformJobContext,
     PlatformJobDefinition,
-    PlatformJobPolicy,
+    PlatformJobFailure,
+    define_platform_job,
 )
+from src.models.orm.platform_jobs import PlatformJob
 from src.scheduler.registry import ScheduledTaskOutcome
 from src.services.platform_jobs import enqueue_platform_job, publish_platform_job_update
 
@@ -90,16 +94,18 @@ async def run_file_index_reconciliation(
 ) -> dict:
     from src.services.file_index_reconciler import reconcile_file_index
 
-    await context.report("Reconciling the workspace file index", percent=5)
+    await context.report("Reconciling the workspace and Solution source index", percent=5)
     async with get_db_context() as db:
         result = await reconcile_file_index(db)
-    await context.report("Workspace file index reconciled", percent=100)
+    await context.report("Source search index reconciled", percent=100)
     await context.log(
         "info",
         "file_index_reconciliation_completed",
-        (
-            f"File index reconciliation completed: {result['added']} added, "
-            f"{result['removed']} removed, {result['reverse_synced']} reverse-synced"
+        "File index reconciliation completed: "
+        + "; ".join(
+            f"{scope} +{stats['added']} ~{stats['updated']} -{stats['removed']}"
+            + (f" failed={stats['failed']}" if stats.get("failed") else "")
+            for scope, stats in result.items()
         ),
     )
     return result
@@ -133,69 +139,72 @@ async def run_artifact_retention_cleanup(
     }
 
 
-OAUTH_REFRESH_DEFINITION = PlatformJobDefinition(
-    job_type="oauth.refresh",
-    payload_version=1,
-    payload_model=OAuthRefreshPayload,
-    handler=run_oauth_refresh,
-    policy=PlatformJobPolicy(
-        timeout_seconds=15 * 60,
-        max_attempts=2,
-        max_concurrency=1,
-        min_memory_headroom_mb=128,
-    ),
+async def run_model_catalog_refresh(
+    context: PlatformJobContext, payload: EmptyMaintenancePayload
+) -> dict:
+    import httpx
+
+    from src.services.model_catalog import (
+        CatalogRefreshRejected,
+        refresh_model_catalog,
+    )
+
+    await context.report("Checking models.dev for catalog changes", percent=5)
+    try:
+        async with get_db_context() as db:
+            result = await refresh_model_catalog(db)
+            await db.commit()
+    except CatalogRefreshRejected as exc:
+        raise PlatformJobFailure("catalog_rejected", str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise PlatformJobFailure(
+            "catalog_unreachable",
+            f"models.dev could not be reached ({exc}); keeping the last good catalog.",
+            retryable=True,
+        ) from exc
+    await context.report("Model catalog refresh complete", percent=100)
+    await context.log(
+        "info",
+        "model_catalog_refresh_completed",
+        (
+            f"Model catalog {'updated' if result.changed else 'unchanged'}: "
+            f"{result.provider_count} providers, {result.model_count} models"
+        ),
+    )
+    return {
+        "changed": result.changed,
+        "provider_count": result.provider_count,
+        "model_count": result.model_count,
+        "fetched_at": result.fetched_at.isoformat(),
+    }
+
+
+OAUTH_REFRESH_DEFINITION = define_platform_job(
+    "oauth.refresh", OAuthRefreshPayload, run_oauth_refresh
 )
 
-WEBHOOK_RENEWAL_DEFINITION = PlatformJobDefinition(
-    job_type="webhook.renew",
-    payload_version=1,
-    payload_model=EmptyMaintenancePayload,
-    handler=run_webhook_renewal,
-    policy=PlatformJobPolicy(
-        timeout_seconds=30 * 60,
-        max_attempts=2,
-        max_concurrency=1,
-        min_memory_headroom_mb=128,
-    ),
+WEBHOOK_RENEWAL_DEFINITION = define_platform_job(
+    "webhook.renew", EmptyMaintenancePayload, run_webhook_renewal
 )
 
-SOLUTION_UPDATE_CHECK_DEFINITION = PlatformJobDefinition(
-    job_type="solution.update_check",
-    payload_version=1,
-    payload_model=EmptyMaintenancePayload,
-    handler=run_solution_update_check,
-    policy=PlatformJobPolicy(
-        timeout_seconds=30 * 60,
-        max_attempts=2,
-        max_concurrency=1,
-        min_memory_headroom_mb=256,
-    ),
+SOLUTION_UPDATE_CHECK_DEFINITION = define_platform_job(
+    "solution.update_check", EmptyMaintenancePayload, run_solution_update_check
 )
 
-FILE_INDEX_RECONCILIATION_DEFINITION = PlatformJobDefinition(
-    job_type="workspace.file_index_reconcile",
-    payload_version=1,
-    payload_model=EmptyMaintenancePayload,
-    handler=run_file_index_reconciliation,
-    policy=PlatformJobPolicy(
-        timeout_seconds=60 * 60,
-        max_attempts=2,
-        max_concurrency=1,
-        min_memory_headroom_mb=256,
-    ),
+FILE_INDEX_RECONCILIATION_DEFINITION = define_platform_job(
+    "workspace.file_index_reconcile",
+    EmptyMaintenancePayload,
+    run_file_index_reconciliation,
 )
 
-ARTIFACT_RETENTION_CLEANUP_DEFINITION = PlatformJobDefinition(
-    job_type="artifact.retention_cleanup",
-    payload_version=1,
-    payload_model=EmptyMaintenancePayload,
-    handler=run_artifact_retention_cleanup,
-    policy=PlatformJobPolicy(
-        timeout_seconds=30 * 60,
-        max_attempts=2,
-        max_concurrency=1,
-        min_memory_headroom_mb=128,
-    ),
+ARTIFACT_RETENTION_CLEANUP_DEFINITION = define_platform_job(
+    "artifact.retention_cleanup",
+    EmptyMaintenancePayload,
+    run_artifact_retention_cleanup,
+)
+
+MODEL_CATALOG_REFRESH_DEFINITION = define_platform_job(
+    "model_catalog.refresh", EmptyMaintenancePayload, run_model_catalog_refresh
 )
 
 
@@ -268,3 +277,41 @@ async def enqueue_automatic_artifact_retention_cleanup() -> ScheduledTaskOutcome
         EmptyMaintenancePayload(),
         title="Clean up expired artifacts",
     )
+
+
+async def enqueue_automatic_model_catalog_refresh() -> ScheduledTaskOutcome:
+    return await enqueue_system_maintenance(
+        MODEL_CATALOG_REFRESH_DEFINITION,
+        EmptyMaintenancePayload(),
+        title="Refresh the model catalog",
+    )
+
+
+async def enqueue_manual_model_catalog_refresh(
+    db: AsyncSession, user: UserPrincipal
+) -> tuple[PlatformJob, bool]:
+    """Queue an administrator-requested catalog refresh (deduplicated)."""
+    from src.services.platform_jobs import ensure_platform_job_notification
+
+    job, reused = await enqueue_platform_job(
+        db,
+        MODEL_CATALOG_REFRESH_DEFINITION,
+        EmptyMaintenancePayload(),
+        dedupe_key="manual",
+        resource_lock_key=MODEL_CATALOG_REFRESH_DEFINITION.job_type,
+        priority=500,
+        organization_id=None,
+        requested_by_user_id=user.user_id,
+        requested_by_email=user.email,
+        requested_by_name=user.name or user.email or "Unknown",
+        resource_type="system",
+        resource_id=MODEL_CATALOG_REFRESH_DEFINITION.job_type,
+        title="Refresh the model catalog",
+        action_url="/settings/ai",
+    )
+    if job.notification_id is None:
+        await ensure_platform_job_notification(db, job)
+    await db.commit()
+    await db.refresh(job)
+    await publish_platform_job_update(job)
+    return job, reused

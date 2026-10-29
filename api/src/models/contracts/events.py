@@ -26,6 +26,10 @@ class WebhookAdapterInfo(BaseModel):
         default=None,
         description="Integration name required for this adapter (e.g., 'Microsoft')",
     )
+    requires_organization: bool = Field(
+        default=False,
+        description="Whether this adapter requires an organization-scoped tenant mapping",
+    )
     config_schema: dict[str, Any] = Field(
         default_factory=dict,
         description="JSON Schema for adapter configuration",
@@ -60,7 +64,12 @@ class WebhookSourceConfig(BaseModel):
     )
     config: dict[str, Any] = Field(
         default_factory=dict,
-        description="Adapter-specific configuration",
+        description=(
+            "Adapter-specific configuration. A 'secret' key sets the HMAC signing "
+            "secret, which is write-only: it is stored encrypted and never returned. "
+            "On update, omit the key to keep the stored secret, or send null or an "
+            "empty string to remove it."
+        ),
     )
     rate_limit_per_minute: int | None = Field(
         default=60,
@@ -73,6 +82,19 @@ class WebhookSourceConfig(BaseModel):
     rate_limit_enabled: bool = Field(
         default=True,
         description="Per-source kill switch.",
+    )
+
+
+class WebhookSecretRotate(BaseModel):
+    """
+    Request model for rotating a webhook source's signing secret.
+    POST /api/events/sources/{source_id}/rotate-secret
+    """
+
+    secret: str | None = Field(
+        default=None,
+        min_length=1,
+        description="New signing secret. If omitted, one is generated.",
     )
 
 
@@ -194,7 +216,7 @@ class EventSubscriptionCreate(BaseModel):
     )
     filter_expression: str | None = Field(
         default=None,
-        description="Optional JSONPath filter expression (future use)",
+        description="Optional JSONPath-style event payload filter (JMESPath syntax; '$' root prefix supported)",
     )
     input_mapping: dict[str, Any] | None = Field(
         default=None,
@@ -249,7 +271,11 @@ class WebhookSourceResponse(BaseModel):
     )
     config: dict[str, Any] = Field(
         default_factory=dict,
-        description="Adapter configuration",
+        description="Adapter configuration, without the signing secret",
+    )
+    secret_set: bool = Field(
+        default=False,
+        description="Whether a signing secret is stored. The secret itself is never returned.",
     )
     callback_url: str = Field(
         ...,
@@ -258,6 +284,10 @@ class WebhookSourceResponse(BaseModel):
     external_id: str | None = Field(
         default=None,
         description="External subscription ID (from external service)",
+    )
+    provider_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Non-secret provider details for operations and display",
     )
     expires_at: datetime | None = Field(
         default=None,
@@ -352,6 +382,21 @@ class EventSourceResponse(BaseModel):
     schedule: ScheduleSourceResponse | None = Field(
         default=None,
         description="Schedule configuration details",
+    )
+
+
+class EventSourceSecretResponse(EventSourceResponse):
+    """
+    Event source returned by the create or rotate call that set its signing secret.
+    POST /api/events/sources, POST /api/events/sources/{source_id}/rotate-secret
+    """
+
+    raw_secret: str | None = Field(
+        default=None,
+        description=(
+            "The signing secret this call set, shown once. No other response "
+            "returns it. Null when the source has no signing secret."
+        ),
     )
 
 
@@ -632,6 +677,10 @@ class DynamicValuesRequest(BaseModel):
         default=None,
         description="Integration ID for OAuth-based operations",
     )
+    organization_id: UUID | None = Field(
+        default=None,
+        description="Organization whose integration mapping supplies tenant context",
+    )
     current_config: dict[str, Any] = Field(
         default_factory=dict,
         description="Config values selected so far (for dependent fields)",
@@ -671,6 +720,10 @@ class EmitEventRequest(BaseModel):
     solution: str | None = Field(
         default=None,
         description="Solution install id from the execution context. When set, topic lookup resolves this install's event source before _repo sources.",
+    )
+    caller_solution: str | None = Field(
+        default=None,
+        description="SPIKE: the caller's OWN install on per-call targeted emits (SDK-attested, engine requests only) for the inbound own-call bypass.",
     )
 
 

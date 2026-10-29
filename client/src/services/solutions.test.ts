@@ -22,18 +22,25 @@ import {
 	deleteSolution,
 	createSolutionExportJob,
 	downloadSolutionExportJob,
+	disconnectSolutionGit,
 	getSolution,
 	getSolutionEntities,
 	getSolutionExportJob,
 	getSolutionReadme,
+	getSolutionSdkStatus,
 	installSolution,
 	installSolutionFromRepo,
 	listSolutionExportJobs,
 	listSolutions,
 	previewInstall,
 	previewSolutionFromRepo,
+	previewWorkspaceBundle,
+	previewWorkspaceBundleFromRepo,
+	importWorkspaceBundle,
 	putSolutionReadme,
 	syncSolution,
+	updateSelectedSolutionAppSdks,
+	updateSolutionAppSdks,
 	updateSolution,
 } from "./solutions";
 
@@ -47,6 +54,56 @@ beforeEach(() => {
 });
 
 describe("solutions service", () => {
+	it("previews a workspace bundle as multipart content", async () => {
+		mockAuthFetch.mockResolvedValue({ ok: true, json: async () => ({ items: [] }) });
+
+		await previewWorkspaceBundle(new File(["zip"], "bundle.zip"));
+
+		expect(mockAuthFetch).toHaveBeenCalledWith(
+			"/api/solutions/import-workspace/preview",
+			expect.objectContaining({ method: "POST" }),
+		);
+	});
+
+	it("enqueues reviewed workspace decisions", async () => {
+		mockPost.mockResolvedValue({ data: { job_id: "job-1", status: "queued", reused: false } });
+
+		await importWorkspaceBundle({ preview_token: "preview-1", decisions: [] });
+
+		expect(mockPost).toHaveBeenCalledWith("/api/solutions/import-workspace", {
+			body: { preview_token: "preview-1", decisions: [] },
+		});
+	});
+
+	it("previews a workspace bundle from repository coordinates", async () => {
+		mockPost.mockResolvedValue({ data: { preview_token: "preview-2", items: [] } });
+
+		const out = await previewWorkspaceBundleFromRepo({
+			repo_url: "https://example.com/repo.git",
+			git_ref: "main",
+			repo_subpath: "packages/demo",
+		});
+
+		expect(mockPost).toHaveBeenCalledWith("/api/solutions/import-workspace/preview-repo", {
+			body: {
+				repo_url: "https://example.com/repo.git",
+				git_ref: "main",
+				repo_subpath: "packages/demo",
+				organization_id: null,
+			},
+		});
+		expect(out).toEqual({ preview_token: "preview-2", items: [] });
+	});
+
+	it("normalizes empty workspace repo coordinates to null", async () => {
+		mockPost.mockResolvedValue({ data: { preview_token: "preview-3", items: [] } });
+
+		await previewWorkspaceBundleFromRepo({ repo_url: "https://example.com/repo.git" });
+
+		expect(mockPost).toHaveBeenCalledWith("/api/solutions/import-workspace/preview-repo", {
+			body: { repo_url: "https://example.com/repo.git", git_ref: null, repo_subpath: null, organization_id: null },
+		});
+	});
 	it("lists solutions", async () => {
 		mockGet.mockResolvedValue({ data: { solutions: [] } });
 
@@ -139,12 +196,15 @@ describe("solutions service", () => {
 
 		const out = await deleteSolution("sol-1", "my-solution");
 
-		expect(mockDelete).toHaveBeenCalledWith("/api/solutions/{solution_id}", {
-			params: {
-				path: { solution_id: "sol-1" },
-				query: { confirm: "my-solution" },
+		expect(mockDelete).toHaveBeenCalledWith(
+			"/api/solutions/{solution_id}",
+			{
+				params: {
+					path: { solution_id: "sol-1" },
+					query: { confirm: "my-solution" },
+				},
 			},
-		});
+		);
 		expect(out.solution_id).toBe("sol-1");
 	});
 
@@ -166,19 +226,113 @@ describe("solutions service", () => {
 	});
 
 	it("syncs a solution by id", async () => {
-		mockPost.mockResolvedValue({ data: undefined });
-
-		await syncSolution("sol-1");
-
-		expect(mockPost).toHaveBeenCalledWith("/api/solutions/{solution_id}/sync", {
-			params: { path: { solution_id: "sol-1" } },
+		mockPost.mockResolvedValue({
+			data: { job_id: "job-1", status: "queued", reused: false },
 		});
+
+		await expect(syncSolution("sol-1")).resolves.toEqual({
+			job_id: "job-1",
+			status: "queued",
+			reused: false,
+		});
+
+		expect(mockPost).toHaveBeenCalledWith(
+			"/api/solutions/{solution_id}/sync",
+			{
+				params: { path: { solution_id: "sol-1" } },
+			},
+		);
 	});
 
 	it("throws when sync fails", async () => {
 		mockPost.mockResolvedValue({ error: { detail: "no remote" } });
 
 		await expect(syncSolution("sol-1")).rejects.toThrow(/no remote/);
+	});
+
+	it("disconnects a solution without changing its installed entities", async () => {
+		mockPatch.mockResolvedValue({ data: { id: "sol-1" } });
+
+		await disconnectSolutionGit("sol-1");
+
+		expect(mockPatch).toHaveBeenCalledWith("/api/solutions/{solution_id}", {
+			params: { path: { solution_id: "sol-1" } },
+			body: {
+				git_connected: false,
+				git_repo_url: null,
+				repo_subpath: null,
+				git_ref: null,
+			},
+		});
+	});
+
+	it("gets aggregate SDK status for a solution", async () => {
+		mockGet.mockResolvedValue({
+			data: {
+				solution_id: "sol-1",
+				sdk_status: "update_available",
+				actionable_count: 2,
+				apps: [],
+			},
+		});
+
+		const out = await getSolutionSdkStatus("sol-1");
+
+		expect(mockGet).toHaveBeenCalledWith(
+			"/api/solutions/{solution_id}/sdk/status",
+			{ params: { path: { solution_id: "sol-1" } } },
+		);
+		expect(out.sdk_status).toBe("update_available");
+	});
+
+	it("queues all actionable app SDK updates for a solution without git sync", async () => {
+		mockPost.mockResolvedValue({
+			data: {
+				solution_id: "sol-1",
+				accepted: [
+					{
+						application_id: "app-1",
+						job_id: "job-1",
+						status: "queued",
+						reused: false,
+					},
+				],
+				skipped: [],
+			},
+		});
+
+		const out = await updateSolutionAppSdks("sol-1");
+
+		expect(mockPost).toHaveBeenCalledWith(
+			"/api/solutions/{solution_id}/sdk/update",
+			{ params: { path: { solution_id: "sol-1" } } },
+		);
+		expect(out.accepted?.[0]?.application_id).toBe("app-1");
+	});
+
+	it("queues app SDK updates for selected solutions in one request", async () => {
+		mockPost.mockResolvedValue({
+			data: {
+				accepted: [
+					{
+						application_id: "app-1",
+						solution_id: "sol-1",
+						job_id: "job-1",
+						status: "queued",
+						reused: false,
+					},
+				],
+				skipped: [{ application_id: "app-2", reason: "current" }],
+			},
+		});
+
+		const out = await updateSelectedSolutionAppSdks(["sol-1", "sol-2"]);
+
+		expect(mockPost).toHaveBeenCalledWith("/api/solutions/sdk/update", {
+			body: { solution_ids: ["sol-1", "sol-2"] },
+		});
+		expect(out.accepted?.[0]?.application_id).toBe("app-1");
+		expect(out.skipped).toHaveLength(1);
 	});
 
 	it("previews a solution from a repo with the body", async () => {
@@ -226,10 +380,13 @@ describe("solutions service", () => {
 		};
 		const out = await installSolutionFromRepo(body);
 
-		expect(mockPost).toHaveBeenCalledWith("/api/solutions/install/from-repo", {
-			body,
-			signal: undefined,
-		});
+		expect(mockPost).toHaveBeenCalledWith(
+			"/api/solutions/install/from-repo",
+			{
+				body,
+				signal: undefined,
+			},
+		);
 		// Polled the job, then fetched the solution.
 		expect(mockGet).toHaveBeenCalledWith(
 			"/api/solutions/deploy-jobs/{job_id}",
@@ -352,6 +509,30 @@ describe("solutions service", () => {
 		expect(url).toBe("/api/solutions/install?force=true");
 	});
 
+	it("installs with ?reactivate=true only when explicit reactivate is set", async () => {
+		mockInstallPoll("job-5", "sol-5");
+		const file = new File(["zip-bytes"], "demo.zip", {
+			type: "application/zip",
+		});
+
+		await installSolution({ file, reactivate: true });
+
+		const [url] = mockAuthFetch.mock.calls[0];
+		expect(url).toBe("/api/solutions/install?reactivate=true");
+	});
+
+	it("preserves force and reactivate when both install flags are set", async () => {
+		mockInstallPoll("job-6", "sol-6");
+		const file = new File(["zip-bytes"], "demo.zip", {
+			type: "application/zip",
+		});
+
+		await installSolution({ file, force: true, reactivate: true });
+
+		const [url] = mockAuthFetch.mock.calls[0];
+		expect(url).toBe("/api/solutions/install?force=true&reactivate=true");
+	});
+
 	it("installs globally with empty organization_id when none given", async () => {
 		mockInstallPoll("job-3", "sol-3");
 		const file = new File(["zip-bytes"], "demo.zip", {
@@ -395,7 +576,8 @@ describe("solutions service", () => {
 			ok: false,
 			status: 422,
 			statusText: "Unprocessable Entity",
-			json: () => Promise.resolve({ detail: "wrong password for this bundle" }),
+			json: () =>
+				Promise.resolve({ detail: "wrong password for this bundle" }),
 		});
 		const file = new File(["zip-bytes"], "demo.zip", {
 			type: "application/zip",
@@ -426,7 +608,8 @@ describe("exportSolution", () => {
 		mockAuthFetch.mockResolvedValue({
 			ok: true,
 			headers: new Headers({
-				"Content-Disposition": 'attachment; filename="rtm-portal-0.9.0.zip"',
+				"Content-Disposition":
+					'attachment; filename="rtm-portal-0.9.0.zip"',
 			}),
 			blob: () => Promise.resolve(blob),
 		});
@@ -478,7 +661,9 @@ describe("exportSolution", () => {
 		await exportSolution("sol-1", "full", "hunter2", true);
 
 		const [url] = mockAuthFetch.mock.calls[0];
-		expect(url).toBe("/api/solutions/sol-1/export?mode=full&include_data=true");
+		expect(url).toBe(
+			"/api/solutions/sol-1/export?mode=full&include_data=true",
+		);
 	});
 
 	it("falls back to a generic filename without a disposition header", async () => {
@@ -498,7 +683,10 @@ describe("exportSolution", () => {
 		mockAuthFetch.mockResolvedValue({
 			ok: false,
 			headers: new Headers(),
-			json: () => Promise.resolve({ detail: "No stored bundle for this install" }),
+			json: () =>
+				Promise.resolve({
+					detail: "No stored bundle for this install",
+				}),
 		});
 
 		const { exportSolution } = await import("./solutions");
@@ -566,22 +754,59 @@ describe("solution export jobs", () => {
 		expect(out.id).toBe("job-1");
 	});
 
-	it("downloads an export job artifact with authFetch", async () => {
-		const blob = new Blob(["zipbytes"], { type: "application/zip" });
+	it("starts a native backup download without buffering artifact bytes", async () => {
 		mockAuthFetch.mockResolvedValue({
 			ok: true,
-			headers: new Headers({
-				"Content-Disposition": 'attachment; filename="backup.zip"',
-			}),
-			blob: () => Promise.resolve(blob),
+			headers: new Headers(),
+			blob: () => {
+				throw new Error("a backup must not be buffered as a Blob");
+			},
 		});
+		const anchors: HTMLAnchorElement[] = [];
+		const click = vi
+			.spyOn(HTMLAnchorElement.prototype, "click")
+			.mockImplementation(function (this: HTMLAnchorElement) {
+				anchors.push(this);
+			});
+		mockPost.mockResolvedValue({
+			data: {
+				url: "https://storage.test/backup.zip?signed=yes",
+				filename: "backup.zip",
+				expires_in: 600,
+			},
+		});
+		try {
+			await downloadSolutionExportJob("job-1");
+			expect(mockPost).toHaveBeenCalledWith(
+				"/api/solutions/export-jobs/{job_id}/download-link",
+				{ params: { path: { job_id: "job-1" } }, signal: undefined },
+			);
+			expect(mockAuthFetch).not.toHaveBeenCalled();
+			expect(click).toHaveBeenCalledOnce();
+			expect(anchors[0].href).toBe(
+				"https://storage.test/backup.zip?signed=yes",
+			);
+			expect(anchors[0].download).toBe("backup.zip");
+			expect(document.body.contains(anchors[0])).toBe(false);
+		} finally {
+			click.mockRestore();
+		}
+	});
 
-		const out = await downloadSolutionExportJob("job-1");
-
-		expect(mockAuthFetch).toHaveBeenCalledWith(
-			"/api/solutions/export-jobs/job-1/download",
-			{ signal: undefined },
-		);
-		expect(out).toEqual({ blob, filename: "backup.zip" });
+	it("does not start a native download when authorization or expiry validation fails", async () => {
+		mockPost.mockResolvedValue({
+			error: { detail: "Export job is not downloadable" },
+		});
+		const click = vi
+			.spyOn(HTMLAnchorElement.prototype, "click")
+			.mockImplementation(() => {});
+		try {
+			await expect(downloadSolutionExportJob("expired")).rejects.toThrow(
+				"Export job is not downloadable",
+			);
+			expect(click).not.toHaveBeenCalled();
+		} finally {
+			click.mockRestore();
+		}
 	});
 });

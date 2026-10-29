@@ -19,7 +19,6 @@ from shared.artifact_generation import (
     validate_artifact_content,
 )
 from src.services.llm.factory import get_llm_config
-from src.services.llm_config_service import LLMConfigService
 from src.services.model_pricing import is_openrouter_endpoint
 
 MediaKind = Literal["image", "video"]
@@ -54,20 +53,14 @@ async def get_media_provider_config(
     kind: MediaKind,
 ) -> MediaProviderConfig:
     """Resolve the configured provider key and dedicated media model."""
-    llm_config = await get_llm_config(db)
-    public_config = await LLMConfigService(db).get_config()
-    if public_config is None:
-        raise MediaGenerationError("AI is not configured.")
-    model = (
-        public_config.image_generation_model
-        if kind == "image"
-        else public_config.video_generation_model
-    )
-    if not model:
+    assignment_key = "image_generation" if kind == "image" else "video_generation"
+    try:
+        llm_config = await get_llm_config(db, assignment_key=assignment_key)
+    except ValueError as exc:
         label = "Image" if kind == "image" else "Video"
         raise MediaGenerationError(
             f"{label} generation is not configured in System Settings."
-        )
+        ) from exc
     endpoint = _base_endpoint(llm_config.provider, llm_config.endpoint)
     openrouter = is_openrouter_endpoint(endpoint)
     if kind == "video" and not openrouter:
@@ -82,7 +75,7 @@ async def get_media_provider_config(
         provider=llm_config.provider,
         endpoint=endpoint,
         api_key=llm_config.api_key,
-        model=model,
+        model=llm_config.model,
         is_openrouter=openrouter,
     )
 
@@ -143,15 +136,19 @@ def _usage(payload: dict[str, Any]) -> tuple[int, int, Decimal | None]:
     return input_tokens, output_tokens, provider_cost
 
 
-async def generate_image(
-    db: AsyncSession,
+async def generate_image_with_config(
+    config: MediaProviderConfig,
     *,
     filename: str,
     prompt: str,
     client: httpx.AsyncClient | None = None,
 ) -> GeneratedArtifact:
-    """Generate one raster image with the configured dedicated image model."""
-    config = await get_media_provider_config(db, "image")
+    """Generate one raster image with a previously resolved provider config.
+
+    Runs the provider HTTP call without touching the database so callers
+    can resolve ``get_media_provider_config`` in a short transaction,
+    release its connection, then call this with no DB session held.
+    """
     path = "/images" if config.is_openrouter else "/images/generations"
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=180.0, follow_redirects=True)
@@ -196,6 +193,20 @@ async def generate_image(
     finally:
         if owns_client:
             await http.aclose()
+
+
+async def generate_image(
+    db: AsyncSession,
+    *,
+    filename: str,
+    prompt: str,
+    client: httpx.AsyncClient | None = None,
+) -> GeneratedArtifact:
+    """Generate one raster image with the configured dedicated image model."""
+    config = await get_media_provider_config(db, "image")
+    return await generate_image_with_config(
+        config, filename=filename, prompt=prompt, client=client
+    )
 
 
 def _same_provider_url(base: str, value: str) -> str:

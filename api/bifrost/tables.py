@@ -1,8 +1,21 @@
 """
-Tables SDK for Bifrost - API-only implementation.
+Tables SDK for Bifrost.
 
 Provides Python API for table and document management (CRUD operations).
-All operations go through HTTP API endpoints.
+
+Every call rides the shared ``BifrostClient``: over the worker's private
+Unix socket when the engine injected one, and over the network API
+otherwise. Same path, body, bearer token, timeout, and error handling on
+both transports; a local failure raises and never falls back to the
+network API.
+
+As of Gate C3b every table method — definitions (``create``/``list``/
+``delete``), document reads (``get``/``query``/``count``), document
+mutations (``insert``/``upsert``/``update``/``delete_document``), and the
+batch writes (``insert_batch``/``upsert_batch``/``bulk_upsert``/
+``delete_batch``) plus the auto-create-on-insert helper — uses those
+ordinary HTTP routes.
+
 All methods are async and must be awaited.
 """
 
@@ -11,9 +24,16 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import urlencode
 
-from .client import get_client, raise_for_status_with_detail
-from .models import TableInfo, DocumentData, DocumentList, BatchResult, BatchDeleteResult
-from ._context import resolve_scope, _execution_context
+from .client import BifrostAPIError, get_client, raise_for_status_with_detail
+from .models import (
+    TableInfo,
+    DocumentData,
+    DocumentList,
+    BatchResult,
+    BatchDeleteResult,
+    BulkUpsertResult,
+)
+from ._context import resolve_scope, _execution_context, get_effective_solution
 
 
 def _current_context():
@@ -21,23 +41,47 @@ def _current_context():
     return _execution_context.get()
 
 
-def _scope_query(scope: str | None) -> str:
+def _raise_unresolved_dev_table(response, client) -> None:
+    """Do not turn an unresolved local data-plane request into an empty table.
+
+    The server deliberately uses the same 404 for missing and inaccessible
+    tables. Keep that distinction private, and retain document-not-found
+    behavior for individual row operations.
+    """
+    from bifrost.solution_dev.session import SolutionDevSession
+
+    if isinstance(getattr(client, "_solution_dev_session", None), SolutionDevSession):
+        raise BifrostAPIError(
+            "404: Local Solution table request could not be resolved or authorized. "
+            "Check the selected install, deployed table definition, and table policies; "
+            "this response is not an empty table.",
+            request=response.request,
+            response=response,
+        )
+
+
+def _scope_query(scope: str | None, solution: str | None = None) -> str:
     """Build the ``?scope=...&solution=...`` querystring for REST table URLs.
 
-    ``scope`` is the org scope (as before). When the active execution belongs to a
-    solution install, also append ``solution=<install_id>`` (from the
-    ExecutionContext) so the server resolves a table BY NAME to the install's OWN
-    table first, then the org/_repo/ cascade — the same own-first behavior a
-    Solution app gets via its ``X-Bifrost-App`` header. Omitted outside a solution
-    execution, so plain ``_repo/`` behavior is unchanged.
+    ``scope`` is the org scope (as before). ``solution`` is a per-call install
+    ref (UUID or slug/name) that wins over the inherited ExecutionContext for
+    this call only; unset → today's behavior (own install or _repo/).
+
+    SPIKE: whenever the execution inherits an install, ``caller_solution=``
+    attests it alongside, so a sealed target can tell own-calls
+    (caller == target) from cross-install calls.
     """
+    from ._context import get_caller_solution
+
     params: dict[str, str] = {}
     if scope:
         params["scope"] = scope
-    ctx = _current_context()
-    solution_id = getattr(ctx, "solution_id", None) if ctx is not None else None
+    solution_id = get_effective_solution(solution)
     if solution_id:
         params["solution"] = str(solution_id)
+    caller = get_caller_solution()
+    if caller:
+        params["caller_solution"] = str(caller)
     return f"?{urlencode(params)}" if params else ""
 
 
@@ -46,15 +90,49 @@ def _has_solution_context() -> bool:
     return bool(getattr(ctx, "solution_id", None)) if ctx is not None else False
 
 
+def _resolve_batch_scope(scope: str | None) -> str | None:
+    """Preserve caller-requested batch scopes, but leave inherited Solution scope implicit.
+
+    Solution-owned global tables have no organization ID. Sending a workflow's
+    inherited caller organization as an explicit scope makes the API correctly
+    require an organization-owned table instead. An explicit caller scope keeps
+    the normal SDK validation and server authorization checks.
+    """
+    if scope is None and _has_solution_context():
+        return None
+    return resolve_scope(scope)
+
+
+def _validate_batch_document_limit(documents: list[dict[str, Any]]) -> None:
+    if len(documents) > 1000:
+        raise ValueError("table batch writes accept at most 1000 documents")
+
+
+def _auto_create_allowed(explicit_solution: str | None) -> bool:
+    """Whether a 404 may trigger loose auto-create-on-insert.
+
+    Explicit per-call ``solution=`` targeting must never conjure a loose
+    shared table when the target is missing/inaccessible (Codex review P2) —
+    surface the 404 instead, same as inherited solution context does.
+    """
+    return not _has_solution_context() and explicit_solution is None
+
+
 async def _ensure_table_exists(table: str, scope: str | None) -> None:
     """Create the table if it doesn't already exist (auto-create-on-insert).
 
     This used to live in the CLI handler (``_find_or_create_table_for_sdk``);
     moved here so the SDK and web UI share one document-write code path.
     Idempotent: a 409 from a concurrent creator is treated as success.
+
+    Rides the shared ``BifrostClient`` exactly like the write that triggered
+    it: over the worker's private Unix socket inside an engine child, and
+    over the network API otherwise. A local attempt never falls back to
+    HTTP.
     """
     client = get_client()
-    response = await client.post(
+    response = await client.engine_request(
+        "POST",
         f"/api/tables{_scope_query(scope)}",
         json={"name": table},
     )
@@ -68,7 +146,10 @@ class tables:
     Table and document management operations.
 
     Allows workflows to create tables and store/query documents.
-    All operations are performed via HTTP API endpoints.
+    Every operation goes through the ordinary HTTP API endpoints, carried
+    by the shared ``BifrostClient`` over the worker's private Unix socket
+    inside an engine child and over the network otherwise; a local attempt
+    never falls back to HTTP.
 
     All methods are async - await is required.
 
@@ -131,9 +212,13 @@ class tables:
             raise RuntimeError(
                 "Solution executions cannot create tables at runtime; declare tables in the solution manifest"
             )
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise. A local attempt never falls back to HTTP.
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             "/api/sdk/tables/create",
             json={
                 "name": name,
@@ -141,7 +226,7 @@ class tables:
                 "table_schema": table_schema,
                 "scope": effective_scope,
                 "app": app,
-            }
+            },
         )
         raise_for_status_with_detail(response)
         return TableInfo.model_validate(response.json())
@@ -172,14 +257,18 @@ class tables:
             >>> all_tables = await tables.list()
             >>> app_tables = await tables.list(app="app-uuid")
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise. A local attempt never falls back to HTTP.
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
             "/api/sdk/tables/list",
             json={
                 "scope": effective_scope,
                 "app": app,
-            }
+            },
         )
         raise_for_status_with_detail(response)
         return [TableInfo.model_validate(t) for t in response.json()]
@@ -205,8 +294,13 @@ class tables:
             >>> from bifrost import tables
             >>> await tables.delete("table-uuid-here")
         """
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise (a missing table raises, like before). A local attempt
+        # never falls back to HTTP.
         client = get_client()
-        response = await client.delete(
+        response = await client.engine_request(
+            "DELETE",
             f"/api/tables/{table_id}",
         )
         raise_for_status_with_detail(response)
@@ -223,6 +317,7 @@ class tables:
         id: str | None = None,
         scope: str | None = None,
         created_by: str | None = None,
+        solution: str | None = None,
     ) -> DocumentData:
         """
         Insert a document into a table.
@@ -255,13 +350,16 @@ class tables:
         if created_by is not None:
             body["created_by"] = created_by
 
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise. A local attempt never falls back to HTTP.
         client = get_client()
-        url = f"/api/tables/{table}/documents{_scope_query(effective_scope)}"
-        response = await client.post(url, json=body)
-        if response.status_code == 404 and not _has_solution_context():
+        url = f"/api/tables/{table}/documents{_scope_query(effective_scope, solution)}"
+        response = await client.engine_request("POST", url, json=body)
+        if response.status_code == 404 and _auto_create_allowed(solution):
             # Table doesn't exist — auto-create then retry.
             await _ensure_table_exists(table, effective_scope)
-            response = await client.post(url, json=body)
+            response = await client.engine_request("POST", url, json=body)
         raise_for_status_with_detail(response)
         return DocumentData.model_validate(response.json())
 
@@ -308,12 +406,20 @@ class tables:
         if updated_by is not None:
             body["updated_by"] = updated_by
 
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise, with the same auto-create-once retry outside a
+        # Solution. A local attempt never falls back to HTTP.
         client = get_client()
         url = f"/api/tables/{table}/documents/upsert{_scope_query(effective_scope)}"
-        response = await client.post(url, json=body)
+        response = await client.engine_request(
+            "POST", url, json=body, retry_transient=True
+        )
         if response.status_code == 404 and not _has_solution_context():
             await _ensure_table_exists(table, effective_scope)
-            response = await client.post(url, json=body)
+            response = await client.engine_request(
+                "POST", url, json=body, retry_transient=True
+            )
         raise_for_status_with_detail(response)
         return DocumentData.model_validate(response.json())
 
@@ -322,14 +428,21 @@ class tables:
         table: str,
         doc_id: str,
         scope: str | None = None,
+        solution: str | None = None,
     ) -> DocumentData | None:
         """
         Get a document by ID.
+
+        Rides the shared client's engine-local transport inside an engine
+        child and the network API elsewhere; the endpoint applies the same
+        resolution and read policy either way.
 
         Args:
             table: Table name or UUID.
             doc_id: Document ID.
             scope: Organization scope.
+            solution: Target solution install (UUID or slug/name) in the
+                resolved scope. Unset → own install or _repo/. Per-call only.
 
         Returns:
             DocumentData if found, None if not found.
@@ -337,10 +450,15 @@ class tables:
         Example:
             >>> doc = await tables.get("customers", "acme-001")
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.get(
-            f"/api/tables/{table}/documents/{doc_id}{_scope_query(effective_scope)}",
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise; the endpoint applies the same read policy either way.
+        # A local attempt never falls back to HTTP.
+        client = get_client()
+        response = await client.engine_request(
+            "GET",
+            f"/api/tables/{table}/documents/{doc_id}{_scope_query(effective_scope, solution)}",
         )
         if response.status_code == 404:
             return None
@@ -378,14 +496,20 @@ class tables:
             ctx = _current_context()
             if ctx is not None and getattr(ctx, "user_id", None) is not None:
                 updated_by = str(ctx.user_id)
-        client = get_client()
         effective_scope = resolve_scope(scope)
         body: dict[str, Any] = {"data": data}
         if updated_by is not None:
             body["updated_by"] = updated_by
-        response = await client.patch(
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise (a missing table or row maps to None). A local attempt
+        # never falls back to HTTP.
+        client = get_client()
+        response = await client.engine_request(
+            "PATCH",
             f"/api/tables/{table}/documents/{doc_id}{_scope_query(effective_scope)}",
             json=body,
+            retry_transient=True,
         )
         if response.status_code == 404:
             return None
@@ -415,9 +539,14 @@ class tables:
         Example:
             >>> deleted = await tables.delete_document("customers", "acme-001")
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.delete(
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise (a missing table or row maps to False). A local attempt
+        # never falls back to HTTP.
+        client = get_client()
+        response = await client.engine_request(
+            "DELETE",
             f"/api/tables/{table}/documents/{doc_id}{_scope_query(effective_scope)}",
         )
         if response.status_code == 404:
@@ -510,6 +639,81 @@ class tables:
         )
 
     @staticmethod
+    async def bulk_upsert(
+        table: str,
+        documents: list[dict[str, Any]],
+        scope: str | None = None,
+        created_by: str | None = None,
+        updated_by: str | None = None,
+        conflict_retries: int = 2,
+    ) -> BulkUpsertResult:
+        """
+        Bulk upsert explicit-id documents with full replacement semantics.
+
+        This privileged ingestion method uses the canonical count-only
+        ``POST /documents/batch`` route with replacement upsert semantics. Each
+        document must have ``id`` and ``data`` keys. The server rejects
+        duplicate IDs.
+
+        Args:
+            table: Table name or UUID.
+            documents: List of dicts, each with "id" (str) and "data" (dict).
+            scope: Organization scope.
+            created_by: Override attribution on inserted rows.
+            updated_by: Override attribution on inserted and updated rows.
+            conflict_retries: Number of bounded retries when the server detects
+                a concurrent insert between policy preflight and the guarded
+                upsert statement.
+
+        Returns:
+            BulkUpsertResult: Count of rows inserted or updated.
+        """
+        _validate_batch_document_limit(documents)
+        ctx = _current_context()
+        if created_by is None and ctx is not None and getattr(ctx, "user_id", None) is not None:
+            created_by = str(ctx.user_id)
+        if updated_by is None and ctx is not None and getattr(ctx, "user_id", None) is not None:
+            updated_by = str(ctx.user_id)
+        effective_scope = _resolve_batch_scope(scope)
+
+        items: list[dict[str, Any]] = []
+        for doc in documents:
+            item: dict[str, Any] = {"id": doc["id"], "data": doc["data"]}
+            if created_by is not None:
+                item["created_by"] = created_by
+            if updated_by is not None:
+                item["updated_by"] = updated_by
+            items.append(item)
+
+        # The shared BifrostClient carries each attempt over the worker's
+        # private Unix socket when the engine injected one, and over the
+        # network otherwise, with the same bounded 409-retry and
+        # auto-create-once behavior. A local attempt never falls back to
+        # HTTP.
+        client = get_client()
+        url = f"/api/tables/{table}/documents/batch{_scope_query(effective_scope)}"
+        body = {
+            "documents": items,
+            "write_mode": "replace_upsert",
+            "return_documents": False,
+        }
+        attempts = max(0, conflict_retries) + 1
+        ensured_table = False
+        response = None
+        for attempt in range(attempts):
+            response = await client.engine_request("POST", url, json=body)
+            if response.status_code == 404 and not _has_solution_context() and not ensured_table:
+                await _ensure_table_exists(table, effective_scope)
+                ensured_table = True
+                response = await client.engine_request("POST", url, json=body)
+            if response.status_code != 409 or attempt == attempts - 1:
+                break
+        assert response is not None
+        raise_for_status_with_detail(response)
+        body = response.json()
+        return BulkUpsertResult(count=body["inserted"])
+
+    @staticmethod
     async def _batch_write(
         table: str,
         documents: list[dict[str, Any]],
@@ -524,12 +728,13 @@ class tables:
         override is applied per-item so the engine can attribute writes to
         the workflow's calling user.
         """
+        _validate_batch_document_limit(documents)
         ctx = _current_context()
         if created_by is None and ctx is not None and getattr(ctx, "user_id", None) is not None:
             created_by = str(ctx.user_id)
         if upsert and updated_by is None and ctx is not None and getattr(ctx, "user_id", None) is not None:
             updated_by = str(ctx.user_id)
-        effective_scope = resolve_scope(scope)
+        effective_scope = _resolve_batch_scope(scope)
 
         items: list[dict[str, Any]] = []
         for doc in documents:
@@ -543,13 +748,22 @@ class tables:
                 item["updated_by"] = updated_by
             items.append(item)
 
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise, with the same auto-create-once retry outside a
+        # Solution. A local attempt never falls back to HTTP.
         req_body: dict[str, Any] = {"documents": items, "upsert": upsert}
         client = get_client()
         url = f"/api/tables/{table}/documents/batch{_scope_query(effective_scope)}"
-        response = await client.post(url, json=req_body)
+        retry_transient = upsert and all(item["id"] for item in items)
+        response = await client.engine_request(
+            "POST", url, json=req_body, retry_transient=retry_transient
+        )
         if response.status_code == 404 and not _has_solution_context():
             await _ensure_table_exists(table, effective_scope)
-            response = await client.post(url, json=req_body)
+            response = await client.engine_request(
+                "POST", url, json=req_body, retry_transient=retry_transient
+            )
         raise_for_status_with_detail(response)
         body = response.json()
         return BatchResult(
@@ -580,9 +794,14 @@ class tables:
         Example:
             >>> result = await tables.delete_batch("customers", ["acme-001", "beta-001"])
         """
+        effective_scope = _resolve_batch_scope(scope)
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise (a missing table maps to an empty result). A local
+        # attempt never falls back to HTTP.
         client = get_client()
-        effective_scope = resolve_scope(scope)
-        response = await client.post(
+        response = await client.engine_request(
+            "POST",
             f"/api/tables/{table}/documents/batch-delete{_scope_query(effective_scope)}",
             json={"ids": doc_ids},
         )
@@ -604,6 +823,11 @@ class tables:
         limit: int = 100,
         offset: int = 0,
         scope: str | None = None,
+        after_document_id: str | None = None,
+        document_id_prefix: str | None = None,
+        skip_count: bool = False,
+        document_ids: list[str] | None = None,
+        solution: str | None = None,
     ) -> DocumentList:
         """
         Query documents with filtering and pagination.
@@ -623,27 +847,52 @@ class tables:
             limit: Maximum documents to return (default 100).
             offset: Number of documents to skip.
             scope: Organization scope.
+            after_document_id: Exclusive cursor over the actual document ID.
+                Activates ascending document-ID ordering. Pass an empty string
+                to begin an unbounded document-ID scan.
+            document_id_prefix: Restrict results to actual document IDs with
+                this prefix. Activates ascending document-ID ordering.
+            skip_count: Skip the matching count query and return ``total=-1``.
+            document_ids: Up to 1000 actual document IDs to match. Duplicates
+                have set semantics; an empty list returns no documents. ANDed
+                with other filters. Results follow normal query ordering and
+                pagination rather than input order.
+            solution: Target solution install (UUID or slug/name) in the
+                resolved scope. Unset → own install or _repo/. Per-call only.
 
         Returns:
             DocumentList: Query results with documents, total count, and
-            pagination info. Returns an empty list if the table doesn't exist.
+            pagination info. Returns an empty list if the table doesn't exist,
+            except in Solution development where an unresolved table raises.
 
         Example:
             >>> results = await tables.query("customers", where={"status": "active"})
         """
-        client = get_client()
         effective_scope = resolve_scope(scope)
-        response = await client.post(
-            f"/api/tables/{table}/documents/query{_scope_query(effective_scope)}",
+        # The shared BifrostClient carries this over the worker's private
+        # Unix socket when the engine injected one, and over the network
+        # otherwise. The endpoint validates the same ``DocumentQuery`` DTO
+        # and runs the same read service. A local attempt never falls back
+        # to HTTP.
+        client = get_client()
+        response = await client.engine_request(
+            "POST",
+            f"/api/tables/{table}/documents/query{_scope_query(effective_scope, solution)}",
             json={
                 "where": where,
                 "order_by": order_by,
                 "order_dir": order_dir,
                 "limit": limit,
                 "offset": offset,
+                "after_document_id": after_document_id,
+                "document_id_prefix": document_id_prefix,
+                "skip_count": skip_count,
+                "document_ids": document_ids,
             },
+            retry_transient=True,
         )
         if response.status_code == 404:
+            _raise_unresolved_dev_table(response, client)
             return DocumentList(documents=[], total=0, limit=limit, offset=offset)
         raise_for_status_with_detail(response)
         return DocumentList.model_validate(response.json())
@@ -671,19 +920,27 @@ class tables:
             >>> active = await tables.count("customers", where={"status": "active"})
         """
         effective_scope = resolve_scope(scope)
-        client = get_client()
         if where is None:
             # Unfiltered count: hit GET /count which avoids row scanning.
-            response = await client.get(
+            # The shared BifrostClient carries this over the worker's
+            # private Unix socket when the engine injected one, and over
+            # the network otherwise. A local attempt never falls back to
+            # HTTP.
+            client = get_client()
+            response = await client.engine_request(
+                "GET",
                 f"/api/tables/{table}/documents/count{_scope_query(effective_scope)}",
             )
             if response.status_code == 404:
+                _raise_unresolved_dev_table(response, client)
                 return 0
             raise_for_status_with_detail(response)
             return response.json()["count"]
 
         # Filtered count: REST /count doesn't accept where, so fall back to
-        # query with limit=1 (the response carries the matched total).
+        # query with limit=1 (the response carries the matched total). The
+        # query itself rides the shared client transport, exactly like the
+        # HTTP path.
         result = await tables.query(
             table=table, where=where, limit=1, scope=scope,
         )

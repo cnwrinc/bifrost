@@ -75,6 +75,49 @@ describe("ChatMessage — user messages", () => {
 		expect(screen.getByText("SupportBot")).toBeInTheDocument();
 		expect(screen.getByText(/please help/)).toBeInTheDocument();
 	});
+
+	it("preserves email addresses instead of rendering their domains as mentions", () => {
+		renderWithProviders(
+			<ChatMessage
+				message={makeMessage({
+					role: "user",
+					content: "Contact jack@example.com for access",
+				})}
+			/>,
+		);
+
+		expect(
+			screen.getByRole("link", { name: "jack@example.com" }),
+		).toHaveAttribute("href", "mailto:jack@example.com");
+		expect(screen.queryByText("example")).not.toBeInTheDocument();
+	});
+
+	it("leaves bare @words as ordinary message text", () => {
+		renderWithProviders(
+			<ChatMessage
+				message={makeMessage({
+					role: "user",
+					content: "Ask @SupportBot for help",
+				})}
+			/>,
+		);
+
+		expect(screen.getByText(/Ask @SupportBot for help/)).toBeInTheDocument();
+	});
+
+	it("renders punctuation in canonical agent names without changing the name", () => {
+		renderWithProviders(
+			<ChatMessage
+				message={makeMessage({
+					role: "user",
+					content: '@[R&D "Tier 2" Agent] investigate',
+				})}
+			/>,
+		);
+
+		expect(screen.getByText('R&D "Tier 2" Agent')).toBeInTheDocument();
+		expect(screen.getByText(/investigate/)).toBeInTheDocument();
+	});
 });
 
 describe("ChatMessage — assistant messages", () => {
@@ -106,6 +149,21 @@ describe("ChatMessage — assistant messages", () => {
 		expect(screen.getByText(/print/)).toBeInTheDocument();
 	});
 
+	it("defers syntax highlighting while a code block is still streaming", () => {
+		const { container } = renderWithProviders(
+			<ChatMessage
+				message={makeMessage({
+					role: "assistant",
+					content: "```python\nprint('still arriving')\n```",
+				})}
+				isStreaming
+			/>,
+		);
+
+		expect(container.querySelector("pre.bg-slate-950")).not.toBeNull();
+		expect(screen.getByText(/still arriving/)).toBeInTheDocument();
+	});
+
 	it("marks streaming content busy without fading the message", () => {
 		const { container, rerender } = renderWithProviders(
 			<ChatMessage
@@ -132,7 +190,7 @@ describe("ChatMessage — assistant messages", () => {
 		expect(container.querySelector(".animate-pulse")).toBeNull();
 	});
 
-	it("shows token counts on hover section when provided", () => {
+	it("keeps message time and duration without showing token counts", () => {
 		renderWithProviders(
 			<ChatMessage
 				message={makeMessage({
@@ -144,9 +202,10 @@ describe("ChatMessage — assistant messages", () => {
 				})}
 			/>,
 		);
-		expect(screen.getByText(/In: 10/)).toBeInTheDocument();
-		expect(screen.getByText(/Out: 42/)).toBeInTheDocument();
+		expect(screen.queryByText(/In: 10/)).not.toBeInTheDocument();
+		expect(screen.queryByText(/Out: 42/)).not.toBeInTheDocument();
 		expect(screen.getByText(/1500ms/)).toBeInTheDocument();
+		expect(screen.getByText(/Apr 20, 2026/i)).toBeInTheDocument();
 	});
 
 	it("shows message time, copies content, and disables local file links", async () => {
@@ -168,4 +227,22 @@ describe("ChatMessage — assistant messages", () => {
 		await user.click(copyButton);
 		expect(writeText).toHaveBeenCalledWith("[Local result](file:///tmp/report.pdf)");
 	});
+	it("shows copy failure and permits retry", async () => {
+		const clipboard = await import("@/lib/clipboard");
+		const copy = vi.spyOn(clipboard, "copyToClipboard").mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+		try {
+			const { user } = renderWithProviders(<ChatMessage message={makeMessage({content:"Copy this result"})} />);
+			await user.click(screen.getByRole("button", {name:"Copy message"}));
+			expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t copy");
+			await user.click(screen.getByRole("button", {name:"Copy message"}));
+			expect(await screen.findByRole("button", {name:"Copied message"})).toBeInTheDocument();
+			expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+		} finally { copy.mockRestore(); }
+	});
+
 });
+
+ it("exposes assistant content separately from conversation navigation", () => {
+  renderWithProviders(<ChatMessage message={makeMessage({ content: "ok" })} />);
+  expect(screen.getByRole("article", { name: "Assistant message" })).toHaveTextContent("ok");
+ });

@@ -15,16 +15,26 @@ import { renderWithProviders, screen } from "@/test-utils";
 
 // Execution data hooks: return no data by default so behavior falls through
 // to props. Individual tests can override via mockReturnValue.
-const mockUseExecution = vi.fn<() => { data: unknown; isLoading: boolean }>(
-	() => ({ data: undefined, isLoading: false }),
-);
-const mockUseExecutionLogs = vi.fn<() => { data: unknown }>(() => ({
+const mockUseExecution = vi.fn<
+	() => { data: unknown; isLoading: boolean; error?: unknown }
+>(() => ({ data: undefined, isLoading: false }));
+const mockUseExecutionLogs = vi.fn<
+	(executionId: string | undefined, enabled: boolean) => { data: unknown }
+>(() => ({
 	data: undefined,
 }));
 
-vi.mock("@/hooks/useExecutions", () => ({
+vi.mock("@/hooks/useExecutions", async (importOriginal) => ({
+	isNotFoundError: (
+		await importOriginal<typeof import("@/hooks/useExecutions")>()
+	).isNotFoundError,
 	useExecution: () => mockUseExecution(),
-	useExecutionLogs: () => mockUseExecutionLogs(),
+	useExecutionLogs: (executionId: string | undefined, enabled: boolean) =>
+		mockUseExecutionLogs(executionId, enabled),
+}));
+
+vi.mock("@/services/runRetention", () => ({
+	useRunRetentionDays: () => 30,
 }));
 
 vi.mock("@/hooks/useExecutionStream", () => ({
@@ -36,6 +46,7 @@ vi.mock("@/stores/executionStreamStore", () => ({
 }));
 
 // Framer-motion: static div.
+const mockUseReducedMotion = vi.hoisted(() => vi.fn(() => false));
 vi.mock("framer-motion", () => {
 	const passthrough = ({
 		children,
@@ -52,6 +63,7 @@ vi.mock("framer-motion", () => {
 		AnimatePresence: ({ children }: { children: React.ReactNode }) => (
 			<>{children}</>
 		),
+		useReducedMotion: () => mockUseReducedMotion(),
 	};
 });
 
@@ -79,6 +91,11 @@ function makeToolCall(overrides: Partial<ToolCall> = {}): ToolCall {
 }
 
 describe("ToolExecutionCard — status transitions", () => {
+	it("exposes timeout details and names its input action", () => {
+		renderWithProviders(<ToolExecutionCard toolCall={makeToolCall()} isStreaming streamingState={{ status: "timeout", logs: [], error: "Timed out waiting for the service" }} />);
+		expect(screen.getByRole("alert")).toHaveTextContent("Timed out waiting for the service");
+		expect(screen.getByRole("button", { name: "Input parameters for run_task" })).toBeInTheDocument();
+	});
 	it("shows Pending when there's no execution data and no result yet", () => {
 		renderWithProviders(
 			<ToolExecutionCard toolCall={makeToolCall()} executionId={undefined} />,
@@ -166,5 +183,95 @@ describe("ToolExecutionCard — result expansion", () => {
 		// PrettyInputDisplay stub renders the JSON blob.
 		const pretty = await screen.findByTestId("pretty-input");
 		expect(pretty).toHaveTextContent(JSON.stringify({ value: 42 }));
+	});
+
+	it("scrolls running logs without smooth motion when reduced motion is enabled", () => {
+		mockUseExecution.mockReturnValue({
+			data: { status: "Running" },
+			isLoading: false,
+		});
+		mockUseReducedMotion.mockReturnValue(true);
+		const scrollTo = vi.fn();
+		const originalScrollTo = Element.prototype.scrollTo;
+		Object.defineProperty(Element.prototype, "scrollTo", {
+			configurable: true,
+			value: scrollTo,
+		});
+
+		renderWithProviders(
+			<ToolExecutionCard
+				toolCall={makeToolCall()}
+				executionId="exec-1"
+				isStreaming
+				streamingState={{
+					status: "running",
+					logs: [{ level: "info", message: "progress..." }],
+				}}
+			/>,
+		);
+
+		expect(scrollTo).toHaveBeenCalledWith({ behavior: "auto", top: 0 });
+		mockUseReducedMotion.mockReturnValue(false);
+		Object.defineProperty(Element.prototype, "scrollTo", {
+			configurable: true,
+			value: originalScrollTo,
+		});
+	});
+});
+
+describe("ToolExecutionCard — removed execution", () => {
+	const removed = {
+		data: undefined,
+		isLoading: false,
+		error: {
+			detail: "Execution exec-1 not found. Finished runs are removed after 30 days.",
+		},
+	};
+
+	it("shows the tool call's own result once its execution is removed", async () => {
+		mockUseExecution.mockReturnValue(removed);
+		const { user } = renderWithProviders(
+			<ToolExecutionCard
+				toolCall={makeToolCall()}
+				executionId="exec-1"
+				hasResultMessage
+				toolCallMessage={{
+					tool_state: "completed",
+					tool_result: { answer: 42 },
+				}}
+			/>,
+		);
+
+		expect(screen.getByText("Success")).toBeInTheDocument();
+		expect(
+			screen.getByText("Removed after 30 days (retention)"),
+		).toBeInTheDocument();
+		await user.click(screen.getByRole("button", { name: /result/i }));
+		expect(await screen.findByTestId("pretty-input")).toHaveTextContent(
+			JSON.stringify({ answer: 42 }),
+		);
+		// The open result section never asks for the removed run's logs.
+		expect(mockUseExecutionLogs).toHaveBeenLastCalledWith("exec-1", false);
+	});
+
+	it("shows the tool call's own error once its execution is removed", () => {
+		mockUseExecution.mockReturnValue(removed);
+		renderWithProviders(
+			<ToolExecutionCard
+				toolCall={makeToolCall()}
+				executionId="exec-1"
+				hasResultMessage
+				toolCallMessage={{
+					tool_state: "error",
+					tool_result: { error: "boom" },
+				}}
+			/>,
+		);
+
+		expect(screen.getByText("Failed")).toBeInTheDocument();
+		expect(screen.getByRole("alert")).toHaveTextContent("boom");
+		expect(
+			screen.getByText("Removed after 30 days (retention)"),
+		).toBeInTheDocument();
 	});
 });

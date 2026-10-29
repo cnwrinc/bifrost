@@ -54,6 +54,7 @@ class AIUsagePublicSimple(BaseModel):
     output_tokens: int
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    reasoning_tokens: int = 0  # Included in output_tokens
     provider_cost: str | None = None
     cost: str | None = None  # Decimal as string
     duration_ms: int | None = None
@@ -67,6 +68,7 @@ class AIUsageTotalsSimple(BaseModel):
     total_output_tokens: int = 0
     total_cache_read_tokens: int = 0
     total_cache_write_tokens: int = 0
+    total_reasoning_tokens: int = 0
     total_provider_cost: str = "0"
     total_cost: str = "0"  # Decimal as string
     total_duration_ms: int = 0
@@ -96,8 +98,7 @@ class ExecutionSummary(BaseModel):
     started_at: datetime | None = None  # May be None if not started yet
     completed_at: datetime | None = None
     scheduled_at: datetime | None = None  # For Scheduled rows, when the row is due to promote
-    # CLI session tracking
-    session_id: str | None = None  # CLI session ID if executed from local runner
+    created_at: datetime | None = None  # Fallback timeline anchor before a run starts
     # Resource metrics (admin only, null for non-admins)
     peak_memory_bytes: int | None = None
     process_rss_bytes: int | None = None
@@ -129,12 +130,13 @@ class WorkflowExecutionRequest(BaseModel):
     form_id: str | None = Field(default=None, description="Optional form ID that triggered this execution")
     app_id: str | None = Field(default=None, description="Optional app ID of the calling Solution app. Used to scope a path::function workflow ref to the app's own install (so it resolves the install's own workflow, not a sibling install's that shares the path).")
     solution_id: str | None = Field(default=None, description="Optional install id of the calling Solution form/agent. Used to scope a path::function workflow ref to that install (so it resolves the install's own workflow, not a sibling install's or the bare _repo/ one). Takes precedence over form_id/app_id derivation.")
+    caller_solution_id: str | None = Field(default=None, description="SPIKE: the caller's OWN install on per-call targeted requests (SDK-attested, engine requests only). Lets the inbound gate tell own-calls (caller == target, always allow) from cross-install calls (target's allow_inbound_access decides).")
     transient: bool = Field(default=False, description="If true, skip database persistence (for code editor debugging)")
     sync: bool | None = Field(default=None, description="If true, block until execution completes and return result inline. Overrides workflow's execution_mode setting.")
-    code: str | None = Field(default=None, description="Optional: Python code to execute as script (base64 encoded). If provided, executes code instead of looking up workflow by ID.")
+    code: str | None = Field(default=None, description="Optional: Python code to execute as a script, as plain text. If provided, executes code instead of looking up workflow by ID.")
     script_name: str | None = Field(default=None, description="Optional: Name/identifier for the script (used for logging when code is provided)")
-    org_id: str | None = Field(default=None, description="Override execution org context. Requires platform admin.")
-    run_as: str | None = Field(default=None, description="Execute as this user UUID (impersonation). Requires platform admin.")
+    org_id: str | None = Field(default=None, description="Override execution org context within the caller's reach. Requires workflows.execute in the target organization.")
+    run_as: str | None = Field(default=None, description="Execute as this user UUID. Requires Impersonate Users in that user's organization.")
     scheduled_at: datetime | None = Field(
         default=None,
         description=(
@@ -281,4 +283,3 @@ class ExecutionPublic(ExecutionBase):
     @field_serializer("created_at", "started_at", "completed_at")
     def serialize_dt(self, dt: datetime | None) -> str | None:
         return dt.isoformat() if dt else None
-

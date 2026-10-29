@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
 	Crown,
 	RefreshCw,
@@ -10,12 +10,13 @@ import {
 	ArrowUp,
 	ArrowDown,
 } from "lucide-react";
+import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
 	DataTable,
 	DataTableBody,
 	DataTableCell,
+	DataTableFooter,
 	DataTableHead,
 	DataTableHeader,
 	DataTableRow,
@@ -28,23 +29,9 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
-import {
-	AlertDialog,
-	AlertDialogAction,
-	AlertDialogCancel,
-	AlertDialogContent,
-	AlertDialogDescription,
-	AlertDialogFooter,
-	AlertDialogHeader,
-	AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { SearchBox } from "@/components/search/SearchBox";
-import { useSearch } from "@/hooks/useSearch";
-import {
-	useUsersFiltered,
-	useDeleteUser,
-	useUpdateUser,
-} from "@/hooks/useUsers";
+import { useUsersPage } from "@/hooks/useUsers";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { useUserSelection } from "@/hooks/useUserSelection";
 import { useOrganizations } from "@/hooks/useOrganizations";
 import { useAuth } from "@/contexts/AuthContext";
@@ -52,37 +39,50 @@ import { useOrgScope } from "@/contexts/OrgScopeContext";
 import { OrganizationSelect } from "@/components/forms/OrganizationSelect";
 import { CreateUserDialog } from "@/components/users/CreateUserDialog";
 import { EditUserDialog } from "@/components/users/EditUserDialog";
-import { UserActionsMenu } from "@/components/users/UserActionsMenu";
-import { RegistrationLinkDialog } from "@/components/users/RegistrationLinkDialog";
+import { profileAbilities } from "@/components/users/UserProfileForm";
+import {
+	PROTECTED_ACCOUNT_NOTICE,
+	UserActionsMenu,
+} from "@/components/users/UserActionsMenu";
+import { useUserAccountActions } from "@/components/users/useUserAccountActions";
 import { UserStatusBadge } from "@/components/users/UserStatusBadge";
 import { Badge } from "@/components/ui/badge";
-import { BulkActionBar } from "@/components/users/BulkActionBar";
+import { UserBulkActionBar } from "@/components/users/BulkActionBar";
+import {
+	ActionsCell,
+	ActionsHead,
+	RecordListBar,
+	RecordSelectAll,
+	RecordSelectTarget,
+	RowSelectCheckbox,
+	SelectionCell,
+	SelectionHead,
+} from "@/components/users/SelectableTable";
 import { UserEmailCell } from "@/components/users/UserEmailCell";
+import { UsersViewTabs } from "@/components/users/UsersViewTabs";
+import { ListPageHeader } from "@/components/layout/ListPageHeader";
+import { ListToolbar } from "@/components/layout/ListToolbar";
+import {
+	PageScrollArea,
+	PageWorkspace,
+} from "@/components/layout/PageWorkspace";
 import {
 	BulkMoveOrgDialog,
 	BulkReplaceRolesDialog,
 	BulkResultDialog,
 	BulkSetActiveDialog,
+	type BulkTarget,
 } from "@/components/users/BulkUserDialogs";
-import {
-	useRegenerateInvite,
-	useResendInvite,
-	useRevokeInvite,
-	useSendInvite,
-} from "@/hooks/useUserInvites";
-import { useEventSources } from "@/services/events";
-import { toast } from "sonner";
+import { orgTarget } from "@/lib/authorization";
+import { useAuthorization } from "@/services/authorization";
+import { ListPagination } from "@/components/pagination/ListPagination";
 import type { components, components as v1 } from "@/lib/v1";
 type User = components["schemas"]["UserPublic"];
 type Organization = components["schemas"]["OrganizationPublic"];
-type RegistrationLinkDialogState = {
-	userId: string;
-	email: string;
-	url: string;
-} | null;
 
 type SortColumn = "name" | "email" | "status" | "created" | "last_login";
 type SortDirection = "asc" | "desc";
+const PAGE_SIZE = 25;
 
 function SortIcon({
 	column,
@@ -101,55 +101,56 @@ function SortIcon({
 	);
 }
 
+function ProtectedBadge() {
+	return (
+		<Tooltip>
+			<TooltipTrigger asChild>
+				<Badge variant="warning" className="shrink-0 text-xs">
+					Protected
+				</Badge>
+			</TooltipTrigger>
+			<TooltipContent>{PROTECTED_ACCOUNT_NOTICE}</TooltipContent>
+		</Tooltip>
+	);
+}
+
 export function Users() {
+	const createUserButtonRef = useRef<HTMLButtonElement>(null);
 	const navigate = useNavigate();
-	const { userId } = useParams<{ userId?: string }>();
-	const [selectedUser, setSelectedUser] = useState<User | undefined>();
+	const isNarrow = useMediaQuery("(max-width: 1023px)");
 	const [isCreateOpen, setIsCreateOpen] = useState(false);
-	const [isEditOpen, setIsEditOpen] = useState(false);
-	const [isDeleteOpen, setIsDeleteOpen] = useState(false);
-	const [isDisableOpen, setIsDisableOpen] = useState(false);
 	const [searchTerm, setSearchTerm] = useState("");
 	const [showDisabled, setShowDisabled] = useState(false);
 	const [filterOrgId, setFilterOrgId] = useState<string | null | undefined>(
 		undefined,
 	);
+	const [profileUser, setProfileUser] = useState<User | undefined>();
 	const [sortColumn, setSortColumn] = useState<SortColumn>("name");
 	const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
-	const [registrationLinkDialog, setRegistrationLinkDialog] =
-		useState<RegistrationLinkDialogState>(null);
+	const [offset, setOffset] = useState(0);
 
 	const { scope } = useOrgScope();
-	const { user: currentUser, isPlatformAdmin } = useAuth();
+	const { user: currentUser } = useAuth();
+	const authorization = useAuthorization();
+	const canSeeOrganizations = authorization.canAnywhere("organizations.read");
 
-	const {
-		data: users,
-		isLoading,
-		refetch,
-	} = useUsersFiltered(
-		isPlatformAdmin ? filterOrgId : undefined,
-		showDisabled,
-	);
-	const deleteMutation = useDeleteUser();
-	const updateMutation = useUpdateUser();
-	const resendMutation = useResendInvite();
-	const regenerateMutation = useRegenerateInvite();
-	const revokeMutation = useRevokeInvite();
-	const sendInviteMutation = useSendInvite();
-	const { data: eventSources } = useEventSources({
-		sourceType: "topic",
-		limit: 100,
+	const usersQuery = useUsersPage({
+		scope: canSeeOrganizations ? filterOrgId : undefined,
+		includeInactive: showDisabled,
+		search: searchTerm,
+		sortBy: sortColumn,
+		sortDirection,
+		limit: PAGE_SIZE,
+		offset,
 	});
-	const inviteAutomationConfigured =
-		eventSources?.items?.some(
-			(source) =>
-				source.is_active &&
-				source.event_type === "user.invited" &&
-				source.subscription_count > 0,
-		) ?? false;
+	const users = usersQuery.data?.items ?? [];
+	const total = usersQuery.data?.total ?? 0;
+	const accountActions = useUserAccountActions({
+		returnFocusRef: createUserButtonRef,
+	});
 
 	const { data: organizations } = useOrganizations({
-		enabled: isPlatformAdmin,
+		enabled: canSeeOrganizations,
 	});
 
 	const getOrgInfo = (
@@ -158,62 +159,36 @@ export function Users() {
 		if (!orgId) return { name: "Platform", isProvider: false };
 		const org = organizations?.find((o: Organization) => o.id === orgId);
 		return {
-			name: org?.name || orgId,
+			name:
+				org?.name ||
+				(organizations
+					? "Unknown organization"
+					: canSeeOrganizations
+						? "Loading…"
+						: "Not visible to you"),
 			isProvider: org?.is_provider ?? false,
 		};
 	};
 
-	const filteredUsers = useSearch(users || [], searchTerm, ["email", "name"]);
-
-	const routeSelectedUser = useMemo(
-		() => users?.find((user) => user.id === userId),
-		[users, userId],
-	);
-	const editDialogUser = selectedUser ?? routeSelectedUser;
-	const isEditDialogOpen = isEditOpen || Boolean(routeSelectedUser);
-
-	const sortedUsers = useMemo(() => {
-		if (!filteredUsers) return [];
-		return [...filteredUsers].sort((a, b) => {
-			const dir = sortDirection === "asc" ? 1 : -1;
-			switch (sortColumn) {
-				case "name":
-					return (
-						dir *
-						(a.name || a.email || "").localeCompare(
-							b.name || b.email || "",
-						)
-					);
-				case "email":
-					return dir * (a.email || "").localeCompare(b.email || "");
-				case "status": {
-					const aVal = a.invite_status ?? "active";
-					const bVal = b.invite_status ?? "active";
-					return dir * aVal.localeCompare(bVal);
-				}
-				case "created": {
-					const aDate = a.created_at
-						? new Date(a.created_at).getTime()
-						: 0;
-					const bDate = b.created_at
-						? new Date(b.created_at).getTime()
-						: 0;
-					return dir * (aDate - bDate);
-				}
-				case "last_login": {
-					const aDate = a.last_login
-						? new Date(a.last_login).getTime()
-						: 0;
-					const bDate = b.last_login
-						? new Date(b.last_login).getTime()
-						: 0;
-					return dir * (aDate - bDate);
-				}
-				default:
-					return 0;
-			}
-		});
-	}, [filteredUsers, sortColumn, sortDirection]);
+	// Bulk operations follow the organization filter (anywhere when it shows
+	// every organization); the server still decides each user and reports
+	// per-user failures.
+	const canBulk = (permission: string) =>
+		filterOrgId
+			? authorization.canAt(permission, orgTarget(filterOrgId))
+			: authorization.canAnywhere(permission);
+	const bulkAbilities = {
+		canMoveOrg: canBulk("userlifecycle.readwrite"),
+		// The replace-roles dialog lists every role, which needs roles.read.
+		canReplaceRoles:
+			canBulk("roleassignments.readwrite") &&
+			authorization.meets({ permission: "roles.read", at: "global" }),
+		canSetActive: canBulk("users.readwrite"),
+	};
+	const showSelection =
+		bulkAbilities.canMoveOrg ||
+		bulkAbilities.canReplaceRoles ||
+		bulkAbilities.canSetActive;
 
 	const handleSort = (column: SortColumn) => {
 		if (sortColumn === column) {
@@ -222,6 +197,7 @@ export function Users() {
 			setSortColumn(column);
 			setSortDirection("asc");
 		}
+		setOffset(0);
 	};
 
 	// ===== Bulk selection + actions =====
@@ -229,14 +205,14 @@ export function Users() {
 		() => (currentUser ? [currentUser.id] : []),
 		[currentUser],
 	);
-	const selection = useUserSelection(sortedUsers, disabledSelectionIds);
+	const selection = useUserSelection(users, disabledSelectionIds);
 
 	type BulkMode = "move_org" | "replace_roles" | "disable" | "enable" | null;
 	const [bulkMode, setBulkMode] = useState<BulkMode>(null);
 	const [bulkResult, setBulkResult] = useState<
 		v1["schemas"]["BulkUserResponse"] | null
 	>(null);
-	const [bulkResultUsers, setBulkResultUsers] = useState<User[]>([]);
+	const [bulkResultUsers, setBulkResultUsers] = useState<BulkTarget[]>([]);
 
 	const activeMix: "all_active" | "all_inactive" | "mixed" = useMemo(() => {
 		const selected = selection.selectedItems;
@@ -249,7 +225,7 @@ export function Users() {
 
 	const handlePartialFailure = (
 		result: v1["schemas"]["BulkUserResponse"],
-		opUsers: User[],
+		opUsers: BulkTarget[],
 	) => {
 		setBulkResult(result);
 		setBulkResultUsers(opUsers);
@@ -266,518 +242,604 @@ export function Users() {
 		selection.clear();
 	};
 
-	const handleEditUser = (user: User) => {
-		setSelectedUser(user);
-		setIsEditOpen(true);
-		if (userId !== user.id) {
-			navigate(`/users/${user.id}`);
-		}
-	};
-
-	const handleToggleActive = (user: User) => {
-		if (user.is_active) {
-			setSelectedUser(user);
-			setIsDisableOpen(true);
-		} else {
-			handleEnableUser(user);
-		}
-	};
-
-	const handleDeleteUser = (user: User) => {
-		setSelectedUser(user);
-		setIsDeleteOpen(true);
-	};
-
-	const handleConfirmDisable = async () => {
-		if (!selectedUser) return;
-
-		try {
-			await updateMutation.mutateAsync({
-				params: { path: { user_id: selectedUser.id } },
-				body: { is_active: false },
-			});
-			toast.success("User disabled", {
-				description: `${selectedUser.name || selectedUser.email} has been disabled`,
-			});
-			setIsDisableOpen(false);
-			setSelectedUser(undefined);
-		} catch (error) {
-			const errorMessage =
-				error instanceof Error
-					? error.message
-					: "Unknown error occurred";
-			toast.error("Failed to disable user", {
-				description: errorMessage,
-			});
-		}
-	};
-
-	const handleEnableUser = async (user: User) => {
-		try {
-			await updateMutation.mutateAsync({
-				params: { path: { user_id: user.id } },
-				body: { is_active: true },
-			});
-			toast.success("User enabled", {
-				description: `${user.name || user.email} has been re-enabled`,
-			});
-		} catch (error) {
-			const errorMessage =
-				error instanceof Error
-					? error.message
-					: "Unknown error occurred";
-			toast.error("Failed to enable user", {
-				description: errorMessage,
-			});
-		}
-	};
-
-	const handleConfirmDelete = async () => {
-		if (!selectedUser) return;
-
-		try {
-			await deleteMutation.mutateAsync({
-				params: { path: { user_id: selectedUser.id } },
-			});
-			toast.success("User permanently deleted", {
-				description: `${selectedUser.name || selectedUser.email} has been permanently removed`,
-			});
-			setIsDeleteOpen(false);
-			setSelectedUser(undefined);
-		} catch (error) {
-			const errorMessage =
-				error instanceof Error
-					? error.message
-					: "Unknown error occurred";
-			toast.error("Failed to delete user", {
-				description: errorMessage,
-			});
-		}
-	};
-
-	const handleEditClose = () => {
-		setIsEditOpen(false);
-		setSelectedUser(undefined);
-		if (userId) navigate("/users", { replace: true });
+	const handleOpenUser = (user: User) => {
+		navigate(`/users/${user.id}`);
 	};
 
 	const isSelf = (user: User) =>
 		!!(currentUser && user.id === currentUser.id);
+	const unselectable = (user: User) =>
+		isSelf(user)
+			? {
+					label: "Cannot select yourself",
+					reason: "You can't include yourself in a bulk action",
+				}
+			: undefined;
 
-	const showRegistrationLink = (user: User, url: string) => {
-		setRegistrationLinkDialog({
-			userId: user.id,
-			email: user.email,
-			url,
-		});
-	};
+	const renderUserActions = (user: User) => (
+		<UserActionsMenu
+			label={`${user.name || user.email} actions`}
+			{...accountActions.menuPropsFor(user)}
+			onEditProfile={
+				profileAbilities(user, isSelf(user), authorization).canSave
+					? () => setProfileUser(user)
+					: undefined
+			}
+		/>
+	);
 
 	return (
-		<div className="h-full flex flex-col space-y-6 max-w-7xl mx-auto">
-			<div className="flex items-center justify-between">
-				<div>
-					<h1 className="text-4xl font-extrabold tracking-tight">
-						Users
-					</h1>
-					<p className="mt-2 text-muted-foreground">
-						{scope.type === "global"
+		<PageWorkspace className="max-w-7xl mx-auto">
+			<ListPageHeader
+				title="Users"
+				titleSlot={<UsersViewTabs />}
+				description={
+					scope.type !== "global"
+						? `Users for ${scope.orgName}`
+						: authorization.isPlatformAdmin
 							? "Manage platform administrators and organization users"
-							: `Users for ${scope.orgName}`}
-					</p>
-				</div>
-				<div className="flex items-center gap-2">
-					<Button
-						variant="outline"
-						size="icon"
-						onClick={() => refetch()}
-						title="Refresh"
-					>
-						<RefreshCw className="h-4 w-4" />
-					</Button>
-					<Button
-						variant="outline"
-						size="icon"
-						onClick={() => setIsCreateOpen(true)}
-						title="Create User"
-					>
-						<Plus className="h-4 w-4" />
-					</Button>
-				</div>
-			</div>
+							: "View and support users in the organizations you can reach"
+				}
+				actions={
+					<>
+						<Button
+							variant="outline"
+							size="icon"
+							onClick={() => usersQuery.refetch()}
+							title="Refresh"
+							aria-label="Refresh users"
+							className="h-11 w-11 lg:h-9 lg:w-9"
+							disabled={usersQuery.isFetching}
+						>
+							<RefreshCw
+								className={`h-4 w-4 ${usersQuery.isFetching ? "animate-spin motion-reduce:animate-none" : ""}`}
+							/>
+						</Button>
+						{authorization.canAnywhere("users.readwrite") && (
+							<Button
+								className="min-h-11 lg:min-h-0"
+								ref={createUserButtonRef}
+								onClick={() => setIsCreateOpen(true)}
+							>
+								<Plus className="h-4 w-4 mr-1.5" />
+								Create User
+							</Button>
+						)}
+					</>
+				}
+			/>
 
-			{/* Filters Row */}
-			<div className="flex items-center gap-4">
+			<ListToolbar>
 				<SearchBox
 					value={searchTerm}
-					onChange={setSearchTerm}
+					onChange={(value) => {
+						setSearchTerm(value);
+						setOffset(0);
+					}}
 					placeholder="Search users by email or name..."
-					className="flex-1"
+					className="w-full sm:flex-1"
 				/>
-				{isPlatformAdmin && (
-					<div className="w-64">
+				{canSeeOrganizations && (
+					<div className="w-full sm:w-64">
 						<OrganizationSelect
 							value={filterOrgId}
-							onChange={setFilterOrgId}
+							onChange={(value) => {
+								setFilterOrgId(value);
+								setOffset(0);
+							}}
 							showAll={true}
 							showGlobal={false}
 							placeholder="All users"
 						/>
 					</div>
 				)}
-				<div className="flex items-center gap-2 ml-auto">
+				<div className="flex items-center gap-2 sm:ml-auto">
 					<Switch
 						id="show-disabled"
 						checked={showDisabled}
-						onCheckedChange={setShowDisabled}
+						onCheckedChange={(checked) => {
+							setShowDisabled(checked);
+							setOffset(0);
+						}}
 					/>
 					<Label
 						htmlFor="show-disabled"
-						className="text-sm text-muted-foreground cursor-pointer"
+						className="cursor-pointer text-sm text-muted-foreground"
 					>
 						Show Inactive
 					</Label>
 				</div>
-			</div>
+			</ListToolbar>
 
+			{usersQuery.isError && (
+				<Alert variant="destructive">
+					<AlertTitle>
+						Users could not be{" "}
+						{usersQuery.data ? "refreshed" : "loaded"}
+					</AlertTitle>
+					<AlertDescription>
+						Check your connection and try again.
+						{usersQuery.data &&
+							" Previously loaded users are still shown."}
+					</AlertDescription>
+					<Button
+						variant="outline"
+						className="mt-3 min-h-11 lg:min-h-0"
+						disabled={usersQuery.isFetching}
+						onClick={() => usersQuery.refetch()}
+					>
+						Retry Users
+					</Button>
+				</Alert>
+			)}
 			{/* Content */}
-			<div className="flex-1 min-h-0">
-				{isLoading ? (
-					<div className="space-y-2">
+			<PageScrollArea
+				aria-label="Users list"
+				className="lg:flex lg:flex-col lg:overflow-hidden"
+				aria-busy={usersQuery.isFetching}
+			>
+				{usersQuery.isLoading ? (
+					<div
+						className="space-y-2"
+						role="status"
+						aria-label="Loading users"
+					>
 						{[...Array(5)].map((_, i) => (
 							<Skeleton key={i} className="h-12 w-full" />
 						))}
 					</div>
-				) : sortedUsers && sortedUsers.length > 0 ? (
-					<DataTable>
-						<DataTableHeader>
-							<DataTableRow>
-								<DataTableHead className="w-0 whitespace-nowrap">
-									<Checkbox
-										aria-label="Select all visible users"
-										checked={
-											selection.allVisibleSelected
-												? true
-												: selection.someVisibleSelected
-													? "indeterminate"
-													: false
-										}
-										onCheckedChange={() =>
-											selection.toggleAllVisible()
-										}
-									/>
-								</DataTableHead>
-								<DataTableHead className="w-0 whitespace-nowrap">
-									Organization
-								</DataTableHead>
-								<DataTableHead
-									className="w-0 whitespace-nowrap cursor-pointer select-none"
-									onClick={() => handleSort("name")}
-								>
-									Name
-									<SortIcon
-										column="name"
-										sortColumn={sortColumn}
-										sortDirection={sortDirection}
-									/>
-								</DataTableHead>
-								<DataTableHead
-									className="cursor-pointer select-none"
-									onClick={() => handleSort("email")}
-								>
-									Email
-									<SortIcon
-										column="email"
-										sortColumn={sortColumn}
-										sortDirection={sortDirection}
-									/>
-								</DataTableHead>
-								<DataTableHead
-									className="w-0 whitespace-nowrap cursor-pointer select-none"
-									onClick={() => handleSort("status")}
-								>
-									Status
-									<SortIcon
-										column="status"
-										sortColumn={sortColumn}
-										sortDirection={sortDirection}
-									/>
-								</DataTableHead>
-								<DataTableHead
-									className="w-0 whitespace-nowrap cursor-pointer select-none"
-									onClick={() => handleSort("created")}
-								>
-									Created
-									<SortIcon
-										column="created"
-										sortColumn={sortColumn}
-										sortDirection={sortDirection}
-									/>
-								</DataTableHead>
-								<DataTableHead
-									className="w-0 whitespace-nowrap cursor-pointer select-none"
-									onClick={() => handleSort("last_login")}
-								>
-									Last Login
-									<SortIcon
-										column="last_login"
-										sortColumn={sortColumn}
-										sortDirection={sortDirection}
-									/>
-								</DataTableHead>
-								<DataTableHead className="w-0 whitespace-nowrap text-right sticky right-0 bg-background"></DataTableHead>
-							</DataTableRow>
-						</DataTableHeader>
-						<DataTableBody>
-							{sortedUsers.map((user) => {
-								const orgInfo = getOrgInfo(
-									user.organization_id,
-								);
-								return (
-									<DataTableRow
-										key={user.id}
-										clickable
-										onClick={() => handleEditUser(user)}
-										className={
-											"group/row" +
-											(!user.is_active
-												? " opacity-60"
-												: "")
-										}
+				) : usersQuery.isError &&
+				  !usersQuery.data ? null : users.length > 0 ? (
+					isNarrow ? (
+						<div className="rounded-[var(--bf-radius-surface)] border bg-card">
+							<RecordListBar>
+								{showSelection && (
+									<RecordSelectAll
+										selection={selection}
+										label="Select all visible users"
 									>
-										<DataTableCell
-											className="w-0 whitespace-nowrap"
-											onClick={(e) => e.stopPropagation()}
-										>
-											{isSelf(user) ? (
-												<Tooltip>
-													<TooltipTrigger asChild>
-														<span>
-															<Checkbox
-																checked={false}
-																disabled
-																aria-label="Cannot select yourself"
-															/>
-														</span>
-													</TooltipTrigger>
-													<TooltipContent>
-														You can't include
-														yourself in a bulk
-														action
-													</TooltipContent>
-												</Tooltip>
+										Select Page
+									</RecordSelectAll>
+								)}
+								<label className="flex min-w-0 items-center gap-2 text-sm">
+									Sort
+									<select
+										aria-label="Sort users"
+										className="h-11 min-w-0 rounded-[var(--bf-radius-control)] border bg-background px-2 text-foreground"
+										value={`${sortColumn}:${sortDirection}`}
+										onChange={(event) => {
+											const [column, direction] =
+												event.target.value.split(":");
+											setSortColumn(column as SortColumn);
+											setSortDirection(
+												direction as SortDirection,
+											);
+											setOffset(0);
+										}}
+									>
+										{(
+											[
+												["name", "Name"],
+												["email", "Email"],
+												["status", "Status"],
+												["created", "Created"],
+												["last_login", "Last Login"],
+											] as const
+										).flatMap(([column, label]) =>
+											(["asc", "desc"] as const).map(
+												(direction) => (
+													<option
+														key={`${column}:${direction}`}
+														value={`${column}:${direction}`}
+													>
+														{label} ·{" "}
+														{direction === "asc"
+															? "ascending"
+															: "descending"}
+													</option>
+												),
+											),
+										)}
+									</select>
+								</label>
+							</RecordListBar>
+							<ul aria-label="Users" className="divide-y">
+								{users.map((user) => (
+									<li key={user.id} className="min-w-0 p-4">
+										<div className="flex items-start gap-2">
+											{showSelection && (
+												<RecordSelectTarget>
+													<RowSelectCheckbox
+														selection={selection}
+														id={user.id}
+														label={`Select ${user.name || user.email}`}
+														unselectable={unselectable(
+															user,
+														)}
+													/>
+												</RecordSelectTarget>
+											)}
+											<div className="min-w-0 flex-1">
+												<button
+													type="button"
+													onClick={() =>
+														handleOpenUser(user)
+													}
+													className="min-h-11 text-left font-medium [overflow-wrap:anywhere] hover:text-primary focus-visible:outline-2 focus-visible:outline-ring"
+												>
+													{user.name || user.email}
+												</button>
+											</div>
+											{renderUserActions(user)}
+										</div>
+										<div className="mt-1 text-sm text-muted-foreground">
+											<UserEmailCell
+												email={user.email}
+												wrap
+											/>
+										</div>
+										<div className="mt-3 flex flex-wrap gap-2">
+											{!user.is_active ? (
+												<Badge variant="secondary">
+													Inactive
+												</Badge>
 											) : (
-												<Checkbox
-													aria-label={`Select ${user.name || user.email}`}
-													checked={selection.isSelected(
-														user.id,
-													)}
-													onClick={(e) => {
-														selection.toggle(
-															user.id,
-															{
-																shiftKey:
-																	e.shiftKey,
-															},
-														);
-														e.preventDefault();
-													}}
+												<UserStatusBadge
+													status={
+														user.invite_status ??
+														"active"
+													}
 												/>
 											)}
-										</DataTableCell>
-										<DataTableCell className="w-0 whitespace-nowrap text-sm">
-											<span className="inline-flex items-center gap-1">
-												{orgInfo.isProvider ? (
-													<Star className="h-3.5 w-3.5 text-amber-500 fill-amber-500" />
-												) : (
-													<Building2 className="h-3.5 w-3.5 text-muted-foreground" />
-												)}
-												<span>{orgInfo.name}</span>
-											</span>
-										</DataTableCell>
-										<DataTableCell className="w-0 whitespace-nowrap">
-											<div className="flex items-center gap-1.5">
-												<span className="font-medium">
-													{user.name || user.email}
-												</span>
-												{user.is_superuser && (
-													<Tooltip>
-														<TooltipTrigger asChild>
-															<Crown className="h-4 w-4 shrink-0 text-amber-500 fill-amber-500" />
-														</TooltipTrigger>
-														<TooltipContent>
-															Platform Admin
-														</TooltipContent>
-													</Tooltip>
-												)}
-												{user.is_external && (
-													<Tooltip>
-														<TooltipTrigger asChild>
-															<Badge
-																variant="outline"
-																className="text-xs shrink-0"
-															>
-																External
-															</Badge>
-														</TooltipTrigger>
-														<TooltipContent>
-															External user — sees only what the Everyone tier or an explicit role grant allows
-														</TooltipContent>
-													</Tooltip>
-												)}
+											{user.is_superuser && (
+												<Badge variant="outline">
+													Platform Admin
+												</Badge>
+											)}
+											{user.is_protected && (
+												<ProtectedBadge />
+											)}
+											{user.is_external && (
+												<Badge variant="outline">
+													External
+												</Badge>
+											)}
+										</div>
+										<dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
+											<div className="col-span-2">
+												<dt className="text-xs text-muted-foreground">
+													Organization
+												</dt>
+												<dd className="mt-1 [overflow-wrap:anywhere]">
+													{
+														getOrgInfo(
+															user.organization_id,
+														).name
+													}
+													{getOrgInfo(
+														user.organization_id,
+													).isProvider && (
+														<span className="ml-2 text-xs text-muted-foreground">
+															Provider
+														</span>
+													)}
+												</dd>
 											</div>
-										</DataTableCell>
-										<DataTableCell
-											className="text-muted-foreground max-w-0"
-											onClick={(e) => e.stopPropagation()}
+											<div>
+												<dt className="text-xs text-muted-foreground">
+													Created
+												</dt>
+												<dd className="mt-1 font-mono text-xs">
+													{user.created_at
+														? new Date(
+																user.created_at,
+															).toLocaleDateString()
+														: "Not available"}
+												</dd>
+											</div>
+											<div>
+												<dt className="text-xs text-muted-foreground">
+													Last Login
+												</dt>
+												<dd className="mt-1 font-mono text-xs">
+													{user.last_login
+														? new Date(
+																user.last_login,
+															).toLocaleDateString()
+														: "Never"}
+												</dd>
+											</div>
+										</dl>
+									</li>
+								))}
+							</ul>
+							<ListPagination
+								offset={offset}
+								limit={PAGE_SIZE}
+								total={total}
+								isFetching={usersQuery.isFetching}
+								onPageChange={setOffset}
+							/>
+						</div>
+					) : (
+						<DataTable className="max-h-full">
+							<DataTableHeader>
+								<DataTableRow>
+									{showSelection && (
+										<SelectionHead
+											selection={selection}
+											label="Select all visible users"
+										/>
+									)}
+									<DataTableHead className="w-0 whitespace-nowrap">
+										Organization
+									</DataTableHead>
+									<DataTableHead
+										className="w-0 whitespace-nowrap"
+										aria-sort={
+											sortColumn === "name"
+												? sortDirection === "asc"
+													? "ascending"
+													: "descending"
+												: "none"
+										}
+									>
+										<button
+											type="button"
+											className="inline-flex min-h-11 items-center text-left focus-visible:outline-2 focus-visible:outline-ring"
+											onClick={() => handleSort("name")}
 										>
-											<UserEmailCell email={user.email} />
-										</DataTableCell>
-										<DataTableCell className="w-0 whitespace-nowrap">
-											<UserStatusBadge
-												status={
-													user.invite_status ??
-													"active"
-												}
+											Name
+											<SortIcon
+												column="name"
+												sortColumn={sortColumn}
+												sortDirection={sortDirection}
 											/>
-										</DataTableCell>
-										<DataTableCell className="w-0 whitespace-nowrap text-sm text-muted-foreground">
-											{user.created_at
-												? new Date(
-														user.created_at,
-													).toLocaleDateString()
-												: "N/A"}
-										</DataTableCell>
-										<DataTableCell className="w-0 whitespace-nowrap text-sm text-muted-foreground">
-											{user.last_login
-												? new Date(
-														user.last_login,
-													).toLocaleDateString()
-												: "Never"}
-										</DataTableCell>
-										<DataTableCell
-											className="w-0 whitespace-nowrap text-right sticky right-0 bg-card group-hover/row:bg-[color-mix(in_oklch,var(--card),var(--muted)_50%)]"
-											onClick={(e) => e.stopPropagation()}
+										</button>
+									</DataTableHead>
+									<DataTableHead
+										className="w-0 whitespace-nowrap"
+										aria-sort={
+											sortColumn === "email"
+												? sortDirection === "asc"
+													? "ascending"
+													: "descending"
+												: "none"
+										}
+									>
+										<button
+											type="button"
+											className="inline-flex min-h-11 items-center text-left focus-visible:outline-2 focus-visible:outline-ring"
+											onClick={() => handleSort("email")}
 										>
-											<UserActionsMenu
-												status={
-													user.invite_status ??
-													"active"
-												}
-												isActive={user.is_active}
-												isSelf={isSelf(user)}
-												onResend={() =>
-													resendMutation.mutate(
-														user.id,
-														{
-															onSuccess: (
-																res,
-															) => {
-																toast.success(
-																	res.event_emitted
-																		? `Invite automation triggered for ${user.email}`
-																		: "Invite regenerated (no automations — copy link from regenerate)",
-																);
-															},
-															onError: (
-																e: unknown,
-															) =>
-																toast.error(
-																	e instanceof
-																		Error
-																		? e.message
-																		: "Failed to resend invite",
-																),
-														},
-													)
-												}
-												onRegenerate={() =>
-													regenerateMutation.mutate(
-														user.id,
-														{
-															onSuccess: (
-																res,
-															) => {
-																showRegistrationLink(
-																	user,
-																	res.registration_url,
-																);
-															},
-															onError: (
-																e: unknown,
-															) =>
-																toast.error(
-																	e instanceof
-																		Error
-																		? e.message
-																		: "Failed to regenerate link",
-																),
-														},
-													)
-												}
-												onCopyLink={() =>
-													regenerateMutation.mutate(
-														user.id,
-														{
-															onSuccess: (
-																res,
-															) => {
-																showRegistrationLink(
-																	user,
-																	res.registration_url,
-																);
-															},
-															onError: (
-																e: unknown,
-															) =>
-																toast.error(
-																	e instanceof
-																		Error
-																		? e.message
-																		: "Failed to copy link",
-																),
-														},
-													)
-												}
-												onRevoke={() =>
-													revokeMutation.mutate(
-														user.id,
-														{
-															onSuccess: () =>
-																toast.success(
-																	"Invite revoked",
-																),
-															onError: (
-																e: unknown,
-															) =>
-																toast.error(
-																	e instanceof
-																		Error
-																		? e.message
-																		: "Failed to revoke invite",
-																),
-														},
-													)
-												}
-												onToggleActive={() =>
-													handleToggleActive(user)
-												}
-												onDelete={() =>
-													handleDeleteUser(user)
-												}
+											Email
+											<SortIcon
+												column="email"
+												sortColumn={sortColumn}
+												sortDirection={sortDirection}
 											/>
-										</DataTableCell>
-									</DataTableRow>
-								);
-							})}
-						</DataTableBody>
-					</DataTable>
+										</button>
+									</DataTableHead>
+									<DataTableHead
+										className="w-0 whitespace-nowrap"
+										aria-sort={
+											sortColumn === "status"
+												? sortDirection === "asc"
+													? "ascending"
+													: "descending"
+												: "none"
+										}
+									>
+										<button
+											type="button"
+											className="inline-flex min-h-11 items-center text-left focus-visible:outline-2 focus-visible:outline-ring"
+											onClick={() => handleSort("status")}
+										>
+											Status
+											<SortIcon
+												column="status"
+												sortColumn={sortColumn}
+												sortDirection={sortDirection}
+											/>
+										</button>
+									</DataTableHead>
+									<DataTableHead
+										className="w-0 whitespace-nowrap"
+										aria-sort={
+											sortColumn === "created"
+												? sortDirection === "asc"
+													? "ascending"
+													: "descending"
+												: "none"
+										}
+									>
+										<button
+											type="button"
+											className="inline-flex min-h-11 items-center text-left focus-visible:outline-2 focus-visible:outline-ring"
+											onClick={() =>
+												handleSort("created")
+											}
+										>
+											Created
+											<SortIcon
+												column="created"
+												sortColumn={sortColumn}
+												sortDirection={sortDirection}
+											/>
+										</button>
+									</DataTableHead>
+									<DataTableHead
+										className="w-0 whitespace-nowrap"
+										aria-sort={
+											sortColumn === "last_login"
+												? sortDirection === "asc"
+													? "ascending"
+													: "descending"
+												: "none"
+										}
+									>
+										<button
+											type="button"
+											className="inline-flex min-h-11 items-center text-left focus-visible:outline-2 focus-visible:outline-ring"
+											onClick={() =>
+												handleSort("last_login")
+											}
+										>
+											Last Login
+											<SortIcon
+												column="last_login"
+												sortColumn={sortColumn}
+												sortDirection={sortDirection}
+											/>
+										</button>
+									</DataTableHead>
+									<ActionsHead />
+								</DataTableRow>
+							</DataTableHeader>
+							<DataTableBody>
+								{users.map((user) => {
+									const orgInfo = getOrgInfo(
+										user.organization_id,
+									);
+									return (
+										<DataTableRow
+											key={user.id}
+											href={`/users/${user.id}`}
+											onClick={() => handleOpenUser(user)}
+											className={"group/row"}
+										>
+											{showSelection && (
+												<SelectionCell
+													selection={selection}
+													id={user.id}
+													label={`Select ${user.name || user.email}`}
+													unselectable={unselectable(
+														user,
+													)}
+												/>
+											)}
+											<DataTableCell className="min-w-0 w-0 whitespace-nowrap text-sm">
+												<span className="inline-flex min-w-0 items-center gap-1">
+													{orgInfo.isProvider ? (
+														<Star className="h-3.5 w-3.5 text-muted-foreground" />
+													) : (
+														<Building2 className="h-3.5 w-3.5 text-muted-foreground" />
+													)}
+													<span className="truncate">
+														{orgInfo.name}
+													</span>
+												</span>
+											</DataTableCell>
+											<DataTableCell className="min-w-48 max-w-64">
+												<div className="flex min-w-0 items-center gap-1.5">
+													<span className="min-w-0 font-medium [overflow-wrap:anywhere]">
+														{user.name ||
+															user.email}
+													</span>
+													{user.is_superuser && (
+														<Tooltip>
+															<TooltipTrigger
+																asChild
+															>
+																<Crown className="h-4 w-4 shrink-0 text-muted-foreground" />
+															</TooltipTrigger>
+															<TooltipContent>
+																Platform Admin
+															</TooltipContent>
+														</Tooltip>
+													)}
+													{user.is_protected && (
+														<ProtectedBadge />
+													)}
+													{user.is_external && (
+														<Tooltip>
+															<TooltipTrigger
+																asChild
+															>
+																<Badge
+																	variant="outline"
+																	className="text-xs shrink-0"
+																>
+																	External
+																</Badge>
+															</TooltipTrigger>
+															<TooltipContent>
+																External user —
+																sees only what
+																the Everyone
+																tier or an
+																explicit role
+																grant allows
+															</TooltipContent>
+														</Tooltip>
+													)}
+												</div>
+											</DataTableCell>
+											<DataTableCell className="min-w-48 max-w-64 text-muted-foreground">
+												<UserEmailCell
+													email={user.email}
+												/>
+											</DataTableCell>
+											<DataTableCell className="w-0 whitespace-nowrap">
+												{!user.is_active ? (
+													<Badge variant="secondary">
+														Inactive
+													</Badge>
+												) : (
+													<UserStatusBadge
+														status={
+															user.invite_status ??
+															"active"
+														}
+													/>
+												)}
+											</DataTableCell>
+											<DataTableCell className="w-0 whitespace-nowrap text-sm text-muted-foreground">
+												{user.created_at
+													? new Date(
+															user.created_at,
+														).toLocaleDateString()
+													: "N/A"}
+											</DataTableCell>
+											<DataTableCell className="w-0 whitespace-nowrap text-sm text-muted-foreground">
+												{user.last_login
+													? new Date(
+															user.last_login,
+														).toLocaleDateString()
+													: "Never"}
+											</DataTableCell>
+											<ActionsCell>
+												{renderUserActions(user)}
+											</ActionsCell>
+										</DataTableRow>
+									);
+								})}
+							</DataTableBody>
+							<DataTableFooter>
+								<DataTableRow>
+									<DataTableCell
+										colSpan={showSelection ? 8 : 7}
+										className="p-0"
+									>
+										<ListPagination
+											offset={offset}
+											limit={PAGE_SIZE}
+											total={total}
+											isFetching={usersQuery.isFetching}
+											onPageChange={setOffset}
+										/>
+									</DataTableCell>
+								</DataTableRow>
+							</DataTableFooter>
+						</DataTable>
+					)
 				) : (
 					<div className="flex flex-col items-center justify-center py-12 text-center">
 						<UserCog className="h-12 w-12 text-muted-foreground" />
 						<h3 className="mt-4 text-lg font-semibold">
 							{searchTerm
 								? "No users match your search"
-								: "No users found"}
+								: "No Users Found"}
 						</h3>
 						<p className="mt-2 text-sm text-muted-foreground">
 							{searchTerm
@@ -786,11 +848,12 @@ export function Users() {
 						</p>
 					</div>
 				)}
-			</div>
+			</PageScrollArea>
 
-			<BulkActionBar
+			<UserBulkActionBar
 				count={selection.count}
 				activeMix={activeMix}
+				{...bulkAbilities}
 				onClear={selection.clear}
 				onMoveOrg={() => setBulkMode("move_org")}
 				onReplaceRoles={() => setBulkMode("replace_roles")}
@@ -841,86 +904,12 @@ export function Users() {
 			/>
 
 			<EditUserDialog
-				user={editDialogUser}
-				open={isEditDialogOpen}
-				onOpenChange={handleEditClose}
+				user={profileUser}
+				open={profileUser !== undefined}
+				onOpenChange={(open) => !open && setProfileUser(undefined)}
 			/>
 
-			<RegistrationLinkDialog
-				open={registrationLinkDialog !== null}
-				email={registrationLinkDialog?.email}
-				url={registrationLinkDialog?.url}
-				canSendEmail={inviteAutomationConfigured}
-				isSendingEmail={sendInviteMutation.isPending}
-				onSendEmail={async () => {
-					if (!registrationLinkDialog) return;
-					try {
-						await sendInviteMutation.mutateAsync({
-							userId: registrationLinkDialog.userId,
-							registrationUrl: registrationLinkDialog.url,
-						});
-						toast.success("Registration email sent");
-						setRegistrationLinkDialog(null);
-					} catch (error) {
-						toast.error("Failed to send registration email", {
-							description:
-								error instanceof Error
-									? error.message
-									: "Unknown error occurred",
-						});
-					}
-				}}
-				onOpenChange={(open) => {
-					if (!open) setRegistrationLinkDialog(null);
-				}}
-			/>
-
-			{/* Disable confirmation dialog */}
-			<AlertDialog open={isDisableOpen} onOpenChange={setIsDisableOpen}>
-				<AlertDialogContent>
-					<AlertDialogHeader>
-						<AlertDialogTitle>Disable User</AlertDialogTitle>
-						<AlertDialogDescription>
-							Are you sure you want to disable{" "}
-							{selectedUser?.name || selectedUser?.email}? They
-							will no longer be able to access the platform. You
-							can re-enable them later.
-						</AlertDialogDescription>
-					</AlertDialogHeader>
-					<AlertDialogFooter>
-						<AlertDialogCancel>Cancel</AlertDialogCancel>
-						<AlertDialogAction onClick={handleConfirmDisable}>
-							Disable
-						</AlertDialogAction>
-					</AlertDialogFooter>
-				</AlertDialogContent>
-			</AlertDialog>
-
-			{/* Permanent delete confirmation dialog */}
-			<AlertDialog open={isDeleteOpen} onOpenChange={setIsDeleteOpen}>
-				<AlertDialogContent>
-					<AlertDialogHeader>
-						<AlertDialogTitle>
-							Permanently Delete User
-						</AlertDialogTitle>
-						<AlertDialogDescription>
-							Are you sure you want to permanently delete{" "}
-							{selectedUser?.name || selectedUser?.email}? This
-							action cannot be undone and all associated data will
-							be removed.
-						</AlertDialogDescription>
-					</AlertDialogHeader>
-					<AlertDialogFooter>
-						<AlertDialogCancel>Cancel</AlertDialogCancel>
-						<AlertDialogAction
-							onClick={handleConfirmDelete}
-							className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-						>
-							Permanently Delete
-						</AlertDialogAction>
-					</AlertDialogFooter>
-				</AlertDialogContent>
-			</AlertDialog>
-		</div>
+			{accountActions.dialogs}
+		</PageWorkspace>
 	);
 }

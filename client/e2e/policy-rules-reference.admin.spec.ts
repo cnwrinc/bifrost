@@ -24,12 +24,41 @@
  */
 
 import { test, expect } from "./fixtures/api-fixture";
+import type { AuthedApi } from "./fixtures/api-fixture";
+import { editorForPath, readEditorContent } from "./fixtures/monaco-editor";
 
 const UNIQUE = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 const FILE_RULE_NAME = `e2e-file-ref-rule-${UNIQUE}`;
 const TABLE_RULE_NAME = `e2e-table-ref-rule-${UNIQUE}`;
 const SHARE_NAME = `e2e-ref-share-${UNIQUE}`.replace(/[^a-z0-9-]/g, "-");
 const TABLE_NAME = `e2e_ref_table_${UNIQUE}`.replace(/[^a-z0-9_]/g, "_");
+
+/**
+ * The Files "Add Shared Rule…" combobox renders a humanized label
+ * (FilePolicyEditor.tsx's `readableRuleName`), not the raw rule name —
+ * mirror that transform so the option locator matches what's on screen.
+ */
+function readableRuleName(name: string) {
+	if (name === "admin_bypass") return "Administrator Access";
+	return name
+		.split(/[_-]+/)
+		.filter(Boolean)
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(" ");
+}
+let tableId: string | undefined;
+
+async function expectCleanupStatus(
+	api: AuthedApi,
+	label: string,
+	cleanup: () => Promise<Awaited<ReturnType<AuthedApi["delete"]>>>,
+) {
+	const response = await cleanup();
+	expect(
+		[200, 204, 404],
+		`${label}: ${response.status()} ${await response.text()}`,
+	).toContain(response.status());
+}
 
 test.describe("Policy rule reference mode", () => {
 	test.beforeAll(async ({ api }) => {
@@ -63,28 +92,36 @@ test.describe("Policy rule reference mode", () => {
 	});
 
 	test.afterAll(async ({ api }) => {
-		// Best-effort cleanup — failures don't fail the suite.
-		await api.delete(`/api/policy-rules/file/${FILE_RULE_NAME}`).catch(() => {});
-		await api.delete(`/api/policy-rules/table/${TABLE_RULE_NAME}`).catch(() => {});
+		await expectCleanupStatus(
+			api,
+			`delete share policy ${SHARE_NAME}`,
+			() =>
+				api.delete("/api/files/policies/", {
+					params: { location: SHARE_NAME },
+				}),
+		);
+		if (tableId) {
+			await expectCleanupStatus(
+				api,
+				`delete table fixture ${tableId}`,
+				() => api.delete(`/api/tables/${tableId}`),
+			);
+		}
+		await expectCleanupStatus(
+			api,
+			`delete file rule ${FILE_RULE_NAME}`,
+			() => api.delete(`/api/policy-rules/file/${FILE_RULE_NAME}`),
+		);
+		await expectCleanupStatus(
+			api,
+			`delete table rule ${TABLE_RULE_NAME}`,
+			() => api.delete(`/api/policy-rules/table/${TABLE_RULE_NAME}`),
+		);
 	});
 
 	test("Files policy editor shows the rule in Insert reference dropdown", async ({
 		page,
-		api,
 	}) => {
-		// Create a share so we have something to edit.
-		const shareRes = await api.post("/api/files/policies/", {
-			params: { location: "workspace", scope: "global" },
-			data: {
-				policies: {
-					policies: [],
-				},
-			},
-		});
-		// The share creation may 404 if the path endpoint differs — fall back
-		// to driving via the UI.
-		void shareRes;
-
 		// Navigate to the Files explorer.
 		await page.goto("/files");
 		await expect(
@@ -96,32 +133,51 @@ test.describe("Policy rule reference mode", () => {
 		await page.getByLabel(/share name/i).fill(SHARE_NAME);
 		await page.getByRole("button", { name: /create share/i }).click();
 
-		// Select the share and open the policy editor.
+		// Select the share and open the root policy editor.
 		await expect(
 			page.getByText(SHARE_NAME, { exact: false }).first(),
 		).toBeVisible({ timeout: 10000 });
-		await page.getByText(SHARE_NAME, { exact: false }).first().click();
-
-		// Open the policy editor from the detail pane.
+		await page.getByRole("tab", { name: "Policies" }).click();
 		await page
-			.getByRole("button", { name: /manage policy|edit policy|policy/i })
-			.first()
+			.getByRole("button", { name: `Manage policy for ${SHARE_NAME}/` })
 			.click();
 
-		// Wait for the editor dialog.
+		// Wait for the embedded policy editor panel (a right-hand inspector
+		// pane, not a modal dialog — see files-explorer.admin.spec.ts).
+		const inspector = page.getByRole("region", {
+			name: "File details",
+			exact: true,
+		});
 		await expect(
-			page.getByRole("dialog", { name: /manage policy/i }),
+			inspector.getByRole("heading", {
+				name: "Manage Policy",
+				exact: true,
+			}),
 		).toBeVisible({ timeout: 10000 });
 
-		// The "Insert reference…" dropdown should appear with the file rule.
-		const refTrigger = page
-			.getByRole("dialog", { name: /manage policy/i })
-			.getByLabel(/insert reference/i);
+		// The "Add Shared Rule…" dropdown should appear with the file rule.
+		const refTrigger = inspector.getByRole("combobox", {
+			name: "Add Shared Rule",
+		});
 		await expect(refTrigger).toBeVisible({ timeout: 5000 });
 		await refTrigger.click();
-		await expect(
-			page.getByRole("option", { name: FILE_RULE_NAME }),
-		).toBeVisible({ timeout: 5000 });
+		const fileRuleOption = page.getByRole("option", {
+			name: readableRuleName(FILE_RULE_NAME),
+		});
+		await expect(fileRuleOption).toBeVisible({ timeout: 5000 });
+		await fileRuleOption.click();
+
+		// The compact editor defaults to the structured "rules" view; flip to
+		// "Advanced" to see the raw doc buffer the rule was added to.
+		await inspector.getByLabel("Advanced").click();
+		await expect(page.getByTestId("json-yaml-editor-yaml")).toBeVisible({
+			timeout: 5000,
+		});
+		await expect
+			.poll(() =>
+				readEditorContent(editorForPath(page, "file-policies.yaml")),
+			)
+			.toContain(FILE_RULE_NAME);
 	});
 
 	test("Tables policy editor shows the rule in Insert reference dropdown", async ({
@@ -135,8 +191,11 @@ test.describe("Policy rule reference mode", () => {
 				schema: { properties: {}, additionalProperties: true },
 			},
 		});
-		expect(tableRes.ok(), `create table: ${await tableRes.text()}`).toBe(true);
+		expect(tableRes.ok(), `create table: ${await tableRes.text()}`).toBe(
+			true,
+		);
 		const tableData = (await tableRes.json()) as { id: string };
+		tableId = tableData.id;
 
 		// Navigate to Tables and open the table edit dialog.
 		await page.goto("/tables");
@@ -144,10 +203,14 @@ test.describe("Policy rule reference mode", () => {
 			page.getByRole("heading", { name: /tables/i }).first(),
 		).toBeVisible({ timeout: 15000 });
 
-		const tableRow = page.getByRole("row").filter({ hasText: TABLE_NAME });
-		await expect(tableRow).toBeVisible({ timeout: 10000 });
-		await tableRow.getByRole("button", { name: /edit table/i }).click();
-		const tableDialog = page.getByRole("dialog", { name: /edit table/i });
+		await expect(page.getByText(TABLE_NAME)).toBeVisible({
+			timeout: 10000,
+		});
+		await page
+			.getByRole("button", { name: `${TABLE_NAME} actions` })
+			.click();
+		await page.getByRole("menuitem", { name: "Edit" }).click();
+		const tableDialog = page.getByRole("region", { name: "Edit Table" });
 		await expect(tableDialog).toBeVisible({ timeout: 10000 });
 
 		// The "Insert reference…" dropdown should appear with the table rule.
@@ -157,10 +220,17 @@ test.describe("Policy rule reference mode", () => {
 		await expect(
 			page.getByRole("option", { name: TABLE_RULE_NAME }),
 		).toBeVisible({ timeout: 5000 });
+		await page.getByRole("option", { name: TABLE_RULE_NAME }).click();
+		await expect
+			.poll(() => readEditorContent(editorForPath(page, "policies.json")))
+			.toContain(TABLE_RULE_NAME);
 
 		// Cleanup.
-		await api
-			.delete(`/api/tables/${tableData.id}`)
-			.catch(() => {});
+		const tableCleanup = await api.delete(`/api/tables/${tableData.id}`);
+		expect(
+			[200, 204, 404],
+			`delete table fixture ${tableData.id}: ${tableCleanup.status()} ${await tableCleanup.text()}`,
+		).toContain(tableCleanup.status());
+		tableId = undefined;
 	});
 });

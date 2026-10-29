@@ -1,3 +1,4 @@
+import { OrganizationSelect } from "./OrganizationSelect";
 /**
  * Component tests for OrganizationSelect.
  *
@@ -26,17 +27,22 @@ const mockOrgs = [
 ];
 
 const useOrganizationsMock = vi.fn();
+const mockUseAuthorization = vi.fn();
 
 vi.mock("@/hooks/useOrganizations", () => ({
-	useOrganizations: () => useOrganizationsMock(),
+	useOrganizations: (...args: unknown[]) => useOrganizationsMock(...args),
+}));
+vi.mock("@/services/authorization", () => ({
+	useAuthorization: () => mockUseAuthorization(),
 }));
 
 beforeEach(() => {
 	useOrganizationsMock.mockReturnValue({ data: mockOrgs, isLoading: false });
+	mockUseAuthorization.mockReturnValue({ authorization: undefined });
 });
 
 async function renderSelect(overrides: Record<string, unknown> = {}) {
-	const { OrganizationSelect } = await import("./OrganizationSelect");
+
 	const onChange = vi.fn();
 	const utils = renderWithProviders(
 		<OrganizationSelect value={null} onChange={onChange} {...overrides} />,
@@ -45,6 +51,19 @@ async function renderSelect(overrides: Record<string, unknown> = {}) {
 }
 
 describe("OrganizationSelect", () => {
+	it("selects a known resource scope while organization discovery is disabled", async () => {
+		const { user, onChange } = await renderSelect({
+			loadOrganizations: false,
+			knownOrganizations: [{ id: "contoso", name: "Contoso" }],
+			showGlobal: false,
+		});
+		expect(useOrganizationsMock).toHaveBeenCalledWith({ enabled: false });
+		await user.click(screen.getByRole("combobox"));
+		expect(screen.queryByRole("option", { name: /^Global/ })).not.toBeInTheDocument();
+		expect(screen.getAllByRole("option")).toHaveLength(1);
+		await user.click(screen.getByRole("option", { name: "Contoso" }));
+		expect(onChange).toHaveBeenCalledWith("contoso");
+	});
 	it("shows 'Global' when value is null", async () => {
 		await renderSelect({ value: null });
 
@@ -55,6 +74,24 @@ describe("OrganizationSelect", () => {
 		await renderSelect({ value: "org-1" });
 
 		expect(screen.getByText("Acme")).toBeInTheDocument();
+	});
+
+	it("shows the home organization label without offering an excluded destination", async () => {
+		useOrganizationsMock.mockReturnValue({ data: [], isLoading: false });
+		mockUseAuthorization.mockReturnValue({
+			authorization: {
+				home_organization_id: "home-org",
+				home_organization_name: "Covi",
+			},
+		});
+		const { user } = await renderSelect({
+			value: "home-org",
+			filterOrganizations: () => false,
+		});
+
+		expect(screen.getByText("Covi")).toBeVisible();
+		await user.click(screen.getByRole("combobox"));
+		expect(screen.queryByRole("option", { name: "Covi" })).toBeNull();
 	});
 
 	it("shows 'All' when value is undefined and showAll is true", async () => {
@@ -146,4 +183,34 @@ describe("OrganizationSelect", () => {
 			screen.queryByPlaceholderText("Search organizations..."),
 		).not.toBeInTheDocument();
 	});
+	it("describes an unavailable selection instead of waiting forever", async () => {
+		useOrganizationsMock.mockReturnValue({ data: [], isLoading: false });
+		await renderSelect({ value: "missing-organization" });
+		expect(screen.getByText("Organization unavailable")).toBeVisible();
+		expect(screen.getByText("missing-organization")).toBeVisible();
+		expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+	});
+	it("forwards form identity and description to the trigger", async () => {
+		const ref = { current: null };
+		await renderSelect({
+			label: "Customer scope",
+			id: "customer-scope",
+			"aria-describedby": "scope-help",
+			ref,
+		});
+		const trigger = screen.getByRole("combobox", {
+			name: "Customer scope",
+		});
+		expect(trigger).toHaveAttribute("id", "customer-scope");
+		expect(trigger).toHaveAttribute("aria-describedby", "scope-help");
+		expect(ref.current).toBe(trigger);
+	});
 });
+
+ it("offers personal scope only when enabled and returns its explicit value", async () => {
+ const { PERSONAL_SCOPE } = await import("./OrganizationSelect");
+ const { user, onChange } = await renderSelect({ showPersonal: true });
+ await user.click(screen.getByRole("combobox"));
+ await user.click(screen.getByRole("option", { name: /Only me/ }));
+ expect(onChange).toHaveBeenCalledWith(PERSONAL_SCOPE);
+ });

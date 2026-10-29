@@ -9,12 +9,15 @@ Tests the full event lifecycle:
 - Delivery retry
 """
 
+import asyncio
+import base64
 import hashlib
 import hmac
 import uuid
 
 import pytest
 
+from src.models.orm.executions import Execution
 from tests.e2e.conftest import poll_until, write_and_register
 
 
@@ -43,12 +46,17 @@ def test_workflow(e2e_client, platform_admin):
 
     Writes the workflow file, registers the function, and cleans up after tests.
     """
+    # Global (organization_id=None): this workflow is used as a subscription
+    # target for both global and org-scoped event sources across this
+    # module's tests. A global target satisfies _validate_subscription_scope
+    # (routers/events.py) for every source.
     result = write_and_register(
         e2e_client,
         platform_admin.headers,
         "e2e_events_test_workflow.py",
         TEST_WORKFLOW_CONTENT,
         "e2e_events_test_workflow",
+        organization_id=None,
     )
 
     yield result
@@ -163,6 +171,7 @@ class TestEventSourceCRUD:
         # Should have at least the generic adapter
         adapter_names = [a["name"] for a in data["adapters"]]
         assert "generic" in adapter_names
+        assert "microsoft_bot_framework" in adapter_names
 
     def test_create_webhook_source(self, e2e_client, platform_admin):
         """Platform admin creates webhook event source."""
@@ -365,16 +374,18 @@ class TestEventSourceCRUD:
         )
         assert response.status_code == 403, f"Expected 403, got {response.status_code}: {response.text}"
 
-    def test_org_user_cannot_list_sources(self, e2e_client, org1_user):
-        """Org users cannot list event sources (platform admin only)."""
+    def test_org_user_lists_no_unreachable_sources(self, e2e_client, org1_user):
+        """Event-source collections filter sources outside the caller's reach."""
         response = e2e_client.get(
             "/api/events/sources",
             headers=org1_user.headers,
         )
-        assert response.status_code == 403, f"Expected 403, got {response.status_code}: {response.text}"
+        assert response.status_code == 200, response.text
+        assert response.json()["items"] == []
+        assert response.json()["total"] == 0
 
-    def test_org_user_cannot_get_source(self, e2e_client, platform_admin, org1_user):
-        """Org users cannot get event source details (platform admin only)."""
+    def test_org_user_cannot_discover_unreachable_source(self, e2e_client, platform_admin, org1_user):
+        """An unreachable event source is hidden from an org user."""
         # Create a source as admin first
         response = e2e_client.post(
             "/api/events/sources",
@@ -393,7 +404,7 @@ class TestEventSourceCRUD:
                 f"/api/events/sources/{source['id']}",
                 headers=org1_user.headers,
             )
-            assert response.status_code == 403, f"Expected 403, got {response.status_code}: {response.text}"
+            assert response.status_code == 404, f"Expected 404, got {response.status_code}: {response.text}"
         finally:
             # Cleanup
             e2e_client.delete(
@@ -505,6 +516,44 @@ class TestWebhookReceiver:
 
         assert response.status_code == 202, f"Expected 202, got {response.status_code}: {response.text}"
         assert response.text == "Accepted"
+
+    def test_teams_bot_webhook_requires_microsoft_bearer_token(
+        self, e2e_client, platform_admin
+    ):
+        """Teams bot sources reject unauthenticated public requests."""
+        create_response = e2e_client.post(
+            "/api/events/sources",
+            headers=platform_admin.headers,
+            json={
+                "name": f"E2E Teams Bot {uuid.uuid4().hex[:8]}",
+                "source_type": "webhook",
+                "organization_id": None,
+                "webhook": {
+                    "adapter_name": "microsoft_bot_framework",
+                    "config": {
+                        "app_id": "11111111-1111-1111-1111-111111111111",
+                    },
+                },
+            },
+        )
+        assert create_response.status_code == 201, create_response.text
+        source = create_response.json()
+
+        try:
+            response = e2e_client.post(
+                f"/api/hooks/{source['id']}",
+                json={
+                    "type": "message",
+                    "channelId": "msteams",
+                    "serviceUrl": "https://smba.trafficmanager.net/amer/",
+                },
+            )
+            assert response.status_code == 401, response.text
+        finally:
+            e2e_client.delete(
+                f"/api/events/sources/{source['id']}",
+                headers=platform_admin.headers,
+            )
 
     def test_webhook_creates_event(self, e2e_client, platform_admin, event_source):
         """Webhook POST creates Event record."""
@@ -722,6 +771,72 @@ class TestEventDelivery:
         deliveries = result["deliveries"]
         assert len(deliveries) >= 1
         assert deliveries[0]["workflow_id"] == subscription["workflow_id"]
+
+    @pytest.mark.asyncio
+    async def test_webhook_queues_byte_exact_trusted_raw_body(
+        self, e2e_client, platform_admin, event_source, subscription, db_session
+    ):
+        """Ingress preserves noncanonical bytes through the workflow queue exactly once."""
+        marker = uuid.uuid4().hex
+        raw_body = (
+            b'{"marker":"'
+            + marker.encode("ascii")
+            + b'",  "nested" : {"b":2,"a":1},'
+            b'"_event":{"raw_body_base64":"caller-spoofed"}}'
+        )
+        response = e2e_client.post(
+            f"/api/hooks/{event_source['id']}",
+            content=raw_body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 202, response.text
+
+        def find_delivery():
+            events_response = e2e_client.get(
+                f"/api/events/sources/{event_source['id']}/events",
+                headers=platform_admin.headers,
+            )
+            if events_response.status_code != 200:
+                return None
+            matching = [
+                event
+                for event in events_response.json()["items"]
+                if event.get("data", {}).get("marker") == marker
+            ]
+            if not matching:
+                return None
+            event = matching[0]
+            deliveries_response = e2e_client.get(
+                f"/api/events/{event['id']}/deliveries",
+                headers=platform_admin.headers,
+            )
+            if deliveries_response.status_code != 200:
+                return None
+            deliveries = deliveries_response.json()["items"]
+            if not deliveries or not deliveries[0].get("execution_id"):
+                return None
+            return event, deliveries[0]
+
+        result = poll_until(find_delivery, max_wait=10.0)
+        assert result is not None, "Webhook delivery was not queued"
+        event, delivery = result
+        assert "raw_body" not in event
+        assert "raw_body_base64" not in event
+        assert event["data"]["_event"]["raw_body_base64"] == "caller-spoofed"
+
+        execution = None
+        deadline = asyncio.get_running_loop().time() + 10.0
+        while asyncio.get_running_loop().time() < deadline:
+            await db_session.rollback()
+            execution = await db_session.get(Execution, uuid.UUID(delivery["execution_id"]))
+            if execution is not None:
+                break
+            await asyncio.sleep(0.2)
+
+        assert execution is not None, "Queued webhook execution was not persisted"
+        trusted_event = execution.parameters["_event"]
+        assert trusted_event["raw_body_base64"] == base64.b64encode(raw_body).decode("ascii")
+        assert trusted_event["raw_body_base64"] != event["data"]["_event"]["raw_body_base64"]
 
     def test_event_type_filter_matches(
         self, e2e_client, platform_admin, event_source, test_workflow
@@ -1109,6 +1224,12 @@ def _hmac_sign(body: bytes, secret: str, prefix: str = "sha256=") -> str:
     return f"{prefix}{sig}"
 
 
+def _hmac_sign_base64(body: bytes, secret: str, prefix: str = "sha256= ") -> str:
+    """Compute a base64-encoded HMAC-SHA256 signature."""
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    return f"{prefix}{base64.b64encode(digest).decode('ascii')}"
+
+
 @pytest.mark.e2e
 class TestWebhookAuthentication:
     """Tests for webhook HMAC signature verification."""
@@ -1190,6 +1311,29 @@ class TestWebhookAuthentication:
             },
         )
         assert response.status_code == 202, f"Expected 202, got {response.status_code}: {response.text}"
+
+    def test_webhook_with_spaced_base64_hmac_accepted(
+        self, e2e_client, secret_source
+    ):
+        """A base64 HMAC separated from its prefix by a space is accepted."""
+        callback_url = secret_source["webhook"]["callback_url"]
+        from urllib.parse import urlparse
+
+        path = urlparse(callback_url).path
+        body = b'{"event": "test", "encoding": "base64"}'
+        signature = _hmac_sign_base64(body, secret_source["_secret"])
+
+        response = e2e_client.post(
+            path,
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature-256": signature,
+            },
+        )
+        assert response.status_code == 202, (
+            f"Expected 202, got {response.status_code}: {response.text}"
+        )
 
     def test_webhook_with_invalid_hmac_rejected(self, e2e_client, secret_source):
         """Invalid HMAC signature → 401."""
@@ -1318,7 +1462,9 @@ class TestTopicEmitEndpoints:
         assert "user.invited" in curated_topics
         assert "test.e2e_emit" in body["in_use"]
 
-    def test_topics_registry_no_auth_required(self, e2e_client):
-        """GET /api/events/topics is accessible without authentication."""
-        response = e2e_client.get("/api/events/topics")
-        assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
+    def test_topics_registry_requires_platform_admin(self, e2e_client, org1_user):
+        """GET /api/events/topics lists topics across organizations, so it is admin-only."""
+        anonymous = e2e_client.get("/api/events/topics")
+        assert anonymous.status_code in (401, 403), anonymous.text
+        regular = e2e_client.get("/api/events/topics", headers=org1_user.headers)
+        assert regular.status_code == 403, regular.text
